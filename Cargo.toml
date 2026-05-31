@@ -1,0 +1,43 @@
+[package]
+name = "ariaminer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "ARIAMiner — open-source, 0% dev-fee CPU miner for Pearl (PRL). Amortized GEMM Int7×Int7 proof-of-work with AVX-512 / AVX-VNNI register-blocking."
+repository = "https://github.com/stefancrypto68/ariaminer"
+readme = "README.md"
+keywords = ["pearl", "mining", "cpu", "miner", "crypto"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "ariaminer"
+path = "src/bin/mine.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+base64 = "0.22"
+blake3 = "1"
+rand = "0.8"
+chrono = "0.4"
+parking_lot = "0.12"
+sha2 = "0.10"
+rayon = "1"
+
+# Pearl's official noise/reference crate (ISC, public). Only used by the noise
+# generator; fetched by cargo from Pearl's public repo — nothing is vendored.
+zk-pow = { git = "https://github.com/pearl-research-labs/pearl.git" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
