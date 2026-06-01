@@ -1,6 +1,6 @@
 [package]
 name = "ariaminer"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 description = "ARIAMiner — open-source, 0% dev-fee CPU miner for Pearl (PRL). Canonical GEMM Int7×Int7 proof-of-work on the AVX-512 VNNI / AVX-VNNI int8 datapath."

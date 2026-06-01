@@ -111,8 +111,8 @@ pub fn build_official_job(
     // the register-blocked micro-kernel runs near its raw throughput instead of
     // being starved by setup (measured: n=64 → 37 GMAC/s vs 2048×1024 → ~220).
     // Tunable via ARIA_BATCH_M / ARIA_BATCH_N for per-machine memory budgets.
-    let tgt_m = std::env::var("ARIA_BATCH_M").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
-    let tgt_n = std::env::var("ARIA_BATCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let tgt_m = std::env::var("ARIA_BATCH_M").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let tgt_n = std::env::var("ARIA_BATCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
     let m = fit_dim(tgt_m, config.rows_pattern.period() as usize, config.rows_pattern.max() as usize);
     let n = fit_dim(tgt_n, config.cols_pattern.period() as usize, config.cols_pattern.max() as usize);
 
