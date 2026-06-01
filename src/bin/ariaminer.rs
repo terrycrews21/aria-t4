@@ -1,12 +1,12 @@
 //! ARIAMiner — open-source, 0% dev-fee CPU miner for Pearl (PRL).
 //!
 //! Grinds Pearl's canonical GEMM Int7×Int7 proof-of-work and submits real
-//! `PlainProof` shares — every accepted share is a genuine proof that passes the
-//! node-side `verify_plain_proof`, so a pool can assemble the block and
-//! `submitblock` on a hit. Optimized with AVX-512 VNNI / AVX-VNNI (scalar
-//! fallback on older CPUs).
+//! `PlainProof` shares — every accepted share passes the node-side
+//! `verify_plain_proof`. Optimized with AVX-512 VNNI / AVX-VNNI (scalar
+//! fallback), auto-reconnects on pool drops, and exposes optional JSON stats
+//! via `--stats-port` (used by the HiveOS integration).
 //!
-//!   ariaminer --pool <host:port> --wallet prl1... --worker my-rig [--threads N]
+//!   ariaminer --pool <host:port> --wallet prl1... --worker my-rig [--threads N] [--stats-port 4068]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,7 +38,14 @@ struct Args {
     /// CPU grind threads. Default: all logical processors.
     #[arg(long)]
     threads: Option<usize>,
+    /// Expose a JSON stats endpoint on 127.0.0.1:<port> (for HiveOS / monitoring).
+    #[arg(long)]
+    stats_port: Option<u16>,
 }
+
+/// Hashrate display convention: same TMACs/s ("TH/s") multiplier the pool uses,
+/// so the miner/HiveOS number matches the pool dashboard for the same rig.
+const HASHRATE_DISPLAY_MULT: f64 = 4.3e6;
 
 /// A job ready to grind: the stratum job id (echoed in the submit) plus the
 /// official inputs. Cheap to clone (matrices are drawn per attempt, not here).
@@ -64,11 +71,48 @@ impl GrindGen {
     }
 }
 
+/// Minimal JSON stats endpoint (HiveOS / monitoring) — no extra deps. Each GET
+/// returns `{hashrate_hs, accepted, rejected, threads, uptime_s}` and closes.
+async fn serve_stats(
+    port: u16,
+    shares: Arc<AtomicU64>,
+    hashrate_hs: Arc<AtomicU64>,
+    threads: usize,
+    started: Instant,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    tracing::info!(port, "stats endpoint listening on 127.0.0.1");
+    loop {
+        let (mut sock, _) = match listener.accept().await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let body = format!(
+            "{{\"hashrate_hs\":{},\"accepted\":{},\"rejected\":0,\"threads\":{},\"uptime_s\":{}}}",
+            hashrate_hs.load(Ordering::Relaxed),
+            shares.load(Ordering::Relaxed),
+            threads,
+            started.elapsed().as_secs(),
+        );
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = sock.write_all(resp.as_bytes()).await;
+        let _ = sock.shutdown().await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_grind(
     job_slot: Arc<Mutex<Arc<GrindJob>>>,
     threads: usize,
     attempts: Arc<AtomicU64>,
     shares: Arc<AtomicU64>,
+    credited: Arc<AtomicU64>,
+    diff_arc: Arc<AtomicU64>,
     submit_tx: mpsc::Sender<Submission>,
 ) -> GrindGen {
     let stop = Arc::new(AtomicBool::new(false));
@@ -78,6 +122,8 @@ fn spawn_grind(
             let stop = Arc::clone(&stop);
             let attempts = Arc::clone(&attempts);
             let shares = Arc::clone(&shares);
+            let credited = Arc::clone(&credited);
+            let diff_arc = Arc::clone(&diff_arc);
             let submit_tx = submit_tx.clone();
             thread::spawn(move || {
                 let mut rng = StdRng::seed_from_u64(
@@ -97,6 +143,8 @@ fn spawn_grind(
                         match encode_base64(&proof) {
                             Ok(proof_base64) => {
                                 shares.fetch_add(1, Ordering::Relaxed);
+                                // Credit this share's difficulty (pool's basis for hashrate).
+                                credited.fetch_add(diff_arc.load(Ordering::Relaxed), Ordering::Relaxed);
                                 tracing::info!(job_id = %job.job_id, "✅ share (real PlainProof) — submitting");
                                 let _ = submit_tx.try_send(Submission {
                                     job_id: job.job_id.clone(),
@@ -157,18 +205,42 @@ async fn main() -> anyhow::Result<()> {
 
     let attempts = Arc::new(AtomicU64::new(0));
     let shares = Arc::new(AtomicU64::new(0));
+    let diff_arc = Arc::new(AtomicU64::new(524_288));
+    let credited = Arc::new(AtomicU64::new(0)); // Σ difficulty of found shares
+    let hashrate_hs = Arc::new(AtomicU64::new(0));
+    let started = Instant::now();
 
-    // Rate reporter (setups/s + shares).
+    // Optional JSON stats endpoint (HiveOS / monitoring).
+    if let Some(sp) = args.stats_port {
+        let shares_s = Arc::clone(&shares);
+        let hr_s = Arc::clone(&hashrate_hs);
+        tokio::spawn(async move {
+            if let Err(e) = serve_stats(sp, shares_s, hr_s, threads, started).await {
+                tracing::warn!(error = %e, "stats endpoint stopped");
+            }
+        });
+    }
+
+    // Rate reporter (setups/s + shares) + hashrate in the pool's TH/s convention.
     {
         let attempts = Arc::clone(&attempts);
         let shares = Arc::clone(&shares);
+        let credited = Arc::clone(&credited);
+        let hashrate_hs = Arc::clone(&hashrate_hs);
         tokio::spawn(async move {
             let mut last = 0u64;
+            let mut last_cred = 0u64;
             let mut t = Instant::now();
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 let now = attempts.load(Ordering::Relaxed);
-                let dt = t.elapsed().as_secs_f64();
+                let cred = credited.load(Ordering::Relaxed);
+                let dt = t.elapsed().as_secs_f64().max(1e-3);
+                // hashrate = Σ(credited difficulty)/window × display-mult — the SAME
+                // basis the pool uses, so the miner's number matches the dashboard
+                // (and converges cleanly with vardiff instead of spiking).
+                let hr = (cred.saturating_sub(last_cred)) as f64 / dt * HASHRATE_DISPLAY_MULT;
+                hashrate_hs.store(hr as u64, Ordering::Relaxed);
                 tracing::info!(
                     "rate: {:.1} setups/s | total {} setups, {} shares",
                     (now - last) as f64 / dt,
@@ -176,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
                     shares.load(Ordering::Relaxed)
                 );
                 last = now;
+                last_cred = cred;
                 t = Instant::now();
             }
         });
@@ -195,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(JobEvent::SetDifficulty(d)) => {
                 tracing::info!(difficulty = d, "difficulty");
                 cur_difficulty = d;
+                diff_arc.store(d, Ordering::Relaxed);
                 // Refresh the live job's bound so vardiff applies immediately.
                 if let (Some(slot), Some(params)) = (&job_slot, &cur_params) {
                     let cur = slot.lock().clone();
@@ -237,6 +311,8 @@ async fn main() -> anyhow::Result<()> {
                             threads,
                             Arc::clone(&attempts),
                             Arc::clone(&shares),
+                            Arc::clone(&credited),
+                            Arc::clone(&diff_arc),
                             submit_tx.clone(),
                         ));
                     }
