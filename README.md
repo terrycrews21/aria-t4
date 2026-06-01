@@ -2,27 +2,27 @@
 
 **Open-source, 0% dev-fee CPU miner for Pearl (PRL).**
 
-ARIAMiner turns Pearl's GEMM Int7×Int7 proof-of-work into real CPU throughput —
-an amortized grind that does one BLAKE3 setup and sweeps thousands of matmul
-tiles per attempt. No GPU required, no hidden fees: the miner takes **0%**.
+ARIAMiner mines Pearl's **GEMM Int7×Int7** proof-of-work on your CPU and submits
+real, node-validated `PlainProof` shares — not shortcuts. No GPU required, no
+hidden fees: the miner takes **0%**.
 
 - **0% dev-fee** — the binary mines 100% to *your* wallet.
+- **Canonical proofs** — every accepted share is a genuine proof that passes the
+  node-side `verify_plain_proof`, so a pool can assemble the block and
+  `submitblock` on a hit. Output is **bit-identical** to the Pearl reference.
 - **CPU only** — runs on any modern x86-64 box, no CUDA / no GPU.
-- **One portable binary** — auto-detects and uses **AVX-512** (AMD Zen 4/5,
-  Intel with AVX-512) or **AVX-VNNI / AVX2** (Intel Core Ultra / Arrow Lake) at
-  runtime, with a scalar fallback.
-- **Register-blocked kernel** — 16 independent accumulators hide the `vpdpbusd`
-  latency; the per-attempt noise/commitment setup is fused and amortized over a
-  large tile batch.
+- **One portable binary** — auto-detects and uses **AVX-512 VNNI** (AMD Zen 4/5,
+  Intel with AVX-512) or **AVX-VNNI** (Intel Core Ultra / Arrow Lake) at runtime,
+  with a scalar fallback on older CPUs.
 
 ## Algorithm
 
-Each attempt computes a sparse **GEMM Int7×Int7 → Int32** "jackpot" over
-noise-perturbed secret strips, then runs a **keyed BLAKE3** hash of that
-transcript against the network/share target. The heavy matmul is what makes the
-work ASIC-resistant; BLAKE3 provides the difficulty test. The kernel output is
-**bit-identical** to the Pearl reference implementation, so shares validate
-normally.
+Each attempt draws noise-perturbed secret strips, computes a sparse
+**GEMM Int7×Int7 → Int32** "jackpot" over them, and runs a **keyed BLAKE3** hash
+of that transcript against the share / network target. The Int7 matrices are
+multiplied on the hardware int8 datapath (`vpdpbusd`), which is bit-exact to the
+reference, so shares validate normally. The heavy matmul is what makes the work
+hard to accelerate cheaply; BLAKE3 provides the difficulty test.
 
 ## Quick start
 
@@ -60,19 +60,10 @@ cargo build --release
 | `--wallet` | *(required)* | Your Pearl receive address (`prl1...`) |
 | `--worker` | `aria` | Worker / rig label |
 | `--threads` | all logical cores | Number of grind threads |
-| `--batch` | `4096` | Amortization batch (rows/cols drawn per setup) |
 | `--password` | `x` | Stratum password (`x;d=N` for static difficulty) |
 
-**Tuning tips**
-
-- `--batch 4096` is the sweet spot on most CPUs (the per-setup noise generation
-  amortizes over `batch² / 128` tiles). Smaller batches under-feed the kernel;
-  larger ones plateau and start thrashing cache.
-- The cache-blocking panel size defaults to a value tuned for a large L3. On
-  CPUs with smaller L3 you can experiment with the `ARIA_PANEL_RG` environment
-  variable, but the default is fine on most chips.
-- On a desktop, leaving one thread free (`--threads <cores-1>`) often gives a
-  smoother system and equal or better hashrate.
+**Tip:** on a desktop, leaving one or two threads free
+(`--threads <cores-1>`) often gives a smoother system and equal hashrate.
 
 ## Where to mine
 
