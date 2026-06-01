@@ -1,4 +1,4 @@
-//! Official-faithful Pearl grind (correctness-first reference).
+//! Official-faithful Pearl grind — chantier 1, brique B (correctness-first).
 //!
 //! A byte-faithful reimplementation of `zk_pow::ffi::mine::try_mine_one`, with
 //! ONE deliberate change: the difficulty bound is supplied by the caller instead
@@ -390,10 +390,120 @@ pub fn try_mine_one_bounded<R: Rng>(
         .map(|(b_row, n_row)| b_row.iter().zip(n_row).map(|(&b, &n)| (b as i32 + n as i32) as i8).collect())
         .collect();
 
-    // Feature detection hoisted out of the per-cell loop: decided once, then the
-    // tile sweep runs with the SIMD kernel inlined (no per-call dispatch).
-    let kernel = detect_dot_kernel();
+    let tile_h = config.rows_pattern.to_list().len();
+    let tile_w = config.cols_pattern.to_list().len();
 
+    // ── FAST PATH: the real Pearl tile shape (h=2 row-offsets × w=64 col-offsets)
+    // on AVX-512 VNNI runs the register-blocked micro-kernel, which
+    // is bit-identical to the per-cell tile (oracle-guarded) — it just computes the
+    // SAME jackpot far faster. The proof is still built from the signal matrices +
+    // pattern indices, exactly like the fallback, so shares stay canonical.
+    #[cfg(target_arch = "x86_64")]
+    if tile_h == 2 && tile_w == 64 && k % 4 == 0 {
+        let avx512 = is_x86_feature_detected!("avx512vnni")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512f");
+        // AVX-VNNI (256-bit) path for AVX-512-less CPUs (Intel Arrow Lake / Core
+        // Ultra — the i9 cluster). Same micro-kernel family, 8-col groups.
+        let avxvnni = !avx512 && is_x86_feature_detected!("avxvnni");
+        if avx512 || avxvnni {
+            let row_tiles = threads_partition(&config.rows_pattern, m);
+            let col_tiles = threads_partition(&config.cols_pattern, n);
+            let nt = row_tiles.len();
+            // A noised, TILE-ORDERED: tile t's two rows at 2t,2t+1, so 4 tiles = 8
+            // contiguous rows for the 8×64 kernel. Built once per setup.
+            let mut a_tiled = vec![0i8; nt * 2 * k];
+            for (t, rt) in row_tiles.iter().enumerate() {
+                a_tiled[(2 * t) * k..(2 * t) * k + k].copy_from_slice(&a_noised[rt[0]]);
+                a_tiled[(2 * t + 1) * k..(2 * t + 1) * k + k].copy_from_slice(&a_noised[rt[1]]);
+            }
+            // ALL B columns gathered tile-ordered, packed ONCE. Packed-once + the
+            // row-panel loop mean A is read from DRAM once per panel, not once per
+            // col-tile (A re-streaming was the multi-thread bandwidth wall).
+            let total_cols = col_tiles.len() * tile_w;
+            let mut b_all = vec![0i8; total_cols * k];
+            for (ci, b_cols) in col_tiles.iter().enumerate() {
+                for (j, &c) in b_cols.iter().enumerate() {
+                    let dst = (ci * tile_w + j) * k;
+                    b_all[dst..dst + k].copy_from_slice(&b_noised_t[c]);
+                }
+            }
+            // 16-col packing groups on AVX-512, 8-col on AVX-VNNI → col-tile c's
+            // first packed group is c*4 vs c*8 respectively.
+            let mut b_packed = Vec::new();
+            let grp_per_tile = if avx512 { 4 } else { 8 };
+            if avx512 {
+                crate::microkernel::pack_b_16(&b_all, total_cols, k, &mut b_packed);
+            } else {
+                crate::microkernel::pack_b_8(&b_all, total_cols, k, &mut b_packed);
+            }
+
+            let panel = std::env::var("ARIA_PANEL")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(256);
+            let mut scratch = vec![0i32; 512];
+            let fb_kernel = detect_dot_kernel(); // AVX-VNNI remainder (no 2×64 avxvnni)
+
+            let mut p0 = 0;
+            while p0 < nt {
+                let p1 = (p0 + panel).min(nt);
+                for (ci, b_cols) in col_tiles.iter().enumerate() {
+                    let grp_base = ci * grp_per_tile;
+                    let mut t = p0;
+                    while t + 4 <= p1 {
+                        let msgs = if avx512 {
+                            unsafe {
+                                crate::microkernel::jackpot_tile_8x64_avx512(
+                                    &a_tiled, &b_packed, 2 * t, grp_base, k, rank, &mut scratch,
+                                )
+                            }
+                        } else {
+                            unsafe {
+                                crate::microkernel::jackpot_tile_8x64_avxvnni(
+                                    &a_tiled, &b_packed, 2 * t, grp_base, k, rank, &mut scratch,
+                                )
+                            }
+                        };
+                        for (tt, msg) in msgs.iter().enumerate() {
+                            if le_leq(&compute_jackpot_hash(msg, a_noise_seed), bound_le) {
+                                let rt = &row_tiles[t + tt];
+                                let a_proof = build_matrix_proof(&a_matrix, &job_key, rt, k);
+                                let b_proof = build_matrix_proof(&b_transposed, &job_key, b_cols, k);
+                                return Some(PlainProof { m, n, k, noise_rank: rank, a: a_proof, bt: b_proof });
+                            }
+                        }
+                        t += 4;
+                    }
+                    // Remainder (<4 tiles): AVX-512 → 2×64 kernel; AVX-VNNI → per-cell.
+                    while t < p1 {
+                        let rt = &row_tiles[t];
+                        let jp = if avx512 {
+                            unsafe {
+                                crate::microkernel::jackpot_tile_2x64_avx512(
+                                    &a_tiled, &b_packed, 2 * t, 2 * t + 1, grp_base, k, rank, &mut scratch,
+                                )
+                            }
+                        } else {
+                            tile_jackpot(fb_kernel, rt, b_cols, &a_noised, &b_noised_t, rank, k)
+                        };
+                        if le_leq(&compute_jackpot_hash(&jp, a_noise_seed), bound_le) {
+                            let a_proof = build_matrix_proof(&a_matrix, &job_key, rt, k);
+                            let b_proof = build_matrix_proof(&b_transposed, &job_key, b_cols, k);
+                            return Some(PlainProof { m, n, k, noise_rank: rank, a: a_proof, bt: b_proof });
+                        }
+                        t += 1;
+                    }
+                }
+                p0 = p1;
+            }
+            return None;
+        }
+    }
+
+    // ── FALLBACK: any other shape / non-AVX-512 CPU — per-cell kernel.
+    let kernel = detect_dot_kernel();
     for a_rows in threads_partition(&config.rows_pattern, m) {
         for b_cols in threads_partition(&config.cols_pattern, n) {
             let jackpot =
@@ -466,7 +576,7 @@ mod tests {
         }
     }
 
-    /// Key property: a proof produced by OUR grind (not by
+    /// THE chantier-1.B deliverable: a proof produced by OUR grind (not by
     /// zk-pow's `mine`) must pass the official node-side verifiers — both the
     /// structural `parse_plain_proof` (Merkle roots == hash_a/hash_b) and the
     /// full `verify_plain_proof` (roots + difficulty under the real header). The
@@ -499,6 +609,43 @@ mod tests {
             crate::official_proof::encode_bytes(&proof).unwrap(),
             crate::official_proof::encode_bytes(&back).unwrap(),
         );
+    }
+
+    /// h=2 × w=64 config — the real Pearl tile shape, which triggers the AVX-512
+    /// register-blocked micro-kernel fast path in `try_mine_one_bounded`.
+    fn config_2x64(k: u32) -> MiningConfiguration {
+        let cols: Vec<u32> = (0..64).collect();
+        MiningConfiguration {
+            common_dim: k,
+            rank: 128,
+            mma_type: MMAType::Int7xInt7ToInt32,
+            rows_pattern: PeriodicPattern::from_list(&[0, 1]).unwrap(),
+            cols_pattern: PeriodicPattern::from_list(&cols).unwrap(),
+            reserved: MiningConfiguration::RESERVED_VALUE,
+        }
+    }
+
+    /// THE phase-1 deliverable: the fast micro-kernel path must produce a proof
+    /// that passes the official node-side verifiers, exactly like the slow path.
+    /// Runs on AVX-512 VNNI hosts (where the fast path engages); on others it
+    /// exercises the fallback — either way the proof must verify.
+    #[test]
+    fn fast_2x64_proof_passes_official_verify() {
+        let (m, n, k) = (256usize, 64usize, 4096usize);
+        let header = easy_header(0x207f_ffff);
+        let config = config_2x64(k as u32);
+
+        let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(header.nbits, &config);
+        let mut bound_le = [0u8; 32];
+        bound.to_little_endian(&mut bound_le);
+
+        let mut rng = StdRng::seed_from_u64(0x2064_BEEF);
+        let proof = mine_share(&mut rng, m, n, k, &header, &config, &bound_le);
+
+        zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof)
+            .expect("fast-path proof must parse (roots == hash_a/hash_b)");
+        zk_pow::api::verify::verify_plain_proof(&header, &proof)
+            .expect("fast-path proof must pass verify_plain_proof");
     }
 
     /// `le_leq` is the difficulty comparator; guard its byte-order semantics.

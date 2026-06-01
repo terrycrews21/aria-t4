@@ -1,4 +1,4 @@
-//! Stratum → official conversion.
+//! Stratum → official conversion — chantier 1.C step (b).
 //!
 //! Turns what the pool sends on the wire (`Job` + `MiningParams` + stratum
 //! difficulty) into exactly the three inputs `official_grind::mine_share`
@@ -106,11 +106,15 @@ pub fn build_official_job(
     let header = header_from_template(&job.header_template)?;
     let config = config_from_params(params)?;
 
-    // CPU-sized m/n (see `fit_dim`). Targets ~256 rows / ~128 cols — the shape
-    // our `verify_plain_proof` tests exercise — instead of the pool's GPU-sized
-    // values. Keeps one setup to a few-hundred-tile sweep and a ~MB matrix.
-    let m = fit_dim(256, config.rows_pattern.period() as usize, config.rows_pattern.max() as usize);
-    let n = fit_dim(128, config.cols_pattern.period() as usize, config.cols_pattern.max() as usize);
+    // CPU-sized m/n (see `fit_dim`). A LARGE batch amortizes the per-setup cost
+    // (draw + BLAKE3 commitment over m·k/n·k + noise) over a big tile sweep, so
+    // the register-blocked micro-kernel runs near its raw throughput instead of
+    // being starved by setup (measured: n=64 → 37 GMAC/s vs 2048×1024 → ~220).
+    // Tunable via ARIA_BATCH_M / ARIA_BATCH_N for per-machine memory budgets.
+    let tgt_m = std::env::var("ARIA_BATCH_M").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let tgt_n = std::env::var("ARIA_BATCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let m = fit_dim(tgt_m, config.rows_pattern.period() as usize, config.rows_pattern.max() as usize);
+    let n = fit_dim(tgt_n, config.cols_pattern.period() as usize, config.cols_pattern.max() as usize);
 
     Ok(OfficialJob {
         header,

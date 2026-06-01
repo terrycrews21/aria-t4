@@ -14,6 +14,11 @@ hidden fees: the miner takes **0%**.
 - **One portable binary** — auto-detects and uses **AVX-512 VNNI** (AMD Zen 4/5,
   Intel with AVX-512) or **AVX-VNNI** (Intel Core Ultra / Arrow Lake) at runtime,
   with a scalar fallback on older CPUs.
+- **Auto-reconnect** — if the pool restarts, crashes or the network blips, the
+  miner waits and reconnects on its own (exponential backoff, never gives up).
+  Leave it running unattended; no manual restart needed.
+- **Register-blocked GEMM kernel** — high CPU throughput on the real Pearl tile
+  shape, with a large amortization batch so per-attempt setup never starves it.
 
 ## Algorithm
 

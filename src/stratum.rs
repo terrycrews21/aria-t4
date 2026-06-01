@@ -35,11 +35,43 @@ pub struct StratumConfig {
     pub password: String,
 }
 
+/// Stratum client with **automatic reconnection**. Runs forever: if the pool
+/// drops the connection (restart, crash, network blip) the miner waits with an
+/// exponential backoff (1s → 30s cap) and reconnects on its own — no manual
+/// restart needed. Grind threads keep running and pick the fresh job up as soon
+/// as the pool is back. Only returns when the local submit channel closes
+/// (process shutdown).
 pub async fn run(
     cfg: StratumConfig,
     job_tx: broadcast::Sender<JobEvent>,
     mut submit_rx: mpsc::Receiver<Submission>,
 ) -> Result<()> {
+    let mut backoff = 1u64;
+    loop {
+        match run_session(&cfg, &job_tx, &mut submit_rx).await {
+            Ok(true) => return Ok(()), // submit channel closed → real shutdown
+            Ok(false) => {
+                tracing::warn!("disconnected from pool — reconnecting");
+                backoff = 1; // we were connected; reset the backoff
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "stratum connection failed — retrying");
+            }
+        }
+        tracing::info!(secs = backoff, "reconnecting in {backoff}s…");
+        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(30);
+    }
+}
+
+/// One connection lifecycle. `Ok(true)` = clean shutdown (submit channel closed),
+/// `Ok(false)` = pool dropped us (caller should reconnect), `Err` = connect or
+/// I/O error (caller should retry).
+async fn run_session(
+    cfg: &StratumConfig,
+    job_tx: &broadcast::Sender<JobEvent>,
+    submit_rx: &mut mpsc::Receiver<Submission>,
+) -> Result<bool> {
     let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))
         .await
         .with_context(|| format!("connect {}:{}", cfg.host, cfg.port))?;
@@ -74,14 +106,14 @@ pub async fn run(
                     Some(l) => l,
                     None => {
                         tracing::warn!("pool closed connection");
-                        return Ok(());
+                        return Ok(false);
                     }
                 };
                 if line.trim().is_empty() { continue; }
                 let v: Value = serde_json::from_str(&line)
                     .with_context(|| format!("invalid JSON-RPC: {line}"))?;
                 if let Some(method) = v.get("method").and_then(Value::as_str) {
-                    if let Err(e) = handle_notification(method, &v, &job_tx) {
+                    if let Err(e) = handle_notification(method, &v, job_tx) {
                         tracing::warn!(method, error = %e, "notification parse failed (ignored)");
                     }
                 } else {
@@ -89,7 +121,7 @@ pub async fn run(
                 }
             }
             sub = submit_rx.recv() => {
-                let Some(sub) = sub else { return Ok(()); };
+                let Some(sub) = sub else { return Ok(true); };
                 send(
                     &mut wr,
                     next_id,
