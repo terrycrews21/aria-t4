@@ -25,217 +25,11 @@ use zk_pow::ffi::plain_proof::{MatrixMerkleProof, PlainProof};
 
 use crate::pearl_compute::LROT_PER_TILE;
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-
 // Pearl signal values are valid in [-64, 64]; we draw into the strict subset
 // [-64, 63] (one bulk mask, see `to_signal`), which keeps every proof valid.
 const SIGNAL_MIN: i8 = -64;
 /// Jackpot accumulator words (`compute_jackpot_hash` consumes `&[u32; 16]`).
 const JACKPOT_SIZE: usize = 16;
-
-/// Which int8-dot kernel the running CPU supports. Resolved ONCE per setup
-/// (feature detection hoisted out of the per-cell hot loop), then the matching
-/// `tile_jackpot_*` runs the whole tile sweep with that kernel inlined.
-#[derive(Clone, Copy)]
-enum DotKernel {
-    #[cfg(target_arch = "x86_64")]
-    Avx512Vnni,
-    #[cfg(target_arch = "x86_64")]
-    AvxVnni,
-    Scalar,
-}
-
-fn detect_dot_kernel() -> DotKernel {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512f")
-        {
-            return DotKernel::Avx512Vnni;
-        }
-        if is_x86_feature_detected!("avxvnni") {
-            return DotKernel::AvxVnni;
-        }
-    }
-    DotKernel::Scalar
-}
-
-/// Body of one tile's jackpot sweep, parameterised by the dot expression so the
-/// SIMD kernel folds directly into a same-`target_feature` wrapper (no per-cell
-/// call, no per-cell feature detection). Returns the `[u32; JACKPOT_SIZE]`
-/// accumulator; the caller hashes it and checks the bound.
-macro_rules! tile_jackpot_body {
-    ($a_rows:expr, $b_cols:expr, $a_noised:expr, $b_noised_t:expr, $rank:expr, $k:expr, $dot:expr) => {{
-        let a_rows = $a_rows;
-        let b_cols = $b_cols;
-        let mut jackpot_tile = vec![vec![0i32; b_cols.len()]; a_rows.len()];
-        let mut jackpot = [0u32; JACKPOT_SIZE];
-        let mut ll = $rank;
-        while ll <= $k {
-            for (u, &a_idx) in a_rows.iter().enumerate() {
-                for (v, &b_idx) in b_cols.iter().enumerate() {
-                    jackpot_tile[u][v] +=
-                        $dot(&$a_noised[a_idx][ll - $rank..ll], &$b_noised_t[b_idx][ll - $rank..ll]);
-                }
-            }
-            let xored_tile = jackpot_tile.iter().flatten().fold(0u32, |acc, &x| acc ^ x as u32);
-            let tid = (ll / $rank - 1) % JACKPOT_SIZE;
-            jackpot[tid] = jackpot[tid].rotate_left(LROT_PER_TILE as u32) ^ xored_tile;
-            ll += $rank;
-        }
-        jackpot
-    }};
-}
-
-fn tile_jackpot_scalar(
-    a_rows: &[usize],
-    b_cols: &[usize],
-    a_noised: &[Vec<i8>],
-    b_noised_t: &[Vec<i8>],
-    rank: usize,
-    k: usize,
-) -> [u32; JACKPOT_SIZE] {
-    tile_jackpot_body!(a_rows, b_cols, a_noised, b_noised_t, rank, k, crate::vnni::dot_i8_scalar)
-}
-
-/// Register-blocked AVX-512 VNNI tile microkernel. Same result as the per-cell
-/// `dot_i8_avx512vnni` summed into `jackpot_tile`, but with the unsigned-bias
-/// term `Σb[v]` (which `vpdpbusd` forces and which is **independent of the A
-/// row `u`**) computed ONCE per (window, col) and reused across all `tile_h`
-/// rows — instead of recomputing it for every (u, v) cell. Bit-identical to the
-/// scalar/per-cell path (oracle-guarded): `Σa·b = Σ(a+128)·b − 128·Σb`, the
-/// chunked `vpdpbusd` covers the 64-wide body and a scalar tail handles the
-/// remainder exactly like `dot_i8_avx512vnni`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn tile_jackpot_avx512(
-    a_rows: &[usize],
-    b_cols: &[usize],
-    a_noised: &[Vec<i8>],
-    b_noised_t: &[Vec<i8>],
-    rank: usize,
-    k: usize,
-) -> [u32; JACKPOT_SIZE] {
-    let th = a_rows.len();
-    let tw = b_cols.len();
-    let n_chunks = rank / 64; // full 64-wide vpdpbusd chunks
-    // Stack buffers (no per-tile heap alloc). Caps cover every real Pearl tile
-    // shape (th·tw ≤ 256, tw ≤ 128, rank ≤ 4096); guarded in debug.
-    const MAX_CELLS: usize = 256;
-    const MAX_COLS: usize = 128;
-    const MAX_CHUNKS: usize = 64;
-    debug_assert!(th * tw <= MAX_CELLS && tw <= MAX_COLS && n_chunks <= MAX_CHUNKS);
-    let ones = _mm512_set1_epi8(1);
-    let bias = _mm512_set1_epi8(-128i8); // XOR 0x80 → (i8 + 128) as u8
-
-    let mut jackpot_tile = [0i32; MAX_CELLS];
-    let mut jackpot = [0u32; JACKPOT_SIZE];
-    let mut sumb = [0i32; MAX_COLS]; // Σb over the chunk body, per col (bias term)
-    // biased A-row chunks, reused across the v-loop. Zero-initialised (one vxor
-    // splatted — negligible vs the tile MACs) rather than left uninit, which is
-    // unsound for `__m512i`. Only [0..n_chunks) is ever written/read.
-    let mut au = [_mm512_setzero_si512(); MAX_CHUNKS];
-    let mut ll = rank;
-    let mut widx = 0usize;
-    while ll <= k {
-        let off = ll - rank;
-
-        // ── bias term, hoisted out of the u-loop: sumb[v] = Σ_body b[v].
-        // (A batched 16×16 transpose-reduce was tried here and LOST: the 16
-        // per-cell `_mm512_reduce_add` are independent and pipeline on the OoO
-        // engine, while the transpose is a serial dependency chain + extra
-        // memory traffic. Per-cell reduce wins — keep it.)
-        for (v, &b_idx) in b_cols.iter().enumerate() {
-            let bp = b_noised_t[b_idx].as_ptr().add(off);
-            let mut acc = _mm512_setzero_si512();
-            let mut c = 0;
-            while c < n_chunks {
-                acc = _mm512_dpbusd_epi32(acc, ones, _mm512_loadu_si512(bp.add(c * 64) as *const __m512i));
-                c += 1;
-            }
-            sumb[v] = _mm512_reduce_add_epi32(acc);
-        }
-
-        // ── per A-row: ab[v] = Σ_body (a+128)·b, then C = ab − 128·sumb + tail.
-        for (u, &a_idx) in a_rows.iter().enumerate() {
-            let ap = a_noised[a_idx].as_ptr().add(off);
-            let mut c = 0;
-            while c < n_chunks {
-                au[c] = _mm512_xor_si512(_mm512_loadu_si512(ap.add(c * 64) as *const __m512i), bias);
-                c += 1;
-            }
-            for (v, &b_idx) in b_cols.iter().enumerate() {
-                let bp = b_noised_t[b_idx].as_ptr().add(off);
-                let mut acc = _mm512_setzero_si512();
-                let mut c = 0;
-                while c < n_chunks {
-                    acc = _mm512_dpbusd_epi32(acc, au[c], _mm512_loadu_si512(bp.add(c * 64) as *const __m512i));
-                    c += 1;
-                }
-                let mut cell = _mm512_reduce_add_epi32(acc).wrapping_sub(128i32.wrapping_mul(sumb[v]));
-                // scalar tail (rank % 64), signed exactly like dot_i8_avx512vnni
-                let mut l = n_chunks * 64;
-                if l < rank {
-                    while l < rank {
-                        cell = cell.wrapping_add((*ap.add(l) as i32).wrapping_mul(*bp.add(l) as i32));
-                        l += 1;
-                    }
-                }
-                let idx = u * tw + v;
-                jackpot_tile[idx] = jackpot_tile[idx].wrapping_add(cell);
-            }
-        }
-
-        let xored = jackpot_tile[..th * tw].iter().fold(0u32, |acc, &x| acc ^ x as u32);
-        let tid = widx % JACKPOT_SIZE;
-        jackpot[tid] = jackpot[tid].rotate_left(LROT_PER_TILE as u32) ^ xored;
-        ll += rank;
-        widx += 1;
-    }
-    jackpot
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,avxvnni")]
-unsafe fn tile_jackpot_avxvnni(
-    a_rows: &[usize],
-    b_cols: &[usize],
-    a_noised: &[Vec<i8>],
-    b_noised_t: &[Vec<i8>],
-    rank: usize,
-    k: usize,
-) -> [u32; JACKPOT_SIZE] {
-    tile_jackpot_body!(a_rows, b_cols, a_noised, b_noised_t, rank, k, |x: &[i8], y: &[i8]| unsafe {
-        crate::vnni::dot_i8_avxvnni(x, y)
-    })
-}
-
-/// Dispatch one tile sweep to the resolved kernel (decision made once per setup).
-#[inline]
-fn tile_jackpot(
-    kernel: DotKernel,
-    a_rows: &[usize],
-    b_cols: &[usize],
-    a_noised: &[Vec<i8>],
-    b_noised_t: &[Vec<i8>],
-    rank: usize,
-    k: usize,
-) -> [u32; JACKPOT_SIZE] {
-    match kernel {
-        #[cfg(target_arch = "x86_64")]
-        DotKernel::Avx512Vnni => unsafe {
-            tile_jackpot_avx512(a_rows, b_cols, a_noised, b_noised_t, rank, k)
-        },
-        #[cfg(target_arch = "x86_64")]
-        DotKernel::AvxVnni => unsafe {
-            tile_jackpot_avxvnni(a_rows, b_cols, a_noised, b_noised_t, rank, k)
-        },
-        DotKernel::Scalar => tile_jackpot_scalar(a_rows, b_cols, a_noised, b_noised_t, rank, k),
-    }
-}
 
 /// `a ≤ b` where both are 256-bit integers in little-endian byte order — the
 /// exact comparison the node uses (`U256::from_little_endian(hash) ≤ bound`).
@@ -325,7 +119,123 @@ fn threads_partition(pattern: &PeriodicPattern, total_dimension: usize) -> Vec<V
 /// hash is `≤ bound` as a canonical `PlainProof`. `None` if no tile qualifies.
 ///
 /// Mirrors `zk_pow::ffi::mine::try_mine_one` with `wrong_jackpot_hash = false`.
+/// Per-thread reusable scratch. All the big buffers one grind attempt needs,
+/// kept alive across attempts so the hot loop allocates NOTHING — the
+/// per-attempt alloc/free churn (thousands of small `Vec<Vec>` rows) was the
+/// multi-core scaling wall (e.g. a 192-thread EPYC collapsing). Buffers are flat
+/// (`m*k` / `n*k`); the `Vec<Vec>` views the proof needs are rebuilt only on a
+/// winning tile (rare). Grow-only — sized up to the largest job seen.
+#[derive(Default)]
+pub struct Workspace {
+    a_bytes: Vec<u8>,
+    b_bytes: Vec<u8>,
+    a_sig: Vec<i8>,      // signal A, row-major (m*k)
+    b_sig: Vec<i8>,      // signal B, transposed (n*k)
+    a_noised: Vec<i8>,   // A + noise (m*k)
+    b_noised_t: Vec<i8>, // Bᵀ + noise (n*k)
+    a_tiled: Vec<i8>,
+    b_all: Vec<i8>,
+    b_packed: Vec<i8>,
+    scratch: Vec<i32>,
+    a_idx: Vec<usize>,
+    b_idx: Vec<usize>,
+}
+
+impl Workspace {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn ensure(&mut self, m: usize, n: usize, k: usize) {
+        let (mk, nk) = (m * k, n * k);
+        if self.a_bytes.len() < mk {
+            self.a_bytes.resize(mk, 0);
+            self.a_sig.resize(mk, 0);
+            self.a_noised.resize(mk, 0);
+            self.a_tiled.resize(mk, 0);
+        }
+        if self.b_bytes.len() < nk {
+            self.b_bytes.resize(nk, 0);
+            self.b_sig.resize(nk, 0);
+            self.b_noised_t.resize(nk, 0);
+            self.b_all.resize(nk, 0);
+            self.b_packed.resize(nk, 0);
+        }
+        if self.scratch.len() < 512 {
+            self.scratch.resize(512, 0);
+        }
+        if self.a_idx.len() != m {
+            self.a_idx = (0..m).collect();
+        }
+        if self.b_idx.len() != n {
+            self.b_idx = (0..n).collect();
+        }
+    }
+}
+
+#[inline]
+fn as_u8(s: &[i8]) -> &[u8] {
+    // i8 and u8 share layout; reinterpret for the byte-oriented BLAKE3 commitment.
+    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len()) }
+}
+
+/// Rebuild the canonical `PlainProof` for a winning tile from the flat signal
+/// buffers. Only called on a hit (rare), so the `Vec<Vec>` reconstruction cost
+/// is irrelevant.
+#[allow(clippy::too_many_arguments)]
+fn make_proof(
+    a_sig: &[i8],
+    b_sig: &[i8],
+    m: usize,
+    n: usize,
+    k: usize,
+    rank: usize,
+    job_key: &[u8; 32],
+    a_rows: &[usize],
+    b_cols: &[usize],
+) -> PlainProof {
+    let a_vv: Vec<Vec<i8>> = a_sig.chunks_exact(k).map(|c| c.to_vec()).collect();
+    let b_vv: Vec<Vec<i8>> = b_sig.chunks_exact(k).map(|c| c.to_vec()).collect();
+    let a = build_matrix_proof(&a_vv, job_key, a_rows, k);
+    let bt = build_matrix_proof(&b_vv, job_key, b_cols, k);
+    PlainProof { m, n, k, noise_rank: rank, a, bt }
+}
+
+/// Per-cell tile jackpot over the FLAT noised buffers — used by the fallback
+/// (non-AVX-512 / non-h2×w64 shapes) and the AVX-VNNI remainder. Bit-identical
+/// to the reference (window XOR + rotate, `dot_i8` per cell). Stack scratch, no
+/// allocation.
+fn tile_jackpot_flat(
+    a_rows: &[usize],
+    b_cols: &[usize],
+    a_noised: &[i8],
+    b_noised_t: &[i8],
+    rank: usize,
+    k: usize,
+) -> [u32; JACKPOT_SIZE] {
+    let th = a_rows.len();
+    let tw = b_cols.len();
+    let mut jackpot_tile = [0i32; 256];
+    let mut jackpot = [0u32; JACKPOT_SIZE];
+    let mut ll = rank;
+    while ll <= k {
+        for (u, &ai) in a_rows.iter().enumerate() {
+            for (v, &bi) in b_cols.iter().enumerate() {
+                jackpot_tile[u * tw + v] += crate::vnni::dot_i8(
+                    &a_noised[ai * k + ll - rank..ai * k + ll],
+                    &b_noised_t[bi * k + ll - rank..bi * k + ll],
+                );
+            }
+        }
+        let xored = jackpot_tile[..th * tw].iter().fold(0u32, |acc, &x| acc ^ x as u32);
+        let tid = (ll / rank - 1) % JACKPOT_SIZE;
+        jackpot[tid] = jackpot[tid].rotate_left(LROT_PER_TILE as u32) ^ xored;
+        ll += rank;
+    }
+    jackpot
+}
+
 pub fn try_mine_one_bounded<R: Rng>(
+    ws: &mut Workspace,
     rng: &mut R,
     m: usize,
     n: usize,
@@ -335,66 +245,46 @@ pub fn try_mine_one_bounded<R: Rng>(
     bound_le: &[u8; 32],
 ) -> Option<PlainProof> {
     let rank = config.rank as usize;
+    ws.ensure(m, n, k);
+    let (mk, nk) = (m * k, n * k);
 
-    // Draw the signal matrices fast: one bulk RNG fill per matrix + a mask into
-    // [-64, 63] (a strict subset of the allowed [-64, 64], so the proof stays
-    // valid). A and B are the miner's FREE choice — only validity matters, not
-    // the exact distribution — so we skip rand's per-element `gen_range`
-    // rejection sampling (the dominant draw cost). B is drawn directly in the
-    // **transposed** (n×k) layout that every downstream consumer (commitment,
-    // noise, proof, tile sweep) wants, so there is no separate transpose pass.
+    // Draw signal A and Bᵀ into REUSED flat buffers: bulk RNG fill + mask into
+    // [-64,63] (a valid subset; A/B are the miner's free choice). No allocation.
     let to_signal = |b: u8| ((b & 0x7F) as i8) + SIGNAL_MIN;
-    let mut a_bytes = vec![0u8; m * k];
-    let mut bt_bytes = vec![0u8; n * k];
-    rng.fill(&mut a_bytes[..]);
-    rng.fill(&mut bt_bytes[..]);
-    let a_matrix: Vec<Vec<i8>> =
-        a_bytes.chunks_exact(k).map(|c| c.iter().map(|&b| to_signal(b)).collect()).collect();
-    let b_transposed: Vec<Vec<i8>> =
-        bt_bytes.chunks_exact(k).map(|c| c.iter().map(|&b| to_signal(b)).collect()).collect();
+    rng.fill(&mut ws.a_bytes[..mk]);
+    rng.fill(&mut ws.b_bytes[..nk]);
+    for i in 0..mk {
+        ws.a_sig[i] = to_signal(ws.a_bytes[i]);
+    }
+    for i in 0..nk {
+        ws.b_sig[i] = to_signal(ws.b_bytes[i]);
+    }
 
     let job_key = compute_job_key(header, config);
-    let a_row_major = pad_to_chunk_boundary(&flatten_matrix(&a_matrix));
-    let b_col_major = pad_to_chunk_boundary(&flatten_matrix(&b_transposed));
+    let a_row_major = pad_to_chunk_boundary(as_u8(&ws.a_sig[..mk]));
+    let b_col_major = pad_to_chunk_boundary(as_u8(&ws.b_sig[..nk]));
     let (b_noise_seed, a_noise_seed) = compute_commitment_hash(&job_key, &a_row_major, &b_col_major);
 
-    // Noise over the whole matrices (official reference PRF).
-    let a_all_rows: Vec<usize> = (0..m).collect();
-    let b_all_cols: Vec<usize> = (0..n).collect();
-    // Bit-identical SIMD (VBMI) drop-in for the reference PRF; falls back to the
-    // reference on non-VBMI hosts / non-128 rank. Oracle-guarded.
-    let noise = crate::fast_noise::compute_noise_for_indices_fast(
+    // Noise: copy signal → noised buffers, then add the official noise IN PLACE.
+    // `add_noise_into_fast` is bit-identical to `compute_noise_for_indices_fast`
+    // + element-wise wrapping add, but allocates no intermediate noise matrices.
+    ws.a_noised[..mk].copy_from_slice(&ws.a_sig[..mk]);
+    ws.b_noised_t[..nk].copy_from_slice(&ws.b_sig[..nk]);
+    crate::fast_noise::add_noise_into_fast(
         k,
         rank,
         (b_noise_seed, a_noise_seed),
-        &a_all_rows,
-        &b_all_cols,
+        &ws.a_idx[..m],
+        &ws.b_idx[..n],
+        &mut ws.a_noised[..mk],
+        &mut ws.b_noised_t[..nk],
     );
-
-    // a_noised / b_noised are signal (i8, [-64,64]) + noise (i8, [-63,63]) ⇒ in
-    // [-127,127] ⇒ they fit in i8 with no overflow. Storing them as i8 (instead of
-    // the reference i32) lets the rank-window dot product run on the vpdpbusd
-    // (AVX-VNNI "Int8") datapath — int7 GEMM computed on int8 lanes — exactly what
-    // production miners do. The integer result is identical (dot_i8 is tested
-    // bit-equal to scalar over int7+noise), so the jackpot/proof stay canonical.
-    let a_noised: Vec<Vec<i8>> = a_matrix
-        .iter()
-        .zip(&noise.a)
-        .map(|(a_row, n_row)| a_row.iter().zip(n_row).map(|(&a, &n)| (a as i32 + n as i32) as i8).collect())
-        .collect();
-    // b_noised_t[i][l] = b_transposed[i][l] + noise.b[i][l] (noise.b is the n×k
-    // col-major noise) — built directly, no intermediate b_noised + transpose.
-    let b_noised_t: Vec<Vec<i8>> = b_transposed
-        .iter()
-        .zip(&noise.b)
-        .map(|(b_row, n_row)| b_row.iter().zip(n_row).map(|(&b, &n)| (b as i32 + n as i32) as i8).collect())
-        .collect();
 
     let tile_h = config.rows_pattern.to_list().len();
     let tile_w = config.cols_pattern.to_list().len();
 
     // ── FAST PATH: the real Pearl tile shape (h=2 row-offsets × w=64 col-offsets)
-    // on AVX-512 VNNI runs the register-blocked micro-kernel, which
+    // on AVX-512 VNNI runs the register-blocked micro-kernel (BZMiner-class), which
     // is bit-identical to the per-cell tile (oracle-guarded) — it just computes the
     // SAME jackpot far faster. The proof is still built from the signal matrices +
     // pattern indices, exactly like the fallback, so shares stay canonical.
@@ -412,30 +302,28 @@ pub fn try_mine_one_bounded<R: Rng>(
             let nt = row_tiles.len();
             // A noised, TILE-ORDERED: tile t's two rows at 2t,2t+1, so 4 tiles = 8
             // contiguous rows for the 8×64 kernel. Built once per setup.
-            let mut a_tiled = vec![0i8; nt * 2 * k];
             for (t, rt) in row_tiles.iter().enumerate() {
-                a_tiled[(2 * t) * k..(2 * t) * k + k].copy_from_slice(&a_noised[rt[0]]);
-                a_tiled[(2 * t + 1) * k..(2 * t + 1) * k + k].copy_from_slice(&a_noised[rt[1]]);
+                let (r0, r1) = (rt[0] * k, rt[1] * k);
+                ws.a_tiled[(2 * t) * k..(2 * t) * k + k].copy_from_slice(&ws.a_noised[r0..r0 + k]);
+                ws.a_tiled[(2 * t + 1) * k..(2 * t + 1) * k + k].copy_from_slice(&ws.a_noised[r1..r1 + k]);
             }
             // ALL B columns gathered tile-ordered, packed ONCE. Packed-once + the
             // row-panel loop mean A is read from DRAM once per panel, not once per
             // col-tile (A re-streaming was the multi-thread bandwidth wall).
             let total_cols = col_tiles.len() * tile_w;
-            let mut b_all = vec![0i8; total_cols * k];
             for (ci, b_cols) in col_tiles.iter().enumerate() {
                 for (j, &c) in b_cols.iter().enumerate() {
                     let dst = (ci * tile_w + j) * k;
-                    b_all[dst..dst + k].copy_from_slice(&b_noised_t[c]);
+                    ws.b_all[dst..dst + k].copy_from_slice(&ws.b_noised_t[c * k..c * k + k]);
                 }
             }
             // 16-col packing groups on AVX-512, 8-col on AVX-VNNI → col-tile c's
             // first packed group is c*4 vs c*8 respectively.
-            let mut b_packed = Vec::new();
             let grp_per_tile = if avx512 { 4 } else { 8 };
             if avx512 {
-                crate::microkernel::pack_b_16(&b_all, total_cols, k, &mut b_packed);
+                crate::microkernel::pack_b_16(&ws.b_all[..total_cols * k], total_cols, k, &mut ws.b_packed);
             } else {
-                crate::microkernel::pack_b_8(&b_all, total_cols, k, &mut b_packed);
+                crate::microkernel::pack_b_8(&ws.b_all[..total_cols * k], total_cols, k, &mut ws.b_packed);
             }
 
             let panel = std::env::var("ARIA_PANEL")
@@ -443,8 +331,6 @@ pub fn try_mine_one_bounded<R: Rng>(
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|&v| v > 0)
                 .unwrap_or(256);
-            let mut scratch = vec![0i32; 512];
-            let fb_kernel = detect_dot_kernel(); // AVX-VNNI remainder (no 2×64 avxvnni)
 
             let mut p0 = 0;
             while p0 < nt {
@@ -456,22 +342,19 @@ pub fn try_mine_one_bounded<R: Rng>(
                         let msgs = if avx512 {
                             unsafe {
                                 crate::microkernel::jackpot_tile_8x64_avx512(
-                                    &a_tiled, &b_packed, 2 * t, grp_base, k, rank, &mut scratch,
+                                    &ws.a_tiled, &ws.b_packed, 2 * t, grp_base, k, rank, &mut ws.scratch,
                                 )
                             }
                         } else {
                             unsafe {
                                 crate::microkernel::jackpot_tile_8x64_avxvnni(
-                                    &a_tiled, &b_packed, 2 * t, grp_base, k, rank, &mut scratch,
+                                    &ws.a_tiled, &ws.b_packed, 2 * t, grp_base, k, rank, &mut ws.scratch,
                                 )
                             }
                         };
                         for (tt, msg) in msgs.iter().enumerate() {
                             if le_leq(&compute_jackpot_hash(msg, a_noise_seed), bound_le) {
-                                let rt = &row_tiles[t + tt];
-                                let a_proof = build_matrix_proof(&a_matrix, &job_key, rt, k);
-                                let b_proof = build_matrix_proof(&b_transposed, &job_key, b_cols, k);
-                                return Some(PlainProof { m, n, k, noise_rank: rank, a: a_proof, bt: b_proof });
+                                return Some(make_proof(&ws.a_sig[..mk], &ws.b_sig[..nk], m, n, k, rank, &job_key, &row_tiles[t + tt], b_cols));
                             }
                         }
                         t += 4;
@@ -482,16 +365,14 @@ pub fn try_mine_one_bounded<R: Rng>(
                         let jp = if avx512 {
                             unsafe {
                                 crate::microkernel::jackpot_tile_2x64_avx512(
-                                    &a_tiled, &b_packed, 2 * t, 2 * t + 1, grp_base, k, rank, &mut scratch,
+                                    &ws.a_tiled, &ws.b_packed, 2 * t, 2 * t + 1, grp_base, k, rank, &mut ws.scratch,
                                 )
                             }
                         } else {
-                            tile_jackpot(fb_kernel, rt, b_cols, &a_noised, &b_noised_t, rank, k)
+                            tile_jackpot_flat(rt, b_cols, &ws.a_noised[..mk], &ws.b_noised_t[..nk], rank, k)
                         };
                         if le_leq(&compute_jackpot_hash(&jp, a_noise_seed), bound_le) {
-                            let a_proof = build_matrix_proof(&a_matrix, &job_key, rt, k);
-                            let b_proof = build_matrix_proof(&b_transposed, &job_key, b_cols, k);
-                            return Some(PlainProof { m, n, k, noise_rank: rank, a: a_proof, bt: b_proof });
+                            return Some(make_proof(&ws.a_sig[..mk], &ws.b_sig[..nk], m, n, k, rank, &job_key, rt, b_cols));
                         }
                         t += 1;
                     }
@@ -503,32 +384,20 @@ pub fn try_mine_one_bounded<R: Rng>(
     }
 
     // ── FALLBACK: any other shape / non-AVX-512 CPU — per-cell kernel.
-    let kernel = detect_dot_kernel();
     for a_rows in threads_partition(&config.rows_pattern, m) {
         for b_cols in threads_partition(&config.cols_pattern, n) {
-            let jackpot =
-                tile_jackpot(kernel, &a_rows, &b_cols, &a_noised, &b_noised_t, rank, k);
-
-            let jackpot_hash = compute_jackpot_hash(&jackpot, a_noise_seed);
-            if le_leq(&jackpot_hash, bound_le) {
-                let a_proof = build_matrix_proof(&a_matrix, &job_key, &a_rows, k);
-                let b_proof = build_matrix_proof(&b_transposed, &job_key, &b_cols, k);
-                return Some(PlainProof {
-                    m,
-                    n,
-                    k,
-                    noise_rank: rank,
-                    a: a_proof,
-                    bt: b_proof,
-                });
+            let jp = tile_jackpot_flat(&a_rows, &b_cols, &ws.a_noised[..mk], &ws.b_noised_t[..nk], rank, k);
+            if le_leq(&compute_jackpot_hash(&jp, a_noise_seed), bound_le) {
+                return Some(make_proof(&ws.a_sig[..mk], &ws.b_sig[..nk], m, n, k, rank, &job_key, &a_rows, &b_cols));
             }
         }
     }
-
     None
 }
 
 /// Grind attempts until one tile beats `bound_le`. Returns the canonical proof.
+/// Allocates one reusable [`Workspace`] for the whole grind (no per-attempt
+/// allocation in the hot loop).
 pub fn mine_share<R: Rng>(
     rng: &mut R,
     m: usize,
@@ -538,8 +407,9 @@ pub fn mine_share<R: Rng>(
     config: &MiningConfiguration,
     bound_le: &[u8; 32],
 ) -> PlainProof {
+    let mut ws = Workspace::new();
     loop {
-        if let Some(p) = try_mine_one_bounded(rng, m, n, k, header, config, bound_le) {
+        if let Some(p) = try_mine_one_bounded(&mut ws, rng, m, n, k, header, config, bound_le) {
             return p;
         }
     }

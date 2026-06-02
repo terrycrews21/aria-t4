@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ariaminer::official_grind::try_mine_one_bounded;
+use ariaminer::official_grind::{Workspace, try_mine_one_bounded};
 use ariaminer::official_proof::encode_base64;
 use ariaminer::protocol::{Job, MiningParams};
 use ariaminer::stratum::{JobEvent, StratumConfig, Submission, run as stratum_run};
@@ -129,6 +129,8 @@ fn spawn_grind(
                 let mut rng = StdRng::seed_from_u64(
                     0xA51A_0000 ^ (tid as u64) ^ (Instant::now().elapsed().as_nanos() as u64),
                 );
+                // One reusable workspace per thread — the hot loop allocates nothing.
+                let mut ws = Workspace::new();
                 while !stop.load(Ordering::Relaxed) {
                     // Adopt the latest job at each setup boundary.
                     let job = job_slot.lock().clone();
@@ -136,7 +138,7 @@ fn spawn_grind(
                     // One faithful attempt: draw matrices, noise, sweep every
                     // PeriodicPattern tile against the share bound.
                     let hit = try_mine_one_bounded(
-                        &mut rng, oj.m, oj.n, oj.k, &oj.header, &oj.config, &oj.bound_le,
+                        &mut ws, &mut rng, oj.m, oj.n, oj.k, &oj.header, &oj.config, &oj.bound_le,
                     );
                     attempts.fetch_add(1, Ordering::Relaxed);
                     if let Some(proof) = hit {
