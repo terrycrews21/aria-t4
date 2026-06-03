@@ -284,7 +284,7 @@ pub fn try_mine_one_bounded<R: Rng>(
     let tile_w = config.cols_pattern.to_list().len();
 
     // ── FAST PATH: the real Pearl tile shape (h=2 row-offsets × w=64 col-offsets)
-    // on AVX-512 VNNI runs the register-blocked micro-kernel (BZMiner-class), which
+    // on AVX-512 VNNI runs the register-blocked micro-kernel, which
     // is bit-identical to the per-cell tile (oracle-guarded) — it just computes the
     // SAME jackpot far faster. The proof is still built from the signal matrices +
     // pattern indices, exactly like the fallback, so shares stay canonical.

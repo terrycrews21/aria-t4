@@ -70,6 +70,24 @@ cargo build --release
 **Tip:** on a desktop, leaving one or two threads free
 (`--threads <cores-1>`) often gives a smoother system and equal hashrate.
 
+## Auto-tuned grid (v0.3.0)
+
+The mining grid (`m × n` batch) is the biggest single lever for CPU throughput, and
+the sweet spot depends on your cache/memory. Set `ARIA_AUTOTUNE=1` and the miner
+scans a set of grid sizes at startup, measures each one's effective tile throughput,
+and locks the fastest for your hardware — no manual `ARIA_BATCH_M/N` tuning needed.
+
+```bash
+ARIA_AUTOTUNE=1 ariaminer --pool <host:port> --wallet prl1... --worker rig --threads N
+```
+
+- `ARIA_AUTOTUNE_GRIDS` — comma-separated candidates (default `2048,4096,8192,12288,16384`).
+- `ARIA_AUTOTUNE_SECS` — seconds measured per candidate (default `5`).
+
+The pool needs no change: proofs are validated from their own embedded shape, so each
+miner is free to pick its own grid. Without `ARIA_AUTOTUNE`, the miner uses the fixed
+`ARIA_BATCH_M/N` grid (default behaviour, unchanged).
+
 ## Where to mine
 
 Point it at any Pearl pool that speaks the Pearl Stratum v1 dialect. One such

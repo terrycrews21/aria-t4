@@ -168,6 +168,82 @@ fn build_grind_job(params: &MiningParams, job: &Job, difficulty: u64) -> anyhow:
     Ok(GrindJob { job_id: job.job_id.clone(), official })
 }
 
+/// Auto-tune the mining grid: scan candidate batch sizes, measure each one's
+/// effective tile throughput (setups/s × tiles-per-setup, and tiles ∝ m·n at fixed
+/// config), and return the batch with the best throughput. The pool's hardware sweet
+/// spot is found automatically instead of hard-coding a single grid.
+/// The pool accepts any grid (proof validation is config-agnostic), so the miner
+/// picks its own hardware sweet spot. Each candidate is measured by running the
+/// real grind for a few seconds. Tunable: ARIA_AUTOTUNE_SECS, ARIA_AUTOTUNE_GRIDS
+/// (comma-separated).
+#[allow(clippy::too_many_arguments)]
+async fn autotune_grid(
+    params: &MiningParams,
+    job: &Job,
+    difficulty: u64,
+    threads: usize,
+    attempts: &Arc<AtomicU64>,
+    shares: &Arc<AtomicU64>,
+    credited: &Arc<AtomicU64>,
+    diff_arc: &Arc<AtomicU64>,
+    submit_tx: &mpsc::Sender<Submission>,
+) -> usize {
+    let candidates: Vec<usize> = std::env::var("ARIA_AUTOTUNE_GRIDS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<_>>())
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| vec![2048, 4096, 8192, 12288, 16384]);
+    let secs: u64 = std::env::var("ARIA_AUTOTUNE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    tracing::info!(grids = ?candidates, secs, "🔧 auto-tune: scanning grids");
+    let mut best_batch = candidates[0];
+    let mut best_score = 0f64;
+    for &b in &candidates {
+        unsafe {
+            std::env::set_var("ARIA_BATCH_M", b.to_string());
+            std::env::set_var("ARIA_BATCH_N", b.to_string());
+        }
+        let gj = match build_grind_job(params, job, difficulty) {
+            Ok(g) => Arc::new(g),
+            Err(e) => {
+                tracing::warn!(grid = b, error = %e, "auto-tune: build failed, skip");
+                continue;
+            }
+        };
+        let (m, n) = (gj.official.m, gj.official.n);
+        let slot = Arc::new(Mutex::new(gj));
+        let start = attempts.load(Ordering::Relaxed);
+        let t0 = Instant::now();
+        let grind = spawn_grind(
+            slot,
+            threads,
+            Arc::clone(attempts),
+            Arc::clone(shares),
+            Arc::clone(credited),
+            Arc::clone(diff_arc),
+            submit_tx.clone(),
+        );
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        let delta = attempts.load(Ordering::Relaxed).saturating_sub(start);
+        let dt = t0.elapsed().as_secs_f64().max(1e-3);
+        grind.retire();
+        let setups_s = delta as f64 / dt;
+        let score = setups_s * m as f64 * n as f64; // ∝ effective tiles/s
+        tracing::info!(
+            grid = b, m, n,
+            setups_per_s = format!("{setups_s:.1}"),
+            "auto-tune candidate"
+        );
+        if score > best_score {
+            best_score = score;
+            best_batch = b;
+        }
+    }
+    best_batch
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -305,6 +381,27 @@ async fn main() -> anyhow::Result<()> {
                 match &job_slot {
                     Some(slot) => *slot.lock() = gj,
                     None => {
+                        // First job: optionally auto-tune the grid (scan candidate
+                        // batch sizes, lock the best tile throughput) before mining.
+                        // The pool accepts any grid (config-agnostic validation).
+                        let gj = if std::env::var("ARIA_AUTOTUNE").is_ok() {
+                            let best = autotune_grid(
+                                &params, &job, cur_difficulty, threads,
+                                &attempts, &shares, &credited, &diff_arc, &submit_tx,
+                            )
+                            .await;
+                            unsafe {
+                                std::env::set_var("ARIA_BATCH_M", best.to_string());
+                                std::env::set_var("ARIA_BATCH_N", best.to_string());
+                            }
+                            tracing::info!(grid = best, "🔧 auto-tune locked grid");
+                            match build_grind_job(&params, &job, cur_difficulty) {
+                                Ok(g) => Arc::new(g),
+                                Err(_) => gj,
+                            }
+                        } else {
+                            gj
+                        };
                         tracing::info!(job_id = %job.job_id, "→ starting official grind");
                         let slot = Arc::new(Mutex::new(gj));
                         job_slot = Some(Arc::clone(&slot));
