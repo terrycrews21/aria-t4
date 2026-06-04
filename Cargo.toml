@@ -1,6 +1,6 @@
 [package]
 name = "ariaminer"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 description = "ARIAMiner — open-source, 0% dev-fee CPU miner for Pearl (PRL). Canonical GEMM Int7×Int7 proof-of-work on the AVX-512 VNNI / AVX-VNNI int8 datapath."
@@ -8,10 +8,51 @@ repository = "https://github.com/stefancrypto68/ariaminer"
 readme = "README.md"
 keywords = ["pearl", "mining", "cpu", "miner", "crypto"]
 categories = ["command-line-utilities"]
+build = "build.rs"
+
+[features]
+# v0.4.0 : chemin GPU (kernel CuTe IMMA + fold jackpot + pow-check via libpearl_gpu).
+# OFF par défaut → le miner CPU reste buildable sans CUDA.
+gpu = []
 
 [[bin]]
 name = "ariaminer"
 path = "src/bin/ariaminer.rs"
+
+[[bin]]
+name = "gpu_smoke"
+path = "src/bin/gpu_smoke.rs"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gpu_live"
+path = "src/bin/gpu_live.rs"
+required-features = ["gpu"]
+
+[[bin]]
+name = "commit_check"
+path = "src/bin/commit_check.rs"
+required-features = ["gpu"]
+
+[[bin]]
+name = "commit_seeds_check"
+path = "src/bin/commit_seeds_check.rs"
+required-features = ["gpu"]
+
+[[bin]]
+name = "resident_bench"
+path = "src/bin/resident_bench.rs"
+required-features = ["gpu"]
+
+[[bin]]
+name = "resident_bench2"
+path = "src/bin/resident_bench2.rs"
+required-features = ["gpu"]
+
+[[bin]]
+name = "noise_check"
+path = "src/bin/noise_check.rs"
+required-features = ["gpu"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -13,7 +13,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ariaminer::official_grind::{Workspace, try_mine_one_bounded};
+#[cfg(not(feature = "gpu"))]
+use ariaminer::official_grind::try_mine_one_bounded;
+use ariaminer::official_grind::Workspace;
+#[cfg(feature = "gpu")]
+#[cfg(feature = "gpu")]
+use ariaminer::official_grind::{canonical_gpu_config, try_mine_one_bounded_gpu_resident_ctx};
 use ariaminer::official_proof::encode_base64;
 use ariaminer::protocol::{Job, MiningParams};
 use ariaminer::stratum::{JobEvent, StratumConfig, Submission, run as stratum_run};
@@ -131,15 +136,39 @@ fn spawn_grind(
                 );
                 // One reusable workspace per thread — the hot loop allocates nothing.
                 let mut ws = Workspace::new();
+                // GPU : contexte résident persistant (alloué une fois, sur le 1er job).
+                #[cfg(feature = "gpu")]
+                let mut gpu_ctx: Option<ariaminer::gpu_ffi::ResidentCtx> = None;
                 while !stop.load(Ordering::Relaxed) {
                     // Adopt the latest job at each setup boundary.
                     let job = job_slot.lock().clone();
                     let oj = &job.official;
                     // One faithful attempt: draw matrices, noise, sweep every
                     // PeriodicPattern tile against the share bound.
+                    // CPU: the pool's tile config on the AVX micro-kernel.
+                    #[cfg(not(feature = "gpu"))]
                     let hit = try_mine_one_bounded(
                         &mut ws, &mut rng, oj.m, oj.n, oj.k, &oj.header, &oj.config, &oj.bound_le,
                     );
+                    // GPU: the GEMM IMMA kernel folds 8×16 MMA fragments, so we mine
+                    // with `canonical_gpu_config` (the fragment tile shape). The share
+                    // bound is config-independent (= MAX/difficulty), so it's unchanged;
+                    // m/n are forced to multiples of 128 (kernel CTA tile). The node
+                    // reconstructs this exact config from the submitted indices → verify OK.
+                    #[cfg(feature = "gpu")]
+                    let hit = {
+                        let gconf = canonical_gpu_config(oj.k as u32);
+                        let gm = oj.m.div_ceil(128) * 128;
+                        let gn = oj.n.div_ceil(128) * 128;
+                        // (Ré)alloue le contexte résident si la forme change (alloc 1× sinon).
+                        if gpu_ctx.as_ref().map(|c| c.dims()) != Some((gm, gn, oj.k)) {
+                            gpu_ctx = Some(ariaminer::gpu_ffi::ResidentCtx::new(gm, gn, oj.k, 64));
+                        }
+                        let ctx = gpu_ctx.as_ref().unwrap();
+                        try_mine_one_bounded_gpu_resident_ctx(
+                            ctx, &mut ws, &mut rng, &oj.header, &gconf, &oj.bound_le,
+                        )
+                    };
                     attempts.fetch_add(1, Ordering::Relaxed);
                     if let Some(proof) = hit {
                         match encode_base64(&proof) {
@@ -253,6 +282,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    // GPU build inclus : on garde le multi-thread — chaque thread prépare son
+    // attempt (signal+commitment+noise sur CPU) en parallèle et nourrit le GPU.
+    // Le prologue CPU est le goulot, donc plus de threads = GPU mieux alimenté.
     let threads = args
         .threads
         .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1));

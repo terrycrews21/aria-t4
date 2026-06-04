@@ -19,6 +19,8 @@
 
 use pearl_blake3::{MerkleTree, blake3_digest, pad_to_chunk_boundary};
 use rand::Rng;
+#[cfg(feature = "gpu")]
+use rand::RngCore;
 use zk_pow::api::proof::{IncompleteBlockHeader, MiningConfiguration, PeriodicPattern};
 use zk_pow::api::proof_utils::compute_jackpot_hash;
 use zk_pow::ffi::plain_proof::{MatrixMerkleProof, PlainProof};
@@ -415,6 +417,292 @@ pub fn mine_share<R: Rng>(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GPU path (feature `gpu`). The hot loop (signal→GEMM IMMA→jackpot fold→pow-check)
+// runs on the 5080 via `gpu_ffi::grind`; the commitment prologue (job_key, noise)
+// and proof building stay on the CPU, byte-identical to the CPU grind above.
+//
+// VERROU correctness résolu : le kernel pave en tuiles 8×16 (1 fragment MMA / thread).
+// Validé exhaustivement (128 lanes) que chaque fragment = produit cartésien 8 rows ×
+// 16 cols dont la forme NORMALISÉE est UNIVERSELLE :
+//   rows = [0,8,32,40,64,72,96,104]   cols = [0,1,16,17,32,33,48,49,64,65,80,81,96,97,112,113]
+// et que tous les offsets globaux des lanes satisfont `PeriodicPattern::offset_is_valid`.
+// Donc en minant avec CETTE config, le vérifieur reconstruit le MÊME pattern depuis les
+// indices soumis → job_key identique → `verify_plain_proof` valide. Cf §VERROU mémoire.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `MiningConfiguration` whose tile shape reproduces the GPU MMA fragment
+/// (8×16, canonical normalized pattern). MUST be used to mine on the GPU so the
+/// node-side `parse_plain_proof` reconstructs an identical config (→ same job_key).
+#[cfg(feature = "gpu")]
+pub fn canonical_gpu_config(common_dim: u32) -> MiningConfiguration {
+    use zk_pow::api::proof::MMAType;
+    MiningConfiguration {
+        common_dim,
+        rank: 128,
+        mma_type: MMAType::Int7xInt7ToInt32,
+        rows_pattern: PeriodicPattern::from_list(&[0, 8, 32, 40, 64, 72, 96, 104]).unwrap(),
+        cols_pattern: PeriodicPattern::from_list(&[
+            0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113,
+        ])
+        .unwrap(),
+        reserved: MiningConfiguration::RESERVED_VALUE,
+    }
+}
+
+/// Reinterpret a 32-byte hash/bound as 8 little-endian u32 words — exactly how
+/// BLAKE3 reads its keyed key and how the LE-256 difficulty compare words split.
+#[cfg(feature = "gpu")]
+#[inline]
+fn le_u32x8(bytes: &[u8; 32]) -> [u32; 8] {
+    std::array::from_fn(|i| u32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]))
+}
+
+/// Fill `out` with valid Pearl signal values in [-64,63] using a fast non-crypto
+/// PRNG (xorshift64*), fused with the `to_signal` mask in a single pass. The
+/// signal is the miner's FREE choice (no consensus constraint), so we don't pay
+/// ChaCha's cost — this was the dominant per-attempt cost (~43ms at 8192² vs the
+/// whole rest ~32ms). One `u64` seed is drawn from the caller's RNG per attempt
+/// so the stream stays driven by (and reproducible from) the passed `Rng`.
+#[cfg(feature = "gpu")]
+#[inline]
+fn fast_fill_signal(seed: u64, out: &mut [i8]) {
+    let mut s = seed | 1;
+    let mut next = || {
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        s.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let mut chunks = out.chunks_exact_mut(8);
+    for c in &mut chunks {
+        let r = next().to_le_bytes();
+        for j in 0..8 {
+            c[j] = ((r[j] & 0x7F) as i8) + SIGNAL_MIN;
+        }
+    }
+    for (i, slot) in chunks.into_remainder().iter_mut().enumerate() {
+        let r = (next() >> (8 * (i % 8))) as u8;
+        *slot = ((r & 0x7F) as i8) + SIGNAL_MIN;
+    }
+}
+
+/// One GPU mining attempt. Identical commitment prologue to
+/// [`try_mine_one_bounded`], but the per-tile jackpot+pow sweep runs on the GPU.
+/// On a hit, the kernel returns the winning fragment's global (rows, cols); we
+/// build the canonical `PlainProof` from the signal matrices exactly like the CPU.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_mine_one_bounded_gpu<R: Rng>(
+    ws: &mut Workspace,
+    rng: &mut R,
+    m: usize,
+    n: usize,
+    k: usize,
+    header: &IncompleteBlockHeader,
+    config: &MiningConfiguration,
+    bound_le: &[u8; 32],
+) -> Option<PlainProof> {
+    let rank = config.rank as usize;
+    ws.ensure(m, n, k);
+    let (mk, nk) = (m * k, n * k);
+    let prof = std::env::var("ARIA_GPU_PROFILE").is_ok();
+    let t = std::time::Instant::now();
+
+    // Signal A / Bᵀ — fast non-crypto fill (the signal is the miner's free choice).
+    // Single fused pass straight into the signal buffers; ~5× faster than the
+    // ChaCha `rng.fill` + separate mask pass it replaces.
+    fast_fill_signal(rng.next_u64(), &mut ws.a_sig[..mk]);
+    fast_fill_signal(rng.next_u64(), &mut ws.b_sig[..nk]);
+    let t_sig = t.elapsed();
+
+    let job_key = compute_job_key(header, config);
+    let a_row_major = pad_to_chunk_boundary(as_u8(&ws.a_sig[..mk]));
+    let b_col_major = pad_to_chunk_boundary(as_u8(&ws.b_sig[..nk]));
+    let (b_noise_seed, a_noise_seed) = compute_commitment_hash(&job_key, &a_row_major, &b_col_major);
+    let t_commit = t.elapsed();
+
+    ws.a_noised[..mk].copy_from_slice(&ws.a_sig[..mk]);
+    ws.b_noised_t[..nk].copy_from_slice(&ws.b_sig[..nk]);
+    crate::fast_noise::add_noise_into_fast(
+        k,
+        rank,
+        (b_noise_seed, a_noise_seed),
+        &ws.a_idx[..m],
+        &ws.b_idx[..n],
+        &mut ws.a_noised[..mk],
+        &mut ws.b_noised_t[..nk],
+    );
+    let t_noise = t.elapsed();
+
+    // GPU consumes the noised matrices; key = a_noise_seed, bound = LE-256 words.
+    let pow_key = le_u32x8(&a_noise_seed);
+    let pow_bound = le_u32x8(bound_le);
+    let (_found, hits) = crate::gpu_ffi::grind(
+        &ws.a_noised[..mk], &ws.b_noised_t[..nk], m, n, k, &pow_key, &pow_bound, 64,
+    );
+    if prof {
+        let t_gpu = t.elapsed();
+        eprintln!(
+            "[profile m={m} n={n} k={k}] signal={:.1}ms  commit={:.1}ms  noise={:.1}ms  gpu(upload+kernel)={:.1}ms  TOTAL={:.1}ms",
+            t_sig.as_secs_f64() * 1e3,
+            (t_commit - t_sig).as_secs_f64() * 1e3,
+            (t_noise - t_commit).as_secs_f64() * 1e3,
+            (t_gpu - t_noise).as_secs_f64() * 1e3,
+            t_gpu.as_secs_f64() * 1e3,
+        );
+    }
+
+    // Each hit is a full 8×16 cartesian fragment (validated). Build the proof from
+    // the first one whose shape matches the config tile (defensive guard).
+    let tile_h = config.rows_pattern.to_list().len();
+    let tile_w = config.cols_pattern.to_list().len();
+    for h in &hits {
+        if h.rows.len() == tile_h && h.cols.len() == tile_w {
+            return Some(make_proof(
+                &ws.a_sig[..mk], &ws.b_sig[..nk], m, n, k, rank, &job_key, &h.rows, &h.cols,
+            ));
+        }
+    }
+    None
+}
+
+/// RÉSIDENT : un attempt entièrement sur GPU (gen signal int7 + commit + noise +
+/// grind, zéro upload a_eff/b_eff). Sur win, le CPU regénère a_sig/b_sig via la
+/// même formule `int7_at(setup_seed,..)` pour bâtir la PlainProof. Le résultat
+/// passe `verify_plain_proof` exactement comme le chemin hybride.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_mine_one_bounded_gpu_resident<R: Rng>(
+    ws: &mut Workspace,
+    rng: &mut R,
+    m: usize,
+    n: usize,
+    k: usize,
+    header: &IncompleteBlockHeader,
+    config: &MiningConfiguration,
+    bound_le: &[u8; 32],
+) -> Option<PlainProof> {
+    let rank = config.rank as usize;
+    ws.ensure(m, n, k);
+    let (mk, nk) = (m * k, n * k);
+    let job_key = compute_job_key(header, config);
+    let setup_seed = rng.next_u64();
+
+    let (found, hits) =
+        crate::gpu_ffi::resident_grind(setup_seed, m, n, k, &job_key, bound_le, 64);
+    if found == 0 {
+        return None;
+    }
+
+    let tile_h = config.rows_pattern.to_list().len();
+    let tile_w = config.cols_pattern.to_list().len();
+    let hit = hits
+        .iter()
+        .find(|h| h.rows.len() == tile_h && h.cols.len() == tile_w)?;
+
+    // Regénère le signal complet (même int7_at que le kernel) pour la preuve.
+    for i in 0..m {
+        for j in 0..k {
+            ws.a_sig[i * k + j] = crate::gpu_ffi::int7_at(setup_seed, 0, i as u32, j as u32);
+        }
+    }
+    for i in 0..n {
+        for j in 0..k {
+            ws.b_sig[i * k + j] = crate::gpu_ffi::int7_at(setup_seed, 1, i as u32, j as u32);
+        }
+    }
+    Some(make_proof(
+        &ws.a_sig[..mk], &ws.b_sig[..nk], m, n, k, rank, &job_key, &hit.rows, &hit.cols,
+    ))
+}
+
+/// RÉSIDENT avec contexte PERSISTANT (buffers alloués 1×) — la version rapide pour
+/// le live (≈145 TH/s). Identique à `try_mine_one_bounded_gpu_resident` mais
+/// réutilise `ctx` au lieu de tout réallouer. m,n,k viennent du ctx.
+#[cfg(feature = "gpu")]
+pub fn try_mine_one_bounded_gpu_resident_ctx<R: Rng>(
+    ctx: &crate::gpu_ffi::ResidentCtx,
+    ws: &mut Workspace,
+    rng: &mut R,
+    header: &IncompleteBlockHeader,
+    config: &MiningConfiguration,
+    bound_le: &[u8; 32],
+) -> Option<PlainProof> {
+    let (m, n, k) = ctx.dims();
+    let rank = config.rank as usize;
+    ws.ensure(m, n, k);
+    let (mk, nk) = (m * k, n * k);
+    let job_key = compute_job_key(header, config);
+    let setup_seed = rng.next_u64();
+
+    let (found, hits) = ctx.grind(setup_seed, &job_key, bound_le);
+    if found == 0 {
+        return None;
+    }
+    let tile_h = config.rows_pattern.to_list().len();
+    let tile_w = config.cols_pattern.to_list().len();
+    let hit = hits
+        .iter()
+        .find(|h| h.rows.len() == tile_h && h.cols.len() == tile_w)?;
+
+    for i in 0..m {
+        for j in 0..k {
+            ws.a_sig[i * k + j] = crate::gpu_ffi::int7_at(setup_seed, 0, i as u32, j as u32);
+        }
+    }
+    for i in 0..n {
+        for j in 0..k {
+            ws.b_sig[i * k + j] = crate::gpu_ffi::int7_at(setup_seed, 1, i as u32, j as u32);
+        }
+    }
+    Some(make_proof(
+        &ws.a_sig[..mk], &ws.b_sig[..nk], m, n, k, rank, &job_key, &hit.rows, &hit.cols,
+    ))
+}
+
+/// Boucle le grind RÉSIDENT jusqu'à un hit ; renvoie la preuve canonique.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn mine_share_gpu_resident<R: Rng>(
+    rng: &mut R,
+    m: usize,
+    n: usize,
+    k: usize,
+    header: &IncompleteBlockHeader,
+    config: &MiningConfiguration,
+    bound_le: &[u8; 32],
+) -> PlainProof {
+    let mut ws = Workspace::new();
+    loop {
+        if let Some(p) =
+            try_mine_one_bounded_gpu_resident(&mut ws, rng, m, n, k, header, config, bound_le)
+        {
+            return p;
+        }
+    }
+}
+
+/// Grind on the GPU until a tile beats `bound_le`; returns the canonical proof.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn mine_share_gpu<R: Rng>(
+    rng: &mut R,
+    m: usize,
+    n: usize,
+    k: usize,
+    header: &IncompleteBlockHeader,
+    config: &MiningConfiguration,
+    bound_le: &[u8; 32],
+) -> PlainProof {
+    let mut ws = Workspace::new();
+    loop {
+        if let Some(p) = try_mine_one_bounded_gpu(&mut ws, rng, m, n, k, header, config, bound_le) {
+            return p;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +767,63 @@ mod tests {
             crate::official_proof::encode_bytes(&proof).unwrap(),
             crate::official_proof::encode_bytes(&back).unwrap(),
         );
+    }
+
+    /// THE étape-3 deliverable: a proof produced by OUR **GPU** grind must pass the
+    /// official node-side verifiers, exactly like the CPU path. This closes the
+    /// VERROU (GPU tile ↔ MiningConfiguration): we mine with `canonical_gpu_config`
+    /// (8×16, the MMA fragment shape) so `parse_plain_proof` reconstructs the same
+    /// config from the submitted indices → same job_key → `verify_plain_proof` OK.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_grind_proof_passes_official_verify() {
+        let (m, n, k) = (256usize, 128usize, 4096usize);
+        let header = easy_header(0x207f_ffff);
+        let config = canonical_gpu_config(k as u32);
+
+        let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(header.nbits, &config);
+        let mut bound_le = [0u8; 32];
+        bound.to_little_endian(&mut bound_le);
+
+        let mut rng = StdRng::seed_from_u64(0xA51A_C0DE);
+        let proof = mine_share_gpu(&mut rng, m, n, k, &header, &config, &bound_le);
+
+        // Structural contract (Merkle roots == hash_a/hash_b, pattern reconstructs).
+        zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof)
+            .expect("GPU proof must parse (roots == hash_a/hash_b)");
+        // Full plain verification: roots + jackpot difficulty under the real header.
+        zk_pow::api::verify::verify_plain_proof(&header, &proof)
+            .expect("GPU proof must pass verify_plain_proof");
+
+        // Survives our canonical wire codec untouched.
+        let b64 = crate::official_proof::encode_base64(&proof).unwrap();
+        let back = crate::official_proof::decode_base64(&b64).unwrap();
+        assert_eq!(
+            crate::official_proof::encode_bytes(&proof).unwrap(),
+            crate::official_proof::encode_bytes(&back).unwrap(),
+        );
+    }
+
+    /// RÉSIDENT : preuve produite par le pipeline 100% GPU (gen+commit+noise+grind
+    /// résidents) doit passer le verify officiel, exactement comme l'hybride.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_resident_proof_passes_official_verify() {
+        let (m, n, k) = (256usize, 128usize, 4096usize);
+        let header = easy_header(0x207f_ffff);
+        let config = canonical_gpu_config(k as u32);
+
+        let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(header.nbits, &config);
+        let mut bound_le = [0u8; 32];
+        bound.to_little_endian(&mut bound_le);
+
+        let mut rng = StdRng::seed_from_u64(0x5080_DEAD_BEEF);
+        let proof = mine_share_gpu_resident(&mut rng, m, n, k, &header, &config, &bound_le);
+
+        zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof)
+            .expect("resident GPU proof must parse (roots == hash_a/hash_b)");
+        zk_pow::api::verify::verify_plain_proof(&header, &proof)
+            .expect("resident GPU proof must pass verify_plain_proof");
     }
 
     /// h=2 × w=64 config — the real Pearl tile shape, which triggers the AVX-512

@@ -8,6 +8,8 @@
 pub mod cpu_engine;
 pub mod fast_noise;
 pub mod gemm;
+#[cfg(feature = "gpu")]
+pub mod gpu_ffi;
 pub mod merkle;
 pub mod microkernel;
 pub mod official_grind;
