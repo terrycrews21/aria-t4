@@ -10,6 +10,12 @@ unsafe extern "C" {
         hit_rows: *mut c_int, hit_cols: *mut c_int, max_hits: c_int,
     ) -> c_int;
 
+    fn pearl_gpu_grind_2x64(
+        a_eff: *const i8, b_eff: *const i8, m: c_int, n: c_int, k: c_int,
+        pow_key: *const u32, pow_bound: *const u32,
+        hit_rows: *mut c_int, hit_cols: *mut c_int, max_hits: c_int,
+    ) -> c_int;
+
     fn pearl_gpu_tensor_hash(
         data: *const u8, len: u32, key: *const u8, out: *mut u8,
     ) -> c_int;
@@ -30,12 +36,22 @@ unsafe extern "C" {
     ) -> c_int;
 
     fn pearl_resident_create(m: c_int, n: c_int, k: c_int, max_hits: c_int) -> *mut core::ffi::c_void;
+    fn pearl_resident_create_2x64(m: c_int, n: c_int, k: c_int, max_hits: c_int) -> *mut core::ffi::c_void;
     fn pearl_resident_grind_ctx(
         ctx: *mut core::ffi::c_void, setup_seed: u64,
         job_key: *const u8, pow_bound_le: *const u8,
         hit_rows: *mut c_int, hit_cols: *mut c_int,
     ) -> c_int;
     fn pearl_resident_destroy(ctx: *mut core::ffi::c_void);
+
+    fn pearl_proof_create(max_rows: c_int, k: c_int, max_leafdata: c_int) -> *mut core::ffi::c_void;
+    fn pearl_proof_build(
+        ctx: *mut core::ffi::c_void, setup_seed: u64, sel: c_int, rows: c_int, k: c_int,
+        job_key: *const u8, leaf_indices: *const i64, n_leaves: c_int,
+        out_leaf_data: *mut u8, out_layers: *mut u8, out_layer_lens: *mut i64,
+        out_num_layers: *mut c_int, out_root: *mut u8,
+    ) -> c_int;
+    fn pearl_proof_destroy(ctx: *mut core::ffi::c_void);
 
     fn pearl_resident2_create(m: c_int, n: c_int, k: c_int) -> *mut core::ffi::c_void;
     fn pearl_resident2_grind_batch(
@@ -95,6 +111,13 @@ impl ResidentCtx {
     pub fn new(m: usize, n: usize, k: usize, max_hits: usize) -> Self {
         let ptr = unsafe { pearl_resident_create(m as c_int, n as c_int, k as c_int, max_hits as c_int) };
         assert!(!ptr.is_null(), "pearl_resident_create a échoué (VRAM ?)");
+        Self { ptr, m, n, k, max_hits }
+    }
+    /// Variante **2×64** (AlphaPool, v1.1) : pipeline résident identique mais le grind
+    /// final folde en tuile 2 lignes {r,r+32} × 64 cols. `grind`/`dims`/`Drop` partagés.
+    pub fn new_2x64(m: usize, n: usize, k: usize, max_hits: usize) -> Self {
+        let ptr = unsafe { pearl_resident_create_2x64(m as c_int, n as c_int, k as c_int, max_hits as c_int) };
+        assert!(!ptr.is_null(), "pearl_resident_create_2x64 a échoué (VRAM ?)");
         Self { ptr, m, n, k, max_hits }
     }
     /// Un grind résident. Renvoie (nb_candidats, hits).
@@ -218,6 +241,95 @@ pub fn grind(
     let mut hc = vec![0i32; max_hits * 128];
     let found = unsafe {
         pearl_gpu_grind(
+            a_eff.as_ptr(), b_eff.as_ptr(), m as c_int, n as c_int, k as c_int,
+            pow_key.as_ptr(), pow_bound.as_ptr(),
+            hr.as_mut_ptr(), hc.as_mut_ptr(), max_hits as c_int,
+        )
+    };
+    let nret = (found.max(0) as usize).min(max_hits);
+    let mut hits = Vec::with_capacity(nret);
+    for s in 0..nret {
+        let mut rows: Vec<usize> = hr[s * 128..s * 128 + 128].iter().map(|&x| x as usize).collect();
+        let mut cols: Vec<usize> = hc[s * 128..s * 128 + 128].iter().map(|&x| x as usize).collect();
+        rows.sort_unstable(); rows.dedup();
+        cols.sort_unstable(); cols.dedup();
+        hits.push(Hit { rows, cols });
+    }
+    (found, hits)
+}
+
+/// Arbre Merkle keyé d'une matrice signal, construit ENTIÈREMENT sur GPU et rapatrié
+/// (toutes les couches + les chunks de feuilles demandés). Le CPU n'a plus qu'à faire le
+/// walk d'indices (= `MerkleTree::get_multileaf_proof`), aucun hachage. `layers` = octets,
+/// nœud `j` de la couche `l` = `layers[(off(l)+j)*32 .. +32]` où `off(l)=Σ layer_lens[0..l]`.
+pub struct ProofRaw {
+    pub leaf_data: Vec<u8>,       // n_leaves * 1024
+    pub layers: Vec<u8>,          // total_nodes * 32
+    pub layer_lens: Vec<usize>,   // nœuds par couche (layer_lens[0] = total_leaves)
+    pub root: [u8; 32],
+}
+
+/// Contexte de preuve GPU PERSISTANT : buffers alloués 1× (signal + couches), réutilisés à
+/// chaque `build`. Un par thread builder (chacun son stream) → preuves en parallèle.
+pub struct ProofGpuCtx {
+    ptr: *mut core::ffi::c_void,
+    max_rows: usize,
+    k: usize,
+    max_leafdata: usize,
+}
+unsafe impl Send for ProofGpuCtx {}
+impl ProofGpuCtx {
+    pub fn new(max_rows: usize, k: usize, max_leafdata: usize) -> Self {
+        let ptr = unsafe { pearl_proof_create(max_rows as c_int, k as c_int, max_leafdata as c_int) };
+        assert!(!ptr.is_null(), "pearl_proof_create a échoué (VRAM ?)");
+        Self { ptr, max_rows, k, max_leafdata }
+    }
+
+    /// Construit l'arbre de la matrice `sel` (0=A, 1=Bᵀ), `rows`×`k`, depuis `setup_seed` clé
+    /// `job_key`, et renvoie les couches + les chunks bruts des `leaf_indices` (triés/uniques).
+    pub fn build(&self, setup_seed: u64, sel: u32, rows: usize, k: usize,
+                 job_key: &[u8; 32], leaf_indices: &[usize]) -> ProofRaw {
+        assert_eq!(k, self.k);
+        assert!(rows <= self.max_rows);
+        assert!(!leaf_indices.is_empty() && leaf_indices.len() <= self.max_leafdata);
+        let num_leaves = rows * k / 1024;
+        let li64: Vec<i64> = leaf_indices.iter().map(|&x| x as i64).collect();
+        let mut leaf_data = vec![0u8; leaf_indices.len() * 1024];
+        let mut layers = vec![0u8; (2 * num_leaves + 8) * 32];
+        let mut layer_lens = vec![0i64; 64];
+        let mut num_layers: c_int = 0;
+        let mut root = [0u8; 32];
+        let rc = unsafe {
+            pearl_proof_build(
+                self.ptr, setup_seed, sel as c_int, rows as c_int, k as c_int,
+                job_key.as_ptr(), li64.as_ptr(), li64.len() as c_int,
+                leaf_data.as_mut_ptr(), layers.as_mut_ptr(), layer_lens.as_mut_ptr(),
+                &mut num_layers as *mut c_int, root.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "pearl_proof_build a échoué (rc={rc})");
+        let lens: Vec<usize> = layer_lens[..num_layers as usize].iter().map(|&x| x as usize).collect();
+        let total_nodes: usize = lens.iter().sum();
+        layers.truncate(total_nodes * 32);
+        ProofRaw { leaf_data, layers, layer_lens: lens, root }
+    }
+}
+impl Drop for ProofGpuCtx {
+    fn drop(&mut self) { unsafe { pearl_proof_destroy(self.ptr) } }
+}
+
+/// Grind GPU **2×64** (AlphaPool) — fold jackpot sur tuile 2 lignes {r,r+32} × 64 cols.
+/// Après dédup : `rows` = 2 indices, `cols` = 64 indices. Sinon identique à [`grind`].
+pub fn grind_2x64(
+    a_eff: &[i8], b_eff: &[i8], m: usize, n: usize, k: usize,
+    pow_key: &[u32; 8], pow_bound: &[u32; 8], max_hits: usize,
+) -> (i32, Vec<Hit>) {
+    assert_eq!(a_eff.len(), m * k);
+    assert_eq!(b_eff.len(), n * k);
+    let mut hr = vec![0i32; max_hits * 128];
+    let mut hc = vec![0i32; max_hits * 128];
+    let found = unsafe {
+        pearl_gpu_grind_2x64(
             a_eff.as_ptr(), b_eff.as_ptr(), m as c_int, n as c_int, k as c_int,
             pow_key.as_ptr(), pow_bound.as_ptr(),
             hr.as_mut_ptr(), hc.as_mut_ptr(), max_hits as c_int,

@@ -661,6 +661,139 @@ pub fn try_mine_one_bounded_gpu_resident_ctx<R: Rng>(
     ))
 }
 
+/// Grind GPU SEUL (chemin chaud) — renvoie le hit SANS construire la preuve.
+/// L'emballage (regen signal + arbre de Merkle) est déporté hors du thread GPU
+/// via [`build_proof_from_hit`] pour ne JAMAIS bloquer le GPU (comme alpha).
+/// `setup_seed` + `job_key` suffisent à rebâtir la preuve ailleurs.
+#[cfg(feature = "gpu")]
+pub fn grind_only_ctx<R: Rng>(
+    ctx: &crate::gpu_ffi::ResidentCtx,
+    rng: &mut R,
+    header: &IncompleteBlockHeader,
+    config: &MiningConfiguration,
+    bound_le: &[u8; 32],
+) -> Option<(u64, crate::gpu_ffi::Hit, [u8; 32])> {
+    let job_key = compute_job_key(header, config);
+    let setup_seed = rng.next_u64();
+    let (found, hits) = ctx.grind(setup_seed, &job_key, bound_le);
+    if found == 0 {
+        return None;
+    }
+    let tile_h = config.rows_pattern.to_list().len();
+    let tile_w = config.cols_pattern.to_list().len();
+    let hit = hits
+        .into_iter()
+        .find(|h| h.rows.len() == tile_h && h.cols.len() == tile_w)?;
+    Some((setup_seed, hit, job_key))
+}
+
+/// Emballe la `PlainProof` à partir d'un hit GPU, HORS du thread GPU. Régénère
+/// le signal complet (même `int7_at` que le kernel) puis bâtit l'arbre de Merkle.
+/// Strictement bit-exact avec [`try_mine_one_bounded_gpu_resident_ctx`].
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_proof_from_hit(
+    setup_seed: u64,
+    hit: &crate::gpu_ffi::Hit,
+    job_key: &[u8; 32],
+    m: usize,
+    n: usize,
+    k: usize,
+    rank: usize,
+    ws: &mut Workspace,
+) -> PlainProof {
+    ws.ensure(m, n, k);
+    let (mk, nk) = (m * k, n * k);
+    for i in 0..m {
+        for j in 0..k {
+            ws.a_sig[i * k + j] = crate::gpu_ffi::int7_at(setup_seed, 0, i as u32, j as u32);
+        }
+    }
+    for i in 0..n {
+        for j in 0..k {
+            ws.b_sig[i * k + j] = crate::gpu_ffi::int7_at(setup_seed, 1, i as u32, j as u32);
+        }
+    }
+    make_proof(&ws.a_sig[..mk], &ws.b_sig[..nk], m, n, k, rank, job_key, &hit.rows, &hit.cols)
+}
+
+/// Assemble une `MatrixMerkleProof` à partir des couches construites SUR GPU (`ProofRaw`).
+/// Walk de frères = copie BIT-pour-BIT de `MerkleTree::get_multileaf_proof` (ordre BTreeSet
+/// ascendant, dédup, borne `< level_len`). Aucun hachage CPU : on ne lit que des nœuds déjà
+/// calculés par le GPU.
+#[cfg(feature = "gpu")]
+fn assemble_matrix_proof(
+    raw: &crate::gpu_ffi::ProofRaw,
+    leaf_indices: &[usize],
+    row_indices: &[usize],
+) -> MatrixMerkleProof {
+    use std::collections::BTreeSet;
+    let total_leaves = raw.layer_lens[0];
+    let leaf_data: Vec<[u8; 1024]> = (0..leaf_indices.len())
+        .map(|i| {
+            let mut a = [0u8; 1024];
+            a.copy_from_slice(&raw.leaf_data[i * 1024..i * 1024 + 1024]);
+            a
+        })
+        .collect();
+    let node = |off: usize, idx: usize| -> [u8; 32] {
+        let mut d = [0u8; 32];
+        d.copy_from_slice(&raw.layers[(off + idx) * 32..(off + idx) * 32 + 32]);
+        d
+    };
+    let mut siblings: Vec<[u8; 32]> = Vec::new();
+    let mut current: BTreeSet<usize> = leaf_indices.iter().copied().collect();
+    let mut level_len = total_leaves;
+    let mut level = 0usize;
+    while level_len > 1 && !current.is_empty() {
+        let off: usize = raw.layer_lens[..level].iter().sum();
+        for &i in &current {
+            if i % 2 == 1 {
+                if !current.contains(&(i - 1)) {
+                    siblings.push(node(off, i - 1));
+                }
+            } else if !current.contains(&(i + 1)) && (i + 1) < level_len {
+                siblings.push(node(off, i + 1));
+            }
+        }
+        current = current.iter().map(|&i| i / 2).collect();
+        level_len = level_len.div_ceil(2);
+        level += 1;
+    }
+    MatrixMerkleProof::new(
+        leaf_data,
+        leaf_indices.to_vec(),
+        row_indices.to_vec(),
+        total_leaves,
+        raw.root,
+        siblings,
+    )
+}
+
+/// Emballe la `PlainProof` d'un hit avec la preuve Merkle construite ENTIÈREMENT sur GPU
+/// (Aria GPU miner v2.0). Régénération du signal + 2 arbres blake3 de 33 Mo = GPU ; le CPU
+/// ne fait que le walk d'indices (µs). Strictement bit-exact avec [`build_proof_from_hit`].
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_proof_from_hit_gpu(
+    pctx: &crate::gpu_ffi::ProofGpuCtx,
+    setup_seed: u64,
+    hit: &crate::gpu_ffi::Hit,
+    job_key: &[u8; 32],
+    m: usize,
+    n: usize,
+    k: usize,
+    rank: usize,
+) -> PlainProof {
+    let a_leaves = MerkleTree::compute_leaf_indices_from_rows(&hit.rows, (m, k));
+    let b_leaves = MerkleTree::compute_leaf_indices_from_rows(&hit.cols, (n, k));
+    let a_raw = pctx.build(setup_seed, 0, m, k, job_key, &a_leaves);
+    let b_raw = pctx.build(setup_seed, 1, n, k, job_key, &b_leaves);
+    let a = assemble_matrix_proof(&a_raw, &a_leaves, &hit.rows);
+    let bt = assemble_matrix_proof(&b_raw, &b_leaves, &hit.cols);
+    PlainProof { m, n, k, noise_rank: rank, a, bt }
+}
+
 /// Boucle le grind RÉSIDENT jusqu'à un hit ; renvoie la preuve canonique.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
@@ -698,6 +831,97 @@ pub fn mine_share_gpu<R: Rng>(
     let mut ws = Workspace::new();
     loop {
         if let Some(p) = try_mine_one_bounded_gpu(&mut ws, rng, m, n, k, header, config, bound_le) {
+            return p;
+        }
+    }
+}
+
+/// Config EXACTE dictée par AlphaPool dans `pearl.set_mining_params` — tuile 2×64.
+/// rows_pattern=[0,32] (h=2) · cols_pattern=[0..63] (w=64) · rank=128 · Int7xInt7ToInt32.
+pub fn alphapool_config_2x64(common_dim: u32) -> MiningConfiguration {
+    use zk_pow::api::proof::MMAType;
+    let cols: Vec<u32> = (0..64).collect();
+    MiningConfiguration {
+        common_dim,
+        rank: 128,
+        mma_type: MMAType::Int7xInt7ToInt32,
+        rows_pattern: PeriodicPattern::from_list(&[0, 32]).unwrap(),
+        cols_pattern: PeriodicPattern::from_list(&cols).unwrap(),
+        reserved: MiningConfiguration::RESERVED_VALUE,
+    }
+}
+
+/// Attempt GPU **2×64** (AlphaPool) — identique à `try_mine_one_bounded_gpu` mais
+/// utilise le kernel `grind_2x64` (fold sur tuile 2 lignes {r,r+32} × 64 cols).
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_mine_one_bounded_gpu_2x64<R: Rng>(
+    ws: &mut Workspace,
+    rng: &mut R,
+    m: usize,
+    n: usize,
+    k: usize,
+    header: &IncompleteBlockHeader,
+    config: &MiningConfiguration,
+    bound_le: &[u8; 32],
+) -> Option<PlainProof> {
+    let rank = config.rank as usize;
+    ws.ensure(m, n, k);
+    let (mk, nk) = (m * k, n * k);
+
+    fast_fill_signal(rng.next_u64(), &mut ws.a_sig[..mk]);
+    fast_fill_signal(rng.next_u64(), &mut ws.b_sig[..nk]);
+
+    let job_key = compute_job_key(header, config);
+    let a_row_major = pad_to_chunk_boundary(as_u8(&ws.a_sig[..mk]));
+    let b_col_major = pad_to_chunk_boundary(as_u8(&ws.b_sig[..nk]));
+    let (b_noise_seed, a_noise_seed) = compute_commitment_hash(&job_key, &a_row_major, &b_col_major);
+
+    ws.a_noised[..mk].copy_from_slice(&ws.a_sig[..mk]);
+    ws.b_noised_t[..nk].copy_from_slice(&ws.b_sig[..nk]);
+    crate::fast_noise::add_noise_into_fast(
+        k,
+        rank,
+        (b_noise_seed, a_noise_seed),
+        &ws.a_idx[..m],
+        &ws.b_idx[..n],
+        &mut ws.a_noised[..mk],
+        &mut ws.b_noised_t[..nk],
+    );
+
+    let pow_key = le_u32x8(&a_noise_seed);
+    let pow_bound = le_u32x8(bound_le);
+    let (_found, hits) = crate::gpu_ffi::grind_2x64(
+        &ws.a_noised[..mk], &ws.b_noised_t[..nk], m, n, k, &pow_key, &pow_bound, 64,
+    );
+
+    let tile_h = config.rows_pattern.to_list().len(); // 2
+    let tile_w = config.cols_pattern.to_list().len(); // 64
+    for h in &hits {
+        if h.rows.len() == tile_h && h.cols.len() == tile_w {
+            return Some(make_proof(
+                &ws.a_sig[..mk], &ws.b_sig[..nk], m, n, k, rank, &job_key, &h.rows, &h.cols,
+            ));
+        }
+    }
+    None
+}
+
+/// Boucle le grind GPU 2×64 jusqu'à un hit ; renvoie la preuve canonique.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn mine_share_gpu_2x64<R: Rng>(
+    rng: &mut R,
+    m: usize,
+    n: usize,
+    k: usize,
+    header: &IncompleteBlockHeader,
+    config: &MiningConfiguration,
+    bound_le: &[u8; 32],
+) -> PlainProof {
+    let mut ws = Workspace::new();
+    loop {
+        if let Some(p) = try_mine_one_bounded_gpu_2x64(&mut ws, rng, m, n, k, header, config, bound_le) {
             return p;
         }
     }
@@ -802,6 +1026,28 @@ mod tests {
             crate::official_proof::encode_bytes(&proof).unwrap(),
             crate::official_proof::encode_bytes(&back).unwrap(),
         );
+    }
+
+    /// 2×64 (AlphaPool) : preuve produite par le kernel GPU 2×64 doit passer le verify
+    /// officiel — prouve que le jackpot sur tuile 2 lignes {r,r+32} × 64 cols est bit-exact.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_2x64_proof_passes_official_verify() {
+        let (m, n, k) = (256usize, 128usize, 4096usize);
+        let header = easy_header(0x207f_ffff);
+        let config = alphapool_config_2x64(k as u32);
+
+        let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(header.nbits, &config);
+        let mut bound_le = [0u8; 32];
+        bound.to_little_endian(&mut bound_le);
+
+        let mut rng = StdRng::seed_from_u64(0x2064_5080_FACE);
+        let proof = mine_share_gpu_2x64(&mut rng, m, n, k, &header, &config, &bound_le);
+
+        zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof)
+            .expect("2×64 GPU proof must parse (roots == hash_a/hash_b)");
+        zk_pow::api::verify::verify_plain_proof(&header, &proof)
+            .expect("2×64 GPU proof must pass verify_plain_proof");
     }
 
     /// RÉSIDENT : preuve produite par le pipeline 100% GPU (gen+commit+noise+grind

@@ -19,10 +19,12 @@ fn main() {
     let shim = "cuda/shim"; // shim TORCH_CHECK no-op (pour tensor_hash officiel)
     // (fichier source, objet) — chaque .cu devient un objet dans libpearl_gpu.a
     let units = [
-        ("cuda/pearl_gpu_lib.cu", "pearl_gpu_lib.o"),       // GEMM IMMA + jackpot + pow
+        ("cuda/pearl_gpu_lib.cu", "pearl_gpu_lib.o"),       // GEMM IMMA + jackpot 8×16 + pow (v1.0)
+        ("cuda/pearl_gpu_2x64_lib.cu", "pearl_gpu_2x64_lib.o"), // GEMM IMMA + jackpot 2×64 + pow (v1.1 AlphaPool)
         ("cuda/pearl_commit_lib.cu", "pearl_commit_lib.o"), // commitment (tensor_hash officiel)
         ("cuda/pearl_noise_lib.cu", "pearl_noise_lib.o"),   // noise structuré (port spec)
         ("cuda/pearl_resident_lib.cu", "pearl_resident_lib.o"), // gen+commit+stir résident
+        ("cuda/pearl_gpu_proof_lib.cu", "pearl_gpu_proof_lib.o"), // preuve Merkle FULL GPU (v2.0)
     ];
     let lib = format!("{}/libpearl_gpu.a", out);
     for (src, obj_name) in units {
@@ -44,8 +46,11 @@ fn main() {
     println!("cargo:rustc-link-lib=stdc++");
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_lib.cu");
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel.cuh");
+    println!("cargo:rerun-if-changed=cuda/pearl_gpu_2x64_lib.cu");
+    println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_2x64.cuh");
     println!("cargo:rerun-if-changed=cuda/pearl_fold.cuh");
     println!("cargo:rerun-if-changed=cuda/pearl_commit_lib.cu");
     println!("cargo:rerun-if-changed=cuda/pearl_noise_lib.cu");
     println!("cargo:rerun-if-changed=cuda/pearl_resident_lib.cu");
+    println!("cargo:rerun-if-changed=cuda/pearl_gpu_proof_lib.cu");
 }

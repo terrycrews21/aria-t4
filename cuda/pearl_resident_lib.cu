@@ -9,7 +9,8 @@
 #include <cute/tensor.hpp>
 #include "blake3/blake3.cuh"
 #include "tensor_hash/tensor_hash_host.hpp"
-#include "pearl_gpu_kernel.cuh"   // gemm_device (grind GEMM IMMA + jackpot + pow)
+#include "pearl_gpu_kernel.cuh"        // gemm_device (grind 8×16, v1.0)
+#include "pearl_gpu_kernel_2x64.cuh"   // gemm_device_2x64 (grind 2×64, v1.1 AlphaPool)
 using namespace cute;
 
 // --- helpers noise (miroir de pearl_noise_lib.cu, inline) ---
@@ -215,6 +216,7 @@ struct Ctx {
   int *d_found,*d_hr,*d_hc;
   cudaStream_t sA, sB; cudaEvent_t eA, eB, eStir;
   uint8_t last_jk[32]; bool jk_set;
+  bool tile2x64;   // false = grind 8×16 (v1.0) ; true = grind 2×64 (v1.1 AlphaPool)
 };
 
 // Lance la chaîne résidente — côtés A‖B sur 2 streams (overlap prologue). Grind sur sA.
@@ -264,15 +266,28 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
       Layout<Shape<_2,_2,_1>, Stride<_1,_2,_0>>{}, Tile<_32,_32,_32>{});
   Copy_Atom<SM75_U32x4_LDSM_N, int8_t> s2rA, s2rB;
   int reduce_every_k = 128/32;
-  int smem = int(sizeof(SharedStorage<int8_t,int8_t,decltype(sA),decltype(sB)>));
   dim3 grd(size(ceil_div(m,bM)), size(ceil_div(n,bN))), blk(size(mma));
-  auto kfn = gemm_device<decltype(prob),decltype(cta),
-      int8_t,decltype(dA),decltype(sA),decltype(copyA),decltype(s2rA),
-      int8_t,decltype(dB),decltype(sB),decltype(copyB),decltype(s2rB),
-      int32_t,decltype(dC),decltype(sC),decltype(mma)>;
-  cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  kfn<<<grd,blk,smem,c->sA>>>(prob,cta, c->d_A,dA,sA,copyA,s2rA, c->d_B,dB,sB,copyB,s2rB,
-      c->d_C,dC,sC,mma, reduce_every_k, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+  if (c->tile2x64) {
+    // v1.1 AlphaPool : grind 2×64 (fold tuile 2 lignes {r,r+32} × 64 cols).
+    int smem = int(sizeof(SharedStorage2x64<int8_t,int8_t,decltype(sA),decltype(sB)>));
+    auto kfn = gemm_device_2x64<decltype(prob),decltype(cta),
+        int8_t,decltype(dA),decltype(sA),decltype(copyA),decltype(s2rA),
+        int8_t,decltype(dB),decltype(sB),decltype(copyB),decltype(s2rB),
+        int32_t,decltype(dC),decltype(sC),decltype(mma)>;
+    cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    kfn<<<grd,blk,smem,c->sA>>>(prob,cta, c->d_A,dA,sA,copyA,s2rA, c->d_B,dB,sB,copyB,s2rB,
+        c->d_C,dC,sC,mma, reduce_every_k, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+  } else {
+    // v1.0 AriaPool : grind 8×16.
+    int smem = int(sizeof(SharedStorage<int8_t,int8_t,decltype(sA),decltype(sB)>));
+    auto kfn = gemm_device<decltype(prob),decltype(cta),
+        int8_t,decltype(dA),decltype(sA),decltype(copyA),decltype(s2rA),
+        int8_t,decltype(dB),decltype(sB),decltype(copyB),decltype(s2rB),
+        int32_t,decltype(dC),decltype(sC),decltype(mma)>;
+    cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    kfn<<<grd,blk,smem,c->sA>>>(prob,cta, c->d_A,dA,sA,copyA,s2rA, c->d_B,dB,sB,copyB,s2rB,
+        c->d_C,dC,sC,mma, reduce_every_k, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+  }
   CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
 
   int found=0; CKR(cudaMemcpy(&found,c->d_found,4,cudaMemcpyDeviceToHost));
@@ -314,6 +329,14 @@ void* pearl_resident_create(int m, int n, int k, int max_hits) {
   cudaEventCreateWithFlags(&c->eB, cudaEventDisableTiming);
   cudaEventCreateWithFlags(&c->eStir, cudaEventDisableTiming);
   c->jk_set = false;
+  c->tile2x64 = false;   // défaut = grind 8×16 (v1.0 AriaPool)
+  return c;
+}
+
+// Variante AlphaPool (v1.1) : contexte résident qui grind en tuile 2×64.
+void* pearl_resident_create_2x64(int m, int n, int k, int max_hits) {
+  Ctx* c = (Ctx*)pearl_resident_create(m, n, k, max_hits);
+  if (c) c->tile2x64 = true;
   return c;
 }
 
