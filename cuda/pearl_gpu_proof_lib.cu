@@ -36,17 +36,18 @@ static __host__ __device__ __forceinline__ int8_t proof_int7_at(uint64_t seed, u
 // Régénère la matrice signal `sel` (rows×k) dans `mat` (octets). Grille 2D, écriture 4 octets.
 __global__ void proof_gen_signal(int8_t* mat, uint64_t seed, uint32_t sel,
                                  uint32_t rows, uint32_t k) {
-  uint32_t i = blockIdx.y;
-  if (i >= rows) return;
-  uint32_t* row4 = (uint32_t*)(mat + (size_t)i * k);
   uint32_t k4 = k >> 2;
-  for (uint32_t q = blockIdx.x * blockDim.x + threadIdx.x; q < k4; q += gridDim.x * blockDim.x) {
-    uint32_t j = q << 2;
-    uint8_t b0 = (uint8_t)proof_int7_at(seed, sel, i, j);
-    uint8_t b1 = (uint8_t)proof_int7_at(seed, sel, i, j + 1);
-    uint8_t b2 = (uint8_t)proof_int7_at(seed, sel, i, j + 2);
-    uint8_t b3 = (uint8_t)proof_int7_at(seed, sel, i, j + 3);
-    row4[q] = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
+  // grille.y plafonnée (max 65535) → on boucle sur les lignes (transparent si rows ≤ gridDim.y).
+  for (uint32_t i = blockIdx.y; i < rows; i += gridDim.y) {
+    uint32_t* row4 = (uint32_t*)(mat + (size_t)i * k);
+    for (uint32_t q = blockIdx.x * blockDim.x + threadIdx.x; q < k4; q += gridDim.x * blockDim.x) {
+      uint32_t j = q << 2;
+      uint8_t b0 = (uint8_t)proof_int7_at(seed, sel, i, j);
+      uint8_t b1 = (uint8_t)proof_int7_at(seed, sel, i, j + 1);
+      uint8_t b2 = (uint8_t)proof_int7_at(seed, sel, i, j + 2);
+      uint8_t b3 = (uint8_t)proof_int7_at(seed, sel, i, j + 3);
+      row4[q] = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
+    }
   }
 }
 
@@ -191,7 +192,7 @@ int pearl_proof_build(void* ctx, uint64_t setup_seed, int sel, int rows, int k,
   PKR(cudaMemcpyAsync(c->d_key, kw, 32, cudaMemcpyHostToDevice, s));
 
   // 1) régénère le signal (sel=0 → A row-major, sel=1 → Bᵀ)
-  proof_gen_signal<<<dim3(((k>>2)+255)/256, rows), 256, 0, s>>>(c->d_signal, setup_seed, (uint32_t)sel, rows, k);
+  proof_gen_signal<<<dim3(((k>>2)+255)/256, (unsigned)(rows<32768?rows:32768)), 256, 0, s>>>(c->d_signal, setup_seed, (uint32_t)sel, rows, k);
 
   // 2) feuilles : 1 thread/feuille
   int tpb = 256;
@@ -224,6 +225,65 @@ int pearl_proof_build(void* ctx, uint64_t setup_seed, int sel, int rows, int k,
   PKR(cudaMemcpyAsync(out_leaf_data, c->d_leafdata, (size_t)n_leaves * 1024, cudaMemcpyDeviceToHost, s));
   PKR(cudaMemcpyAsync(out_layers, c->d_layers, (size_t)total_nodes * 32, cudaMemcpyDeviceToHost, s));
   PKR(cudaMemcpyAsync(out_root, (const uint8_t*)(c->d_layers + cur_off * 8), 32, cudaMemcpyDeviceToHost, s));
+  PKR(cudaStreamSynchronize(s));
+  PKR(cudaGetLastError());
+  return 0;
+}
+
+// === v0.4.2 (forme 131072) : arbre UNE fois par setup, puis gather par hit ===
+// À 131072² un setup trouve des centaines de hits qui PARTAGENT la même matrice A/B.
+// Reconstruire l'arbre par hit (536 Mo) serait catastrophique → on le bâtit une fois ici
+// (signal + couches restent RÉSIDENTS dans le ctx), puis chaque hit ne fait qu'un gather.
+//
+// Construit l'arbre de `sel` (rows×k depuis setup_seed) et renvoie les couches + racine.
+// NE gather PAS les feuilles : le signal reste dans c->d_signal pour les `pearl_proof_gather`
+// suivants. Un ctx par matrice (A et B) → les 2 signaux restent résidents en parallèle.
+int pearl_proof_build_tree(void* ctx, uint64_t setup_seed, int sel, int rows, int k,
+                           const uint8_t job_key[32],
+                           uint8_t* out_layers, long* out_layer_lens, int* out_num_layers,
+                           uint8_t out_root[32]) {
+  ProofCtx* c = (ProofCtx*)ctx;
+  if (((long)rows * k) % 1024 != 0) { fprintf(stderr, "proof: rows*k non multiple de 1024\n"); return -1; }
+  long num_leaves = ((long)rows * k) / 1024;
+  if (num_leaves < 2 || num_leaves > c->max_leaves) { fprintf(stderr, "proof: num_leaves hors capacité\n"); return -1; }
+  cudaStream_t s = c->s;
+
+  uint32_t kw[8]; b2w(job_key, kw, 8);
+  PKR(cudaMemcpyAsync(c->d_key, kw, 32, cudaMemcpyHostToDevice, s));
+  proof_gen_signal<<<dim3(((k>>2)+255)/256, (unsigned)(rows<32768?rows:32768)), 256, 0, s>>>(c->d_signal, setup_seed, (uint32_t)sel, rows, k);
+  int tpb = 256;
+  hash_leaves_kernel<<<(int)((num_leaves + tpb - 1) / tpb), tpb, 0, s>>>(
+      (const uint8_t*)c->d_signal, c->d_key, c->d_layers, (uint64_t)num_leaves);
+  long cur_off = 0, cur_s = num_leaves;
+  out_layer_lens[0] = num_leaves;
+  int nl = 1;
+  while (cur_s > 1) {
+    long next_off = cur_off + cur_s;
+    long next_s = (cur_s + 1) / 2;
+    bool is_root = (cur_s == 2);
+    parent_level_kernel<<<(int)((next_s + tpb - 1) / tpb), tpb, 0, s>>>(
+        c->d_key, c->d_layers + next_off * 8, c->d_layers + cur_off * 8, (uint64_t)cur_s, is_root);
+    out_layer_lens[nl++] = next_s;
+    cur_off = next_off; cur_s = next_s;
+  }
+  *out_num_layers = nl;
+  long total_nodes = cur_off + cur_s;
+  PKR(cudaMemcpyAsync(out_layers, c->d_layers, (size_t)total_nodes * 32, cudaMemcpyDeviceToHost, s));
+  PKR(cudaMemcpyAsync(out_root, (const uint8_t*)(c->d_layers + cur_off * 8), 32, cudaMemcpyDeviceToHost, s));
+  PKR(cudaStreamSynchronize(s));
+  PKR(cudaGetLastError());
+  return 0;
+}
+
+// Ramasse les chunks bruts des feuilles `leaf_indices` depuis le signal RÉSIDENT
+// (= celui du dernier pearl_proof_build_tree sur ce ctx). Coût négligeable → appelé par hit.
+int pearl_proof_gather(void* ctx, const long* leaf_indices, int n_leaves, uint8_t* out_leaf_data) {
+  ProofCtx* c = (ProofCtx*)ctx;
+  if (n_leaves < 1 || n_leaves > c->max_leafdata) { fprintf(stderr, "proof: n_leaves hors capacité\n"); return -1; }
+  cudaStream_t s = c->s;
+  PKR(cudaMemcpyAsync(c->d_leafidx, leaf_indices, (size_t)n_leaves * sizeof(long), cudaMemcpyHostToDevice, s));
+  gather_leaves_kernel<<<n_leaves, 256, 0, s>>>((const uint8_t*)c->d_signal, c->d_leafidx, n_leaves, c->d_leafdata);
+  PKR(cudaMemcpyAsync(out_leaf_data, c->d_leafdata, (size_t)n_leaves * 1024, cudaMemcpyDeviceToHost, s));
   PKR(cudaStreamSynchronize(s));
   PKR(cudaGetLastError());
   return 0;

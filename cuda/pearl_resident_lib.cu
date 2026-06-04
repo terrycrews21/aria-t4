@@ -81,17 +81,19 @@ __host__ __device__ __forceinline__ int8_t int7_at(uint64_t seed, uint32_t sel,
 // Grille 2D (blockIdx.y=ligne, zéro division) + écritures 4 octets (uint32) = plein débit.
 __global__ void gen_signal_kernel(int8_t* mat, uint64_t seed, uint32_t sel,
                                    uint32_t rows, uint32_t k) {
-  uint32_t i = blockIdx.y;
-  if (i >= rows) return;
-  uint32_t* row4 = (uint32_t*)(mat + (size_t)i * k);
   uint32_t k4 = k >> 2;
-  for (uint32_t q = blockIdx.x * blockDim.x + threadIdx.x; q < k4; q += gridDim.x * blockDim.x) {
-    uint32_t j = q << 2;
-    uint8_t b0 = (uint8_t)int7_at(seed, sel, i, j);
-    uint8_t b1 = (uint8_t)int7_at(seed, sel, i, j + 1);
-    uint8_t b2 = (uint8_t)int7_at(seed, sel, i, j + 2);
-    uint8_t b3 = (uint8_t)int7_at(seed, sel, i, j + 3);
-    row4[q] = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
+  // grille.y plafonnée (max 65535) → boucle sur les lignes (transparent si rows ≤ gridDim.y,
+  // ex. 8192). Indispensable à 131072 (sinon grid.y > 65535 = invalid configuration).
+  for (uint32_t i = blockIdx.y; i < rows; i += gridDim.y) {
+    uint32_t* row4 = (uint32_t*)(mat + (size_t)i * k);
+    for (uint32_t q = blockIdx.x * blockDim.x + threadIdx.x; q < k4; q += gridDim.x * blockDim.x) {
+      uint32_t j = q << 2;
+      uint8_t b0 = (uint8_t)int7_at(seed, sel, i, j);
+      uint8_t b1 = (uint8_t)int7_at(seed, sel, i, j + 1);
+      uint8_t b2 = (uint8_t)int7_at(seed, sel, i, j + 2);
+      uint8_t b3 = (uint8_t)int7_at(seed, sel, i, j + 3);
+      row4[q] = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
+    }
   }
 }
 
@@ -138,8 +140,8 @@ int pearl_gpu_commit_seeds(uint64_t setup_seed, int m, int n, int k,
   CKR(cudaMemcpy(d_jk, jk, 32, cudaMemcpyHostToDevice));
 
   int8_t *d_A, *d_B; CKR(cudaMalloc(&d_A,(size_t)m*k)); CKR(cudaMalloc(&d_B,(size_t)n*k));
-  gen_signal_kernel<<<dim3(((k>>2)+255)/256,m),256>>>(d_A, setup_seed, 0, m, k);
-  gen_signal_kernel<<<dim3(((k>>2)+255)/256,n),256>>>(d_B, setup_seed, 1, n, k);
+  gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256>>>(d_A, setup_seed, 0, m, k);
+  gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256>>>(d_B, setup_seed, 1, n, k);
   CKR(cudaGetLastError());
 
   // commit : tensor_hash(A, job_key) -> hash_a (idem B). num_blocks comme run_tensor_hash.
@@ -230,10 +232,10 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   }
   cudaMemsetAsync(c->d_found,0,4,c->sA);
   // Phase 1 : A‖B (gen + commit), indépendants
-  gen_signal_kernel<<<dim3(((k>>2)+255)/256,m),256,0,c->sA>>>(c->d_A, setup_seed, 0, m, k);
+  gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,c->sA>>>(c->d_A, setup_seed, 0, m, k);
   commit_nokey<256,2,256>((const uint8_t*)c->d_A,(uint32_t)((size_t)m*k),(uint8_t*)c->d_ha,c->nbA,c->d_ra,c->sA);
   cudaEventRecord(c->eA, c->sA);
-  gen_signal_kernel<<<dim3(((k>>2)+255)/256,n),256,0,c->sB>>>(c->d_B, setup_seed, 1, n, k);
+  gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256,0,c->sB>>>(c->d_B, setup_seed, 1, n, k);
   commit_nokey<256,2,256>((const uint8_t*)c->d_B,(uint32_t)((size_t)n*k),(uint8_t*)c->d_hb,c->nbB,c->d_rb,c->sB);
   cudaEventRecord(c->eB, c->sB);
   // Phase 2 : stir sur sA (attend hash_b côté sB)
@@ -306,8 +308,12 @@ void* pearl_resident_create(int m, int n, int k, int max_hits) {
   c->nbA=(((uint32_t)((size_t)m*k)+chunk-1)/chunk + tpb-1)/tpb;
   c->nbB=(((uint32_t)((size_t)n*k)+chunk-1)/chunk + tpb-1)/tpb;
   auto ok=[&](cudaError_t e){ return e==cudaSuccess; };
+  // d_C est VESTIGIAL : le kernel 2×64 (et 8×16) accumule en registres (tCrC), folde dans
+  // `transcript` et fait le pow-check — il n'écrit JAMAIS C en global. On alloue donc un
+  // buffer minuscule (le pointeur par-CTA est calculé mais jamais déréférencé). Sans ça,
+  // (size_t)m*n*4 explose à 131072² (68 Go) ; ici 1 Mo suffit pour TOUTE forme.
   bool good = ok(cudaMalloc(&c->d_A,(size_t)m*k)) && ok(cudaMalloc(&c->d_B,(size_t)n*k))
-    && ok(cudaMalloc(&c->d_C,(size_t)m*n*4))
+    && ok(cudaMalloc(&c->d_C,(size_t)1<<20))
     && ok(cudaMalloc(&c->d_jk,32)) && ok(cudaMalloc(&c->d_bnd,32))
     && ok(cudaMalloc(&c->d_ha,32)) && ok(cudaMalloc(&c->d_hb,32))
     && ok(cudaMalloc(&c->d_as,32)) && ok(cudaMalloc(&c->d_bs,32))
@@ -397,8 +403,8 @@ static void launch_chain2(Ctx2* c, int slot, uint64_t seed, const uint8_t job_ke
   cudaStream_t s = c->st[slot];
   int m=c->m,n=c->n,k=c->k;
   cudaMemsetAsync(c->d_found[slot], 0, 4, s);
-  gen_signal_kernel<<<dim3(((k>>2)+255)/256,m),256,0,s>>>(c->d_A[slot], seed, 0, m, k);
-  gen_signal_kernel<<<dim3(((k>>2)+255)/256,n),256,0,s>>>(c->d_B[slot], seed, 1, n, k);
+  gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,s>>>(c->d_A[slot], seed, 0, m, k);
+  gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256,0,s>>>(c->d_B[slot], seed, 1, n, k);
   // commit SANS set_key (clé posée 1× par batch) → overlap réel des streams
   commit_nokey<256,2,256>((const uint8_t*)c->d_A[slot],(uint32_t)((size_t)m*k),(uint8_t*)c->d_ha[slot],c->nbA,c->d_ra[slot],s);
   commit_nokey<256,2,256>((const uint8_t*)c->d_B[slot],(uint32_t)((size_t)n*k),(uint8_t*)c->d_hb[slot],c->nbB,c->d_rb[slot],s);

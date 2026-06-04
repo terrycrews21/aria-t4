@@ -51,6 +51,14 @@ unsafe extern "C" {
         out_leaf_data: *mut u8, out_layers: *mut u8, out_layer_lens: *mut i64,
         out_num_layers: *mut c_int, out_root: *mut u8,
     ) -> c_int;
+    fn pearl_proof_build_tree(
+        ctx: *mut core::ffi::c_void, setup_seed: u64, sel: c_int, rows: c_int, k: c_int,
+        job_key: *const u8, out_layers: *mut u8, out_layer_lens: *mut i64,
+        out_num_layers: *mut c_int, out_root: *mut u8,
+    ) -> c_int;
+    fn pearl_proof_gather(
+        ctx: *mut core::ffi::c_void, leaf_indices: *const i64, n_leaves: c_int, out_leaf_data: *mut u8,
+    ) -> c_int;
     fn pearl_proof_destroy(ctx: *mut core::ffi::c_void);
 
     fn pearl_resident2_create(m: c_int, n: c_int, k: c_int) -> *mut core::ffi::c_void;
@@ -312,6 +320,43 @@ impl ProofGpuCtx {
         let total_nodes: usize = lens.iter().sum();
         layers.truncate(total_nodes * 32);
         ProofRaw { leaf_data, layers, layer_lens: lens, root }
+    }
+
+    /// v0.4.2 — bâtit l'arbre de `sel` (rows×k) UNE fois (signal + couches résidents dans le ctx),
+    /// renvoie couches + lens + racine SANS gather. À 131072 on appelle ça 1×/setup puis [`gather`]
+    /// par hit (les ~256 hits du setup partagent la même matrice → arbre amorti).
+    pub fn build_tree(&self, setup_seed: u64, sel: u32, rows: usize, k: usize,
+                      job_key: &[u8; 32]) -> (Vec<u8>, Vec<usize>, [u8; 32]) {
+        assert_eq!(k, self.k);
+        assert!(rows <= self.max_rows);
+        let num_leaves = rows * k / 1024;
+        let mut layers = vec![0u8; (2 * num_leaves + 8) * 32];
+        let mut layer_lens = vec![0i64; 64];
+        let mut num_layers: c_int = 0;
+        let mut root = [0u8; 32];
+        let rc = unsafe {
+            pearl_proof_build_tree(self.ptr, setup_seed, sel as c_int, rows as c_int, k as c_int,
+                job_key.as_ptr(), layers.as_mut_ptr(), layer_lens.as_mut_ptr(),
+                &mut num_layers as *mut c_int, root.as_mut_ptr())
+        };
+        assert_eq!(rc, 0, "pearl_proof_build_tree a échoué (rc={rc})");
+        let lens: Vec<usize> = layer_lens[..num_layers as usize].iter().map(|&x| x as usize).collect();
+        let total_nodes: usize = lens.iter().sum();
+        layers.truncate(total_nodes * 32);
+        (layers, lens, root)
+    }
+
+    /// Ramasse les chunks bruts des feuilles `leaf_indices` depuis le signal résident
+    /// (= dernier [`build_tree`] sur ce ctx). Négligeable → 1 appel par hit.
+    pub fn gather(&self, leaf_indices: &[usize]) -> Vec<u8> {
+        assert!(!leaf_indices.is_empty() && leaf_indices.len() <= self.max_leafdata);
+        let li64: Vec<i64> = leaf_indices.iter().map(|&x| x as i64).collect();
+        let mut leaf_data = vec![0u8; leaf_indices.len() * 1024];
+        let rc = unsafe {
+            pearl_proof_gather(self.ptr, li64.as_ptr(), li64.len() as c_int, leaf_data.as_mut_ptr())
+        };
+        assert_eq!(rc, 0, "pearl_proof_gather a échoué (rc={rc})");
+        leaf_data
     }
 }
 impl Drop for ProofGpuCtx {

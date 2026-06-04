@@ -49,6 +49,11 @@ fn flatten_matrix(matrix: &[Vec<i8>]) -> Vec<u8> {
 }
 
 /// `blake3(header.to_bytes() ‖ config.to_bytes())` — the canonical job key.
+/// Wrapper public de [`compute_job_key`] (pour les binaires de test qui pilotent `ctx.grind`).
+pub fn compute_job_key_pub(header: &IncompleteBlockHeader, config: &MiningConfiguration) -> [u8; 32] {
+    compute_job_key(header, config)
+}
+
 fn compute_job_key(header: &IncompleteBlockHeader, config: &MiningConfiguration) -> [u8; 32] {
     let mut data = Vec::with_capacity(IncompleteBlockHeader::SERIALIZED_SIZE + MiningConfiguration::SERIALIZED_SIZE);
     data.extend_from_slice(&header.to_bytes());
@@ -723,22 +728,25 @@ pub fn build_proof_from_hit(
 /// calculés par le GPU.
 #[cfg(feature = "gpu")]
 fn assemble_matrix_proof(
-    raw: &crate::gpu_ffi::ProofRaw,
+    layers: &[u8],
+    layer_lens: &[usize],
+    root: [u8; 32],
+    leaf_data_bytes: &[u8],
     leaf_indices: &[usize],
     row_indices: &[usize],
 ) -> MatrixMerkleProof {
     use std::collections::BTreeSet;
-    let total_leaves = raw.layer_lens[0];
+    let total_leaves = layer_lens[0];
     let leaf_data: Vec<[u8; 1024]> = (0..leaf_indices.len())
         .map(|i| {
             let mut a = [0u8; 1024];
-            a.copy_from_slice(&raw.leaf_data[i * 1024..i * 1024 + 1024]);
+            a.copy_from_slice(&leaf_data_bytes[i * 1024..i * 1024 + 1024]);
             a
         })
         .collect();
     let node = |off: usize, idx: usize| -> [u8; 32] {
         let mut d = [0u8; 32];
-        d.copy_from_slice(&raw.layers[(off + idx) * 32..(off + idx) * 32 + 32]);
+        d.copy_from_slice(&layers[(off + idx) * 32..(off + idx) * 32 + 32]);
         d
     };
     let mut siblings: Vec<[u8; 32]> = Vec::new();
@@ -746,7 +754,7 @@ fn assemble_matrix_proof(
     let mut level_len = total_leaves;
     let mut level = 0usize;
     while level_len > 1 && !current.is_empty() {
-        let off: usize = raw.layer_lens[..level].iter().sum();
+        let off: usize = layer_lens[..level].iter().sum();
         for &i in &current {
             if i % 2 == 1 {
                 if !current.contains(&(i - 1)) {
@@ -765,7 +773,7 @@ fn assemble_matrix_proof(
         leaf_indices.to_vec(),
         row_indices.to_vec(),
         total_leaves,
-        raw.root,
+        root,
         siblings,
     )
 }
@@ -789,9 +797,46 @@ pub fn build_proof_from_hit_gpu(
     let b_leaves = MerkleTree::compute_leaf_indices_from_rows(&hit.cols, (n, k));
     let a_raw = pctx.build(setup_seed, 0, m, k, job_key, &a_leaves);
     let b_raw = pctx.build(setup_seed, 1, n, k, job_key, &b_leaves);
-    let a = assemble_matrix_proof(&a_raw, &a_leaves, &hit.rows);
-    let bt = assemble_matrix_proof(&b_raw, &b_leaves, &hit.cols);
+    let a = assemble_matrix_proof(&a_raw.layers, &a_raw.layer_lens, a_raw.root, &a_raw.leaf_data, &a_leaves, &hit.rows);
+    let bt = assemble_matrix_proof(&b_raw.layers, &b_raw.layer_lens, b_raw.root, &b_raw.leaf_data, &b_leaves, &hit.cols);
     PlainProof { m, n, k, noise_rank: rank, a, bt }
+}
+
+/// v0.4.2 (forme 131072) — emballe les preuves de TOUS les hits d'un setup en bâtissant les
+/// 2 arbres (A, B) UNE seule fois (via `ctx_a`/`ctx_b` résidents), puis un simple gather par hit.
+/// C'est le modèle d'alpha (`fill_proof_kernel`) : l'arbre de 536 Mo est amorti sur ~256 hits.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_proofs_from_setup_gpu(
+    ctx_a: &crate::gpu_ffi::ProofGpuCtx,
+    ctx_b: &crate::gpu_ffi::ProofGpuCtx,
+    setup_seed: u64,
+    hits: &[crate::gpu_ffi::Hit],
+    job_key: &[u8; 32],
+    m: usize,
+    n: usize,
+    k: usize,
+    rank: usize,
+) -> Vec<PlainProof> {
+    // Arbres bâtis 1× (signal résident dans chaque ctx pour les gathers qui suivent).
+    let (a_layers, a_lens, a_root) = ctx_a.build_tree(setup_seed, 0, m, k, job_key);
+    let (b_layers, b_lens, b_root) = ctx_b.build_tree(setup_seed, 1, n, k, job_key);
+    let tile_h = 2usize; // rows_pattern [0,32]
+    let tile_w = 64usize; // cols_pattern [0..63]
+    let mut out = Vec::with_capacity(hits.len());
+    for hit in hits {
+        if hit.rows.len() != tile_h || hit.cols.len() != tile_w {
+            continue;
+        }
+        let a_leaves = MerkleTree::compute_leaf_indices_from_rows(&hit.rows, (m, k));
+        let b_leaves = MerkleTree::compute_leaf_indices_from_rows(&hit.cols, (n, k));
+        let a_leaf_data = ctx_a.gather(&a_leaves);
+        let b_leaf_data = ctx_b.gather(&b_leaves);
+        let a = assemble_matrix_proof(&a_layers, &a_lens, a_root, &a_leaf_data, &a_leaves, &hit.rows);
+        let bt = assemble_matrix_proof(&b_layers, &b_lens, b_root, &b_leaf_data, &b_leaves, &hit.cols);
+        out.push(PlainProof { m, n, k, noise_rank: rank, a, bt });
+    }
+    out
 }
 
 /// Boucle le grind RÉSIDENT jusqu'à un hit ; renvoie la preuve canonique.
