@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 use ariaminer::official_grind::try_mine_one_bounded;
 use ariaminer::official_grind::Workspace;
 #[cfg(feature = "gpu")]
-#[cfg(feature = "gpu")]
-use ariaminer::official_grind::{canonical_gpu_config, try_mine_one_bounded_gpu_resident_ctx};
+use ariaminer::official_grind::{
+    build_proof_from_hit, canonical_gpu_config, compute_job_key_pub,
+};
 use ariaminer::official_proof::encode_base64;
 use ariaminer::protocol::{Job, MiningParams};
 use ariaminer::stratum::{JobEvent, StratumConfig, Submission, run as stratum_run};
@@ -26,6 +27,8 @@ use ariaminer::stratum_to_official::{OfficialJob, build_official_job};
 use clap::Parser;
 use parking_lot::Mutex;
 use rand::SeedableRng;
+#[cfg(feature = "gpu")]
+use rand::RngCore;
 use rand::rngs::StdRng;
 use tokio::sync::{broadcast, mpsc};
 
@@ -106,6 +109,21 @@ async fn serve_stats(
     }
 }
 
+/// v0.5.0 — un hit GPU brut envoyé au pool de threads "builder" : seed + tuile + tout
+/// ce qu'il faut pour reconstruire la `PlainProof` HORS du thread grind (pattern ethminer :
+/// le GPU ne stalle jamais, l'emballage coûteux part sur d'autres cœurs).
+#[cfg(feature = "gpu")]
+struct HitJob {
+    seed: u64,
+    hit: ariaminer::gpu_ffi::Hit,
+    job_key: [u8; 32],
+    gm: usize,
+    gn: usize,
+    k: usize,
+    rank: usize,
+    job_id: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_grind(
     job_slot: Arc<Mutex<Arc<GrindJob>>>,
@@ -120,7 +138,15 @@ fn spawn_grind(
     submit_tx: mpsc::Sender<Submission>,
 ) -> GrindGen {
     let stop = Arc::new(AtomicBool::new(false));
-    let handles = (0..threads)
+    // v0.5.0 : sur GPU, UN seul thread + UN seul contexte résident suffisent à saturer
+    // le GPU (mesuré : 1 thread tight = 157 TH/s, GPU-bound ; le wrapper coûte 0.016 ms).
+    // Plus de threads = plusieurs contextes concurrents qui se DISPUTENT le GPU (146 < 157)
+    // et bouffent le CPU pour rien. CPU mining = N threads (chacun un cœur).
+    #[cfg(feature = "gpu")]
+    let nthreads = 1;
+    #[cfg(not(feature = "gpu"))]
+    let nthreads = threads;
+    let handles = (0..nthreads)
         .map(|tid| {
             let job_slot = Arc::clone(&job_slot);
             let stop = Arc::clone(&stop);
@@ -136,58 +162,126 @@ fn spawn_grind(
                 );
                 // One reusable workspace per thread — the hot loop allocates nothing.
                 let mut ws = Workspace::new();
-                // GPU : contexte résident persistant (alloué une fois, sur le 1er job).
-                #[cfg(feature = "gpu")]
-                let mut gpu_ctx: Option<ariaminer::gpu_ffi::ResidentCtx> = None;
+
+                // ============ CHEMIN CPU (inchangé : N threads, config pool) ============
+                #[cfg(not(feature = "gpu"))]
                 while !stop.load(Ordering::Relaxed) {
-                    // Adopt the latest job at each setup boundary.
                     let job = job_slot.lock().clone();
                     let oj = &job.official;
                     work_per_setup.store(
                         (oj.m as u64) * (oj.n as u64) * (oj.k as u64),
                         Ordering::Relaxed,
                     );
-                    // One faithful attempt: draw matrices, noise, sweep every
-                    // PeriodicPattern tile against the share bound.
-                    // CPU: the pool's tile config on the AVX micro-kernel.
-                    #[cfg(not(feature = "gpu"))]
                     let hit = try_mine_one_bounded(
                         &mut ws, &mut rng, oj.m, oj.n, oj.k, &oj.header, &oj.config, &oj.bound_le,
                     );
-                    // GPU: the GEMM IMMA kernel folds 8×16 MMA fragments, so we mine
-                    // with `canonical_gpu_config` (the fragment tile shape). The share
-                    // bound is config-independent (= MAX/difficulty), so it's unchanged;
-                    // m/n are forced to multiples of 128 (kernel CTA tile). The node
-                    // reconstructs this exact config from the submitted indices → verify OK.
-                    #[cfg(feature = "gpu")]
-                    let hit = {
-                        let gconf = canonical_gpu_config(oj.k as u32);
-                        let gm = oj.m.div_ceil(128) * 128;
-                        let gn = oj.n.div_ceil(128) * 128;
-                        // (Ré)alloue le contexte résident si la forme change (alloc 1× sinon).
-                        if gpu_ctx.as_ref().map(|c| c.dims()) != Some((gm, gn, oj.k)) {
-                            gpu_ctx = Some(ariaminer::gpu_ffi::ResidentCtx::new(gm, gn, oj.k, 64));
-                        }
-                        let ctx = gpu_ctx.as_ref().unwrap();
-                        try_mine_one_bounded_gpu_resident_ctx(
-                            ctx, &mut ws, &mut rng, &oj.header, &gconf, &oj.bound_le,
-                        )
-                    };
                     attempts.fetch_add(1, Ordering::Relaxed);
                     if let Some(proof) = hit {
-                        match encode_base64(&proof) {
-                            Ok(proof_base64) => {
-                                shares.fetch_add(1, Ordering::Relaxed);
-                                // Credit this share's difficulty (pool's basis for hashrate).
-                                credited.fetch_add(diff_arc.load(Ordering::Relaxed), Ordering::Relaxed);
-                                tracing::debug!(job_id = %job.job_id, "share (real PlainProof) — submitting");
-                                let _ = submit_tx.try_send(Submission {
-                                    job_id: job.job_id.clone(),
-                                    proof_base64,
-                                });
-                            }
-                            Err(e) => tracing::error!(error = %e, "encode PlainProof failed"),
+                        if let Ok(proof_base64) = encode_base64(&proof) {
+                            shares.fetch_add(1, Ordering::Relaxed);
+                            credited.fetch_add(diff_arc.load(Ordering::Relaxed), Ordering::Relaxed);
+                            let _ = submit_tx.try_send(Submission {
+                                job_id: job.job_id.clone(),
+                                proof_base64,
+                            });
                         }
+                    }
+                }
+
+                // ============ CHEMIN GPU v0.5.0 : 1 contexte, constantes hoistées ============
+                // Le GEMM IMMA folde des fragments 8×16 → on mine avec `canonical_gpu_config`
+                // (forme de tuile du fragment). Le bound est config-indépendant ; m/n forcés
+                // à des multiples de 128 (tuile CTA). Le node reconstruit ce config exact depuis
+                // les indices soumis → vérif OK. job_key/config/dims = constants par JOB :
+                // on ne les recalcule QUE quand le job change (sinon ils affament le GPU).
+                #[cfg(feature = "gpu")]
+                {
+                    let _ = &mut ws; // le grind n'emballe plus de preuve : les builders ont leur propre ws.
+
+                    // POOL DE BUILDERS (pattern ethminer) : le grind ne fait QUE grinder ; chaque hit
+                    // part sur un thread builder qui régénère le signal + Merkle + soumet, SANS
+                    // bloquer le GPU. Canal borné + try_send → si saturé on lâche (jamais de stall grind).
+                    const N_BUILDERS: usize = 6;
+                    let mut builder_txs: Vec<std::sync::mpsc::SyncSender<HitJob>> = Vec::new();
+                    let mut builder_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+                    for _ in 0..N_BUILDERS {
+                        let (tx, rx) = std::sync::mpsc::sync_channel::<HitJob>(64);
+                        builder_txs.push(tx);
+                        let submit_tx = submit_tx.clone();
+                        let shares = Arc::clone(&shares);
+                        let credited = Arc::clone(&credited);
+                        let diff_arc = Arc::clone(&diff_arc);
+                        builder_handles.push(thread::spawn(move || {
+                            let mut bws = Workspace::new();
+                            while let Ok(j) = rx.recv() {
+                                let proof = build_proof_from_hit(
+                                    j.seed, &j.hit, &j.job_key, j.gm, j.gn, j.k, j.rank, &mut bws,
+                                );
+                                if let Ok(proof_base64) = encode_base64(&proof) {
+                                    shares.fetch_add(1, Ordering::Relaxed);
+                                    credited.fetch_add(diff_arc.load(Ordering::Relaxed), Ordering::Relaxed);
+                                    let _ = submit_tx.try_send(Submission { job_id: j.job_id, proof_base64 });
+                                }
+                            }
+                        }));
+                    }
+
+                    let mut gpu_ctx: Option<ariaminer::gpu_ffi::ResidentCtx> = None;
+                    // (job_ptr, job_key, gm, gn, k, rank, tile_h, tile_w, bound_le)
+                    let mut cache: Option<(usize, [u8; 32], usize, usize, usize, usize, usize, usize, [u8; 32])> = None;
+                    let mut rr = 0usize; // round-robin builder
+                    while !stop.load(Ordering::Relaxed) {
+                        let job = job_slot.lock().clone();
+                        let job_ptr = Arc::as_ptr(&job) as usize;
+                        if cache.as_ref().map(|c| c.0) != Some(job_ptr) {
+                            let oj = &job.official;
+                            let gconf = canonical_gpu_config(oj.k as u32);
+                            let gm = oj.m.div_ceil(128) * 128;
+                            let gn = oj.n.div_ceil(128) * 128;
+                            let job_key = compute_job_key_pub(&oj.header, &gconf);
+                            let rank = gconf.rank as usize;
+                            let tile_h = gconf.rows_pattern.to_list().len();
+                            let tile_w = gconf.cols_pattern.to_list().len();
+                            if gpu_ctx.as_ref().map(|c| c.dims()) != Some((gm, gn, oj.k)) {
+                                gpu_ctx = Some(ariaminer::gpu_ffi::ResidentCtx::new(gm, gn, oj.k, 64));
+                            }
+                            work_per_setup.store((gm as u64) * (gn as u64) * (oj.k as u64), Ordering::Relaxed);
+                            cache = Some((job_ptr, job_key, gm, gn, oj.k, rank, tile_h, tile_w, oj.bound_le));
+                        }
+                        let (_, job_key, gm, gn, k, rank, tile_h, tile_w, bound_le) =
+                            cache.as_ref().unwrap();
+                        let ctx = gpu_ctx.as_ref().unwrap();
+
+                        // Boucle TIGHT : SEULEMENT le grind GPU (gen→commit→noise→GEMM→powcheck).
+                        let setup_seed = rng.next_u64();
+                        let (found, hits) = ctx.grind(setup_seed, job_key, bound_le);
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        if found > 0 {
+                            // Hit → on DÉPORTE l'emballage sur un builder (round-robin), sans bloquer.
+                            if let Some(hit) = hits
+                                .into_iter()
+                                .find(|h| h.rows.len() == *tile_h && h.cols.len() == *tile_w)
+                            {
+                                let job_box = HitJob {
+                                    seed: setup_seed,
+                                    hit,
+                                    job_key: *job_key,
+                                    gm: *gm,
+                                    gn: *gn,
+                                    k: *k,
+                                    rank: *rank,
+                                    job_id: job.job_id.clone(),
+                                };
+                                // try_send : si le builder est saturé, on passe au suivant ; jamais de blocage.
+                                let _ = builder_txs[rr % N_BUILDERS].try_send(job_box);
+                                rr += 1;
+                            }
+                        }
+                    }
+                    // Arrêt propre : on lâche les senders → les builders sortent de recv() → join.
+                    drop(builder_txs);
+                    for h in builder_handles {
+                        let _ = h.join();
                     }
                 }
             })

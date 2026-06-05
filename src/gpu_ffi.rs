@@ -43,6 +43,9 @@ unsafe extern "C" {
         hit_rows: *mut c_int, hit_cols: *mut c_int,
     ) -> c_int;
     fn pearl_resident_destroy(ctx: *mut core::ffi::c_void);
+    fn pearl_resident_set_timing(ctx: *mut core::ffi::c_void, on: c_int);
+    fn pearl_resident_last_times(ctx: *mut core::ffi::c_void, prologue_ms: *mut f32, grind_ms: *mut f32);
+    fn pearl_resident_last_times4(ctx: *mut core::ffi::c_void, genc_ms: *mut f32, noise_ms: *mut f32, grind_ms: *mut f32);
 
     fn pearl_proof_create(max_rows: c_int, k: c_int, max_leafdata: c_int) -> *mut core::ffi::c_void;
     fn pearl_proof_build(
@@ -67,7 +70,12 @@ unsafe extern "C" {
         num: c_int, out_idx: *mut c_int, out_rows: *mut c_int, out_cols: *mut c_int, max_out: c_int,
     ) -> c_int;
     fn pearl_resident2_destroy(ctx: *mut core::ffi::c_void);
+    fn pearl_resident2_set_grind_blocks(ctx: *mut core::ffi::c_void, g: c_int);
+    fn pearl_gpu_sm_count() -> c_int;
 }
+
+/// Nombre de SM du GPU 0 (pour calibrer le headroom du grind persistant).
+pub fn gpu_sm_count() -> usize { (unsafe { pearl_gpu_sm_count() }).max(0) as usize }
 
 /// Contexte DOUBLE-BUFFER batché : 2 jeux de buffers + 2 streams, prologue(N+1)
 /// overlap grind(N). `grind_batch` pipeline `num` setups en un appel.
@@ -103,6 +111,9 @@ impl ResidentCtx2 {
         out
     }
     pub fn dims(&self) -> (usize, usize, usize) { (self.m, self.n, self.k) }
+    /// v0.5.0 : grille du grind persistant. 0 = grille pleine ; >0 = G blocs grid-stride
+    /// (occupation bridée → le prologue du slot suivant peut tourner en concurrence).
+    pub fn set_grind_blocks(&self, g: usize) { unsafe { pearl_resident2_set_grind_blocks(self.ptr, g as c_int) } }
 }
 impl Drop for ResidentCtx2 {
     fn drop(&mut self) { unsafe { pearl_resident2_destroy(self.ptr) } }
@@ -147,6 +158,21 @@ impl ResidentCtx {
         (found, hits)
     }
     pub fn dims(&self) -> (usize, usize, usize) { (self.m, self.n, self.k) }
+
+    /// Active/désactive la mesure per-phase (cudaEvents). Hors chemin chaud.
+    pub fn set_timing(&self, on: bool) { unsafe { pearl_resident_set_timing(self.ptr, on as c_int) } }
+    /// Derniers temps GPU (ms) du dernier `grind` : (prologue gen+commit+noise, grind GEMM).
+    pub fn last_times(&self) -> (f32, f32) {
+        let (mut p, mut g) = (0f32, 0f32);
+        unsafe { pearl_resident_last_times(self.ptr, &mut p, &mut g) };
+        (p, g)
+    }
+    /// Split fin du dernier grind : (gen+commit+stir, noise, grind) en ms.
+    pub fn last_times4(&self) -> (f32, f32, f32) {
+        let (mut gc, mut no, mut gr) = (0f32, 0f32, 0f32);
+        unsafe { pearl_resident_last_times4(self.ptr, &mut gc, &mut no, &mut gr) };
+        (gc, no, gr)
+    }
 }
 impl Drop for ResidentCtx {
     fn drop(&mut self) { unsafe { pearl_resident_destroy(self.ptr) } }

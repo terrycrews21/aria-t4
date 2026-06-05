@@ -219,6 +219,8 @@ struct Ctx {
   cudaStream_t sA, sB; cudaEvent_t eA, eB, eStir;
   uint8_t last_jk[32]; bool jk_set;
   bool tile2x64;   // false = grind 8×16 (v1.0) ; true = grind 2×64 (v1.1 AlphaPool)
+  // --- instrumentation (v0.5.0) : split prologue vs grind par cudaEvents timés ---
+  cudaEvent_t tStart, tMid, tPro, tEnd; float last_pro_ms, last_grind_ms, last_genc_ms, last_noise_ms; bool do_timing;
 };
 
 // Lance la chaîne résidente — côtés A‖B sur 2 streams (overlap prologue). Grind sur sA.
@@ -231,6 +233,7 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
     for (int i=0;i<32;i++) c->last_jk[i]=job_key[i]; c->jk_set=true;
   }
   cudaMemsetAsync(c->d_found,0,4,c->sA);
+  if (c->do_timing) cudaEventRecord(c->tStart, c->sA);
   // Phase 1 : A‖B (gen + commit), indépendants
   gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,c->sA>>>(c->d_A, setup_seed, 0, m, k);
   commit_nokey<256,2,256>((const uint8_t*)c->d_A,(uint32_t)((size_t)m*k),(uint8_t*)c->d_ha,c->nbA,c->d_ra,c->sA);
@@ -242,6 +245,7 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   cudaStreamWaitEvent(c->sA, c->eB, 0);
   stir_kernel<<<1,1,0,c->sA>>>(c->d_ha,c->d_hb,c->d_jk,c->d_as,c->d_bs);
   cudaEventRecord(c->eStir, c->sA);
+  if (c->do_timing) cudaEventRecord(c->tMid, c->sA); // fin gen+commit+stir, avant noise
   // Phase 3 : noise A‖B (sB attend les seeds via eStir)
   perm_k_<<<(k+255)/256,256,0,c->sA>>>(c->d_sla, c->d_as, k, c->d_faA, c->d_saA);
   noise_add_k_<<<m,256,0,c->sA>>>(c->d_sla, c->d_as, m, k, c->d_faA, c->d_saA, c->d_A);
@@ -251,6 +255,7 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   cudaEventRecord(c->eB, c->sB);
   // Phase 4 : GEMM sur sA (attend noise B via eB) ; pow_key=a_seed, bound=d_bnd
   cudaStreamWaitEvent(c->sA, c->eB, 0);
+  if (c->do_timing) cudaEventRecord(c->tPro, c->sA); // fin prologue = juste avant le GEMM
   auto prob = make_shape(m, n, k);
   auto dA = make_stride(k, Int<1>{}); auto dB = make_stride(k, Int<1>{}); auto dC = make_stride(n, Int<1>{});
   auto bM=Int<128>{}; auto bN=Int<128>{}; auto bK=Int<64>{};
@@ -290,7 +295,14 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
     kfn<<<grd,blk,smem,c->sA>>>(prob,cta, c->d_A,dA,sA,copyA,s2rA, c->d_B,dB,sB,copyB,s2rB,
         c->d_C,dC,sC,mma, reduce_every_k, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
   }
+  if (c->do_timing) cudaEventRecord(c->tEnd, c->sA);
   CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
+  if (c->do_timing) {
+    cudaEventElapsedTime(&c->last_pro_ms,   c->tStart, c->tPro);
+    cudaEventElapsedTime(&c->last_grind_ms, c->tPro,   c->tEnd);
+    cudaEventElapsedTime(&c->last_genc_ms,  c->tStart, c->tMid);  // gen+commit+stir
+    cudaEventElapsedTime(&c->last_noise_ms, c->tMid,   c->tPro);  // perm+noise
+  }
 
   int found=0; CKR(cudaMemcpy(&found,c->d_found,4,cudaMemcpyDeviceToHost));
   int nret = found<max_hits?found:max_hits;
@@ -334,6 +346,8 @@ void* pearl_resident_create(int m, int n, int k, int max_hits) {
   cudaEventCreateWithFlags(&c->eA, cudaEventDisableTiming);
   cudaEventCreateWithFlags(&c->eB, cudaEventDisableTiming);
   cudaEventCreateWithFlags(&c->eStir, cudaEventDisableTiming);
+  cudaEventCreate(&c->tStart); cudaEventCreate(&c->tMid); cudaEventCreate(&c->tPro); cudaEventCreate(&c->tEnd); // timés
+  c->do_timing = false; c->last_pro_ms = 0.f; c->last_grind_ms = 0.f; c->last_genc_ms = 0.f; c->last_noise_ms = 0.f;
   c->jk_set = false;
   c->tile2x64 = false;   // défaut = grind 8×16 (v1.0 AriaPool)
   return c;
@@ -356,8 +370,24 @@ int pearl_resident_grind_ctx(void* ctx, uint64_t setup_seed,
   return resident_run(c, setup_seed, job_key, hit_rows, hit_cols);
 }
 
+// --- instrumentation (v0.5.0) ---
+void pearl_resident_set_timing(void* ctx, int on) { ((Ctx*)ctx)->do_timing = (on != 0); }
+void pearl_resident_last_times(void* ctx, float* prologue_ms, float* grind_ms) {
+  Ctx* c = (Ctx*)ctx;
+  if (prologue_ms) *prologue_ms = c->last_pro_ms;
+  if (grind_ms)    *grind_ms    = c->last_grind_ms;
+}
+// Split fin : gen+commit+stir / noise / grind (ms).
+void pearl_resident_last_times4(void* ctx, float* genc_ms, float* noise_ms, float* grind_ms) {
+  Ctx* c = (Ctx*)ctx;
+  if (genc_ms)  *genc_ms  = c->last_genc_ms;
+  if (noise_ms) *noise_ms = c->last_noise_ms;
+  if (grind_ms) *grind_ms = c->last_grind_ms;
+}
+
 void pearl_resident_destroy(void* ctx) {
   Ctx* c = (Ctx*)ctx; if(!c) return;
+  cudaEventDestroy(c->tStart); cudaEventDestroy(c->tMid); cudaEventDestroy(c->tPro); cudaEventDestroy(c->tEnd);
   cudaFree(c->d_A);cudaFree(c->d_B);cudaFree(c->d_C);cudaFree(c->d_jk);cudaFree(c->d_bnd);
   cudaFree(c->d_ha);cudaFree(c->d_hb);cudaFree(c->d_as);cudaFree(c->d_bs);cudaFree(c->d_sla);cudaFree(c->d_slb);
   cudaFree(c->d_faA);cudaFree(c->d_saA);cudaFree(c->d_faB);cudaFree(c->d_saB);
@@ -387,6 +417,7 @@ int pearl_gpu_resident_grind(uint64_t setup_seed, int m, int n, int k,
 struct Ctx2 {
   int m, n, k;
   uint32_t nbA, nbB;
+  int grind_blocks;   // v0.5.0 : 0 = grille pleine (gemm_device) ; >0 = persistant G blocs (gemm_device_persist, occupation bridée → overlap)
   void* prop;
   cudaStream_t st[2];
   int32_t* d_C;                       // partagé (jamais écrit)
@@ -428,16 +459,26 @@ static void launch_chain2(Ctx2* c, int slot, uint64_t seed, const uint8_t job_ke
   TiledMMA mma=make_tiled_mma(SM80_16x8x32_S32S8S8S32_TN{},Layout<Shape<_2,_2,_1>,Stride<_1,_2,_0>>{},Tile<_32,_32,_32>{});
   Copy_Atom<SM75_U32x4_LDSM_N,int8_t> s2rA,s2rB;
   int rek=128/32, smem=int(sizeof(SharedStorage<int8_t,int8_t,decltype(sA),decltype(sB)>));
-  dim3 grd(size(ceil_div(m,bM)),size(ceil_div(n,bN))), blk(size(mma));
-  auto kfn=gemm_device<decltype(prob),decltype(cta),int8_t,decltype(dA),decltype(sA),decltype(copyA),decltype(s2rA),int8_t,decltype(dB),decltype(sB),decltype(copyB),decltype(s2rB),int32_t,decltype(dC),decltype(sC),decltype(mma)>;
-  cudaFuncSetAttribute(kfn,cudaFuncAttributeMaxDynamicSharedMemorySize,smem);
-  kfn<<<grd,blk,smem,s>>>(prob,cta,c->d_A[slot],dA,sA,copyA,s2rA,c->d_B[slot],dB,sB,copyB,s2rB,c->d_C,dC,sC,mma,rek,c->d_as[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64);
+  int nbx=size(ceil_div(m,bM)), nby=size(ceil_div(n,bN));
+  dim3 blk(size(mma));
+  if (c->grind_blocks > 0) {
+    // v0.5.0 : grind PERSISTANT à occupation bridée (G blocs grid-stride) → laisse
+    // des SM libres pour que le prologue du slot suivant tourne en concurrence.
+    auto kfn=gemm_device_persist<decltype(prob),decltype(cta),int8_t,decltype(dA),decltype(sA),decltype(copyA),decltype(s2rA),int8_t,decltype(dB),decltype(sB),decltype(copyB),decltype(s2rB),int32_t,decltype(dC),decltype(sC),decltype(mma)>;
+    cudaFuncSetAttribute(kfn,cudaFuncAttributeMaxDynamicSharedMemorySize,smem);
+    kfn<<<dim3(c->grind_blocks),blk,smem,s>>>(prob,cta,c->d_A[slot],dA,sA,copyA,s2rA,c->d_B[slot],dB,sB,copyB,s2rB,c->d_C,dC,sC,mma,rek,c->d_as[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64,nbx,nby);
+  } else {
+    dim3 grd(nbx,nby);
+    auto kfn=gemm_device<decltype(prob),decltype(cta),int8_t,decltype(dA),decltype(sA),decltype(copyA),decltype(s2rA),int8_t,decltype(dB),decltype(sB),decltype(copyB),decltype(s2rB),int32_t,decltype(dC),decltype(sC),decltype(mma)>;
+    cudaFuncSetAttribute(kfn,cudaFuncAttributeMaxDynamicSharedMemorySize,smem);
+    kfn<<<grd,blk,smem,s>>>(prob,cta,c->d_A[slot],dA,sA,copyA,s2rA,c->d_B[slot],dB,sB,copyB,s2rB,c->d_C,dC,sC,mma,rek,c->d_as[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64);
+  }
 }
 
 #define MK(p,sz) do{ if(cudaMalloc((void**)&(p),(sz))!=cudaSuccess){return nullptr;} }while(0)
 extern "C" {
 void* pearl_resident2_create(int m,int n,int k){
-  Ctx2* c=new Ctx2(); c->m=m;c->n=n;c->k=k;
+  Ctx2* c=new Ctx2(); c->m=m;c->n=n;c->k=k; c->grind_blocks=0;
   c->prop=new cudaDeviceProp(); if(cudaGetDeviceProperties((cudaDeviceProp*)c->prop,0)){delete c;return nullptr;}
   const uint32_t tpb=256,chunk=1024;
   c->nbA=(((uint32_t)((size_t)m*k)+chunk-1)/chunk+tpb-1)/tpb;
@@ -482,6 +523,11 @@ int pearl_resident2_grind_batch(void* ctx, unsigned long long base_seed, const u
   for(int i=(num>=2?num-2:0); i<num; i++) collect(i);
   return out;
 }
+// v0.5.0 : règle la grille du grind persistant. 0 = grille pleine (défaut).
+void pearl_resident2_set_grind_blocks(void* ctx, int g){ ((Ctx2*)ctx)->grind_blocks = g; }
+// Nombre de SM du GPU 0 (pour calibrer G = headroom).
+int pearl_gpu_sm_count(){ cudaDeviceProp p; if(cudaGetDeviceProperties(&p,0)) return 0; return p.multiProcessorCount; }
+
 void pearl_resident2_destroy(void* ctx){
   Ctx2* c=(Ctx2*)ctx; if(!c)return;
   cudaFree(c->d_C);cudaFree(c->d_sla);cudaFree(c->d_slb);cudaFree(c->d_jk);
