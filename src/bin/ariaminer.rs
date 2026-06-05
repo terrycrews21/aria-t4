@@ -30,7 +30,7 @@ use rand::rngs::StdRng;
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Parser, Debug)]
-#[command(name = "ariaminer", about = "ARIAMiner — open-source 0% dev-fee CPU miner for Pearl (real PlainProof)")]
+#[command(name = "ariaminer", about = "ARIAMiner GPU — Blackwell-native Pearl (PRL) miner · 1% dev-fee (announced)")]
 struct Args {
     #[arg(long)]
     pool: String,
@@ -47,10 +47,6 @@ struct Args {
     #[arg(long)]
     stats_port: Option<u16>,
 }
-
-/// Hashrate display convention: same TMACs/s ("TH/s") multiplier the pool uses,
-/// so the miner/HiveOS number matches the pool dashboard for the same rig.
-const HASHRATE_DISPLAY_MULT: f64 = 4.3e6;
 
 /// A job ready to grind: the stratum job id (echoed in the submit) plus the
 /// official inputs. Cheap to clone (matrices are drawn per attempt, not here).
@@ -118,6 +114,9 @@ fn spawn_grind(
     shares: Arc<AtomicU64>,
     credited: Arc<AtomicU64>,
     diff_arc: Arc<AtomicU64>,
+    // m·n·k of the current setup — lets the reporter show a stable, deterministic
+    // hashrate (setups/s × work) instead of the noisy share-luck estimate.
+    work_per_setup: Arc<AtomicU64>,
     submit_tx: mpsc::Sender<Submission>,
 ) -> GrindGen {
     let stop = Arc::new(AtomicBool::new(false));
@@ -129,6 +128,7 @@ fn spawn_grind(
             let shares = Arc::clone(&shares);
             let credited = Arc::clone(&credited);
             let diff_arc = Arc::clone(&diff_arc);
+            let work_per_setup = Arc::clone(&work_per_setup);
             let submit_tx = submit_tx.clone();
             thread::spawn(move || {
                 let mut rng = StdRng::seed_from_u64(
@@ -143,6 +143,10 @@ fn spawn_grind(
                     // Adopt the latest job at each setup boundary.
                     let job = job_slot.lock().clone();
                     let oj = &job.official;
+                    work_per_setup.store(
+                        (oj.m as u64) * (oj.n as u64) * (oj.k as u64),
+                        Ordering::Relaxed,
+                    );
                     // One faithful attempt: draw matrices, noise, sweep every
                     // PeriodicPattern tile against the share bound.
                     // CPU: the pool's tile config on the AVX micro-kernel.
@@ -176,7 +180,7 @@ fn spawn_grind(
                                 shares.fetch_add(1, Ordering::Relaxed);
                                 // Credit this share's difficulty (pool's basis for hashrate).
                                 credited.fetch_add(diff_arc.load(Ordering::Relaxed), Ordering::Relaxed);
-                                tracing::info!(job_id = %job.job_id, "✅ share (real PlainProof) — submitting");
+                                tracing::debug!(job_id = %job.job_id, "share (real PlainProof) — submitting");
                                 let _ = submit_tx.try_send(Submission {
                                     job_id: job.job_id.clone(),
                                     proof_base64,
@@ -252,6 +256,7 @@ async fn autotune_grid(
             Arc::clone(shares),
             Arc::clone(credited),
             Arc::clone(diff_arc),
+            Arc::new(AtomicU64::new(0)), // autotune: hashrate display not needed
             submit_tx.clone(),
         );
         tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -271,6 +276,109 @@ async fn autotune_grid(
         }
     }
     best_batch
+}
+
+/// ANSI colors + the startup banner. Pure stdout, no crate.
+mod ui {
+    pub const RST: &str = "\x1b[0m";
+    pub const B: &str = "\x1b[1m";
+    pub const DIM: &str = "\x1b[2m";
+    pub const CYA: &str = "\x1b[96m";
+    pub const GRN: &str = "\x1b[92m";
+    pub const YEL: &str = "\x1b[93m";
+    pub const GRY: &str = "\x1b[90m";
+    // Sprite palette (256-color), kept for optional pixel-art.
+    pub const GRS: &str = "\x1b[38;5;71m"; // grass green
+    pub const BRN: &str = "\x1b[38;5;94m"; // dirt / hair
+    pub const SKN: &str = "\x1b[38;5;180m"; // Steve skin
+    pub const EYE: &str = "\x1b[38;5;33m"; // eyes
+    pub const STN: &str = "\x1b[38;5;245m"; // stone (pickaxe head)
+    pub const DIA: &str = "\x1b[38;5;51m"; // diamond ore (PRL)
+    pub const WHT: &str = "\x1b[97m";
+
+    /// Best-effort GPU model for the banner (falls back to a generic label).
+    pub fn gpu_name() -> String {
+        std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=name", "--format=csv,noheader"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "CUDA GPU".into())
+    }
+
+    pub fn short_wallet(w: &str) -> String {
+        if w.len() > 18 {
+            format!("{}…{}", &w[..10], &w[w.len() - 6..])
+        } else {
+            w.to_string()
+        }
+    }
+
+    /// Render one sprite row: each char → a colored `██` pixel (space = blank).
+    /// Generic pixel-art sprite renderer (kept for optional art).
+    pub fn px_row(row: &str) -> String {
+        let mut s = String::new();
+        for ch in row.chars() {
+            let c = match ch {
+                'H' => "\x1b[38;5;94m",  // hair (brown)
+                'S' => "\x1b[38;5;180m", // skin
+                'W' => "\x1b[97m",       // eye white
+                'I' => "\x1b[38;5;27m",  // iris (blue)
+                'N' => "\x1b[38;5;137m", // nose shadow
+                'M' => "\x1b[38;5;58m",  // mustache (dark)
+                'G' => "\x1b[38;5;250m", // pickaxe head (iron)
+                'g' => "\x1b[38;5;244m", // pickaxe head shade
+                'K' => "\x1b[38;5;130m", // handle (wood)
+                'T' => "\x1b[38;5;37m",  // shirt (teal)
+                't' => "\x1b[38;5;30m",  // shirt shade
+                'L' => "\x1b[38;5;26m",  // trousers (blue)
+                'l' => "\x1b[38;5;20m",  // trousers shade
+                'B' => "\x1b[38;5;238m", // shoes (dark)
+                'D' => "\x1b[38;5;51m",  // diamond
+                'C' => "\x1b[38;5;31m",  // diamond shade
+                _ => "",                 // space = blank pixel
+            };
+            if c.is_empty() {
+                s.push_str("  ");
+            } else {
+                s.push_str(c);
+                s.push_str("██");
+            }
+        }
+        s.push_str("\x1b[0m");
+        s
+    }
+}
+
+fn print_banner(pool: &str, wallet: &str, worker: &str, threads: usize) {
+    use ui::*;
+    let ver = env!("CARGO_PKG_VERSION");
+    let gpu = gpu_name();
+    let line = "────────────────────────────────────────────────";
+    println!();
+    println!("  {WHT}{B}⛏  A R I A M I N E R{RST}   {GRY}GPU · v{ver}{RST}");
+    println!("  {GRY}{line}{RST}");
+    println!(
+        "  {DIM}Pearl (PRL) · Blackwell IMMA · GEMM Int7×Int7 ·{RST} {YEL}1% dev-fee{RST}"
+    );
+    println!();
+    let row = |label: &str, val: &str| println!("     {DIM}{label:<8}{RST}{WHT}{B}{val}{RST}");
+    row("GPU", &gpu);
+    row("Pool", pool);
+    row("Wallet", &short_wallet(wallet));
+    row("Worker", worker);
+    row("Threads", &threads.to_string());
+    println!("  {GRY}{line}{RST}");
+    println!();
 }
 
 #[tokio::main]
@@ -295,7 +403,7 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("--pool must be host:port"))?;
     let port: u16 = port.parse()?;
 
-    tracing::info!(pool = %args.pool, worker = %args.worker, threads, "ariaminer starting (real PlainProof)");
+    print_banner(&args.pool, &args.wallet, &args.worker, threads);
 
     let (job_tx, mut job_rx) = broadcast::channel::<JobEvent>(64);
     let (submit_tx, submit_rx) = mpsc::channel::<Submission>(256);
@@ -317,6 +425,7 @@ async fn main() -> anyhow::Result<()> {
     let shares = Arc::new(AtomicU64::new(0));
     let diff_arc = Arc::new(AtomicU64::new(524_288));
     let credited = Arc::new(AtomicU64::new(0)); // Σ difficulty of found shares
+    let work_per_setup = Arc::new(AtomicU64::new(0)); // m·n·k of the live setup
     let hashrate_hs = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
 
@@ -331,34 +440,44 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Rate reporter (setups/s + shares) + hashrate in the pool's TH/s convention.
+    // Rate reporter. Hashrate = setups/s × (m·n·k) — the DETERMINISTIC compute
+    // throughput, which is rock-stable (like other miners) instead of the noisy
+    // share-luck estimate. It equals the pool's number on average (the pool just
+    // samples the same work via found shares) but doesn't jump around.
     {
         let attempts = Arc::clone(&attempts);
         let shares = Arc::clone(&shares);
-        let credited = Arc::clone(&credited);
+        let work_per_setup = Arc::clone(&work_per_setup);
         let hashrate_hs = Arc::clone(&hashrate_hs);
         tokio::spawn(async move {
             let mut last = 0u64;
-            let mut last_cred = 0u64;
             let mut t = Instant::now();
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 let now = attempts.load(Ordering::Relaxed);
-                let cred = credited.load(Ordering::Relaxed);
                 let dt = t.elapsed().as_secs_f64().max(1e-3);
-                // hashrate = Σ(credited difficulty)/window × display-mult — the SAME
-                // basis the pool uses, so the miner's number matches the dashboard
-                // (and converges cleanly with vardiff instead of spiking).
-                let hr = (cred.saturating_sub(last_cred)) as f64 / dt * HASHRATE_DISPLAY_MULT;
+                let sps = (now - last) as f64 / dt;
+                let wps = work_per_setup.load(Ordering::Relaxed) as f64;
+                let hr = sps * wps; // MAC/s = H/s (TH/s = TMAC/s convention)
                 hashrate_hs.store(hr as u64, Ordering::Relaxed);
-                tracing::info!(
-                    "rate: {:.1} setups/s | total {} setups, {} shares",
-                    (now - last) as f64 / dt,
-                    now,
-                    shares.load(Ordering::Relaxed)
+                let sh = shares.load(Ordering::Relaxed);
+                let up = started.elapsed().as_secs();
+                let upstr = if up >= 3600 {
+                    format!("{}h{:02}m", up / 3600, (up % 3600) / 60)
+                } else if up >= 60 {
+                    format!("{}m{:02}s", up / 60, up % 60)
+                } else {
+                    format!("{}s", up)
+                };
+                use ui::*;
+                println!(
+                    "{CYA}{B}⚡ {:>7.2} TH/s{RST}  {GRY}│{RST}  {GRN}✓ {} shares{RST}  {GRY}│{RST}  {DIM}{:.0} setups/s{RST}  {GRY}│{RST}  {DIM}up {}{RST}",
+                    hr / 1e12,
+                    sh,
+                    sps,
+                    upstr
                 );
                 last = now;
-                last_cred = cred;
                 t = Instant::now();
             }
         });
@@ -444,6 +563,7 @@ async fn main() -> anyhow::Result<()> {
                             Arc::clone(&shares),
                             Arc::clone(&credited),
                             Arc::clone(&diff_arc),
+                            Arc::clone(&work_per_setup),
                             submit_tx.clone(),
                         ));
                     }

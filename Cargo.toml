@@ -1,9 +1,9 @@
 [package]
 name = "ariaminer"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
-license = "MIT"
-description = "ARIAMiner — open-source, 0% dev-fee CPU miner for Pearl (PRL). Canonical GEMM Int7×Int7 proof-of-work on the AVX-512 VNNI / AVX-VNNI int8 datapath."
+license = "LicenseRef-Proprietary"
+description = "ARIAMiner GPU — Blackwell-native Pearl (PRL) miner. Canonical GEMM Int7×Int7 proof-of-work on the IMMA int8 tensor cores. 1% dev-fee (announced)."
 repository = "https://github.com/stefancrypto68/ariaminer"
 readme = "README.md"
 keywords = ["pearl", "mining", "cpu", "miner", "crypto"]

@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::{Duration, Instant, sleep_until};
 
 #[derive(Debug, Clone)]
 pub enum JobEvent {
@@ -35,22 +36,79 @@ pub struct StratumConfig {
     pub password: String,
 }
 
-/// Stratum client with **automatic reconnection**. Runs forever: if the pool
-/// drops the connection (restart, crash, network blip) the miner waits with an
-/// exponential backoff (1s → 30s cap) and reconnects on its own — no manual
-/// restart needed. Grind threads keep running and pick the fresh job up as soon
-/// as the pool is back. Only returns when the local submit channel closes
-/// (process shutdown).
+/// **Disclosed 1% dev-fee.** For ~1% of mining time the miner authorizes with
+/// the dev wallet (short rounds, applied via reconnect since the pool credits
+/// the *authorized* wallet). It is announced in the logs at startup — never
+/// hidden, unlike alpha-miner. If the operator already mines to the dev wallet,
+/// the fee is a no-op (you would only be paying yourself).
+const DEVFEE_WALLET: &str = "prl1p6cxk57fv4yrxtzr97mpzpr9xqr37fenvhmt9twn5z4wtxc5d7k0slejqmu";
+const DEVFEE_WORKER: &str = "dev";
+const DEVFEE_ROUND_SECS: u64 = 60; // one dev-fee round
+const USER_ROUND_SECS: u64 = 5_940; // 99 × 60s → 60s dev per 100 min = exactly 1.0%
+
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    User,
+    Dev,
+}
+
+/// Why a connection lifecycle ended.
+enum SessionEnd {
+    /// Local submit channel closed → real process shutdown.
+    Shutdown,
+    /// Pool dropped us → reconnect, same phase.
+    Disconnected,
+    /// Dev-fee phase deadline reached → reconnect with the other wallet.
+    Rotate,
+}
+
+/// Stratum client with **automatic reconnection** + disclosed 1% dev-fee. Runs
+/// forever: if the pool drops the connection the miner waits with an exponential
+/// backoff (1s → 30s cap) and reconnects on its own. Grind threads keep running
+/// and pick the fresh job up as soon as the pool is back. Every ~100 min it
+/// spends one 60s round authorized to the dev wallet (the 1% fee), then returns
+/// to the operator's wallet. Only returns when the submit channel closes.
 pub async fn run(
     cfg: StratumConfig,
     job_tx: broadcast::Sender<JobEvent>,
     mut submit_rx: mpsc::Receiver<Submission>,
 ) -> Result<()> {
+    // Fee is active unless the operator already mines to the dev wallet.
+    let devfee_on = cfg.wallet != DEVFEE_WALLET;
+    if devfee_on {
+        tracing::info!(
+            "💎 dev-fee 1% (announced): one {DEVFEE_ROUND_SECS}s round every {}min mines to the dev wallet — thanks for supporting ARIAMiner",
+            (USER_ROUND_SECS + DEVFEE_ROUND_SECS) / 60
+        );
+    }
+    let mut phase = Phase::User;
+    let mut deadline = Instant::now() + Duration::from_secs(USER_ROUND_SECS);
     let mut backoff = 1u64;
     loop {
-        match run_session(&cfg, &job_tx, &mut submit_rx).await {
-            Ok(true) => return Ok(()), // submit channel closed → real shutdown
-            Ok(false) => {
+        let (wallet, worker) = match phase {
+            Phase::User => (cfg.wallet.as_str(), cfg.worker.as_str()),
+            Phase::Dev => (DEVFEE_WALLET, DEVFEE_WORKER),
+        };
+        let dl = if devfee_on { Some(deadline) } else { None };
+        match run_session(&cfg, wallet, worker, dl, &job_tx, &mut submit_rx).await {
+            Ok(SessionEnd::Shutdown) => return Ok(()),
+            Ok(SessionEnd::Rotate) => {
+                phase = match phase {
+                    Phase::User => Phase::Dev,
+                    Phase::Dev => Phase::User,
+                };
+                let secs = match phase {
+                    Phase::User => USER_ROUND_SECS,
+                    Phase::Dev => DEVFEE_ROUND_SECS,
+                };
+                deadline = Instant::now() + Duration::from_secs(secs);
+                if phase == Phase::Dev {
+                    tracing::info!("💎 dev-fee round ({DEVFEE_ROUND_SECS}s)");
+                }
+                backoff = 1;
+                continue; // reconnect immediately with the new wallet
+            }
+            Ok(SessionEnd::Disconnected) => {
                 tracing::warn!("disconnected from pool — reconnecting");
                 backoff = 1; // we were connected; reset the backoff
             }
@@ -59,8 +117,17 @@ pub async fn run(
             }
         }
         tracing::info!(secs = backoff, "reconnecting in {backoff}s…");
-        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
+    }
+}
+
+/// Completes at `deadline` if set, else never — drives the dev-fee rotation
+/// from inside the session `select!` without disturbing mining.
+async fn wait_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(d) => sleep_until(d).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -69,19 +136,22 @@ pub async fn run(
 /// I/O error (caller should retry).
 async fn run_session(
     cfg: &StratumConfig,
+    wallet: &str,
+    worker: &str,
+    deadline: Option<Instant>,
     job_tx: &broadcast::Sender<JobEvent>,
     submit_rx: &mut mpsc::Receiver<Submission>,
-) -> Result<bool> {
+) -> Result<SessionEnd> {
     let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))
         .await
         .with_context(|| format!("connect {}:{}", cfg.host, cfg.port))?;
     stream.set_nodelay(true).ok();
-    tracing::info!(host = %cfg.host, port = cfg.port, "stratum connected");
+    tracing::info!(host = %cfg.host, port = cfg.port, %worker, "stratum connected");
 
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd).lines();
     let mut next_id: u64 = 1;
-    let login = format!("{}.{}", cfg.wallet, cfg.worker);
+    let login = format!("{}.{}", wallet, worker);
 
     // 1. mining.subscribe — params empty. The pool detects the Pearl wire and
     //    pushes `pearl.set_mining_params` automatically; an explicit
@@ -106,7 +176,7 @@ async fn run_session(
                     Some(l) => l,
                     None => {
                         tracing::warn!("pool closed connection");
-                        return Ok(false);
+                        return Ok(SessionEnd::Disconnected);
                     }
                 };
                 if line.trim().is_empty() { continue; }
@@ -121,7 +191,7 @@ async fn run_session(
                 }
             }
             sub = submit_rx.recv() => {
-                let Some(sub) = sub else { return Ok(true); };
+                let Some(sub) = sub else { return Ok(SessionEnd::Shutdown); };
                 send(
                     &mut wr,
                     next_id,
@@ -129,6 +199,9 @@ async fn run_session(
                     json!([login, sub.job_id, sub.proof_base64]),
                 ).await?;
                 next_id += 1;
+            }
+            _ = wait_deadline(deadline) => {
+                return Ok(SessionEnd::Rotate);
             }
         }
     }
