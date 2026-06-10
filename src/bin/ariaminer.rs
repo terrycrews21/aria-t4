@@ -559,6 +559,9 @@ async fn main() -> anyhow::Result<()> {
             // Forme mainnet figée (la pool valide m=n=131072 dans le proof soumis).
             if std::env::var("ARIA_BATCH_M").is_err() { std::env::set_var("ARIA_BATCH_M", "131072"); }
             if std::env::var("ARIA_BATCH_N").is_err() { std::env::set_var("ARIA_BATCH_N", "131072"); }
+            // fix-B : B (b_eff) calculé 1× par job et gardé résident, seul A est
+            // streamé → économise gen+commit+noise de B (~2.7ms) par setup.
+            if std::env::var("ARIA_FIXB").is_err() { std::env::set_var("ARIA_FIXB", "1"); }
         }
         // Bound = règle CONSENSUS (jackpot LE ≤ target × h·w·k) : le ×h·w·k donne
         // la difficulté effective réaliste (~2^31 pour target 2^50) qui colle au
