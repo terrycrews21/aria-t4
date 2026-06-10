@@ -173,14 +173,30 @@ void gemm_device_tma_ms(ProblemShape shape_MNK, CtaTiler cta_tiler,
     TA const* A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, S2RAtomA s2r_atom_a,
     TB const* B, BStride dB, CUTE_GRID_CONSTANT TmaB const tma_b, BSmemLayout sB_layout, S2RAtomB s2r_atom_b,
     TC* C, CStride dC, CSmemLayout, TiledMma mma,
-    int reduce_every_k,
+    int reduce_every_k, int swz_g,
     const uint32_t* pow_key, const uint32_t* pow_bound, int* found_count,
     int* hit_rows, int* hit_cols, int max_hits) {
   Tensor mA = make_tensor(make_gmem_ptr(A), select<0,2>(shape_MNK), dA);
   Tensor mC = make_tensor(make_gmem_ptr(C), select<0,1>(shape_MNK), dC);
   Tensor mB = tma_b.get_tma_tensor(select<1,2>(shape_MNK));
 
-  auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
+  // SWIZZLE de grille (v0.6.1) : remap (bx,by) en bandes de swz_g tuiles-M.
+  // L'ordre de lancement CUDA (x fastest) balaie alors swz_g×bM lignes de A (qui
+  // tiennent en L2) sur TOUTES les colonnes N avant la bande suivante → A n'est
+  // plus re-streamé N/bN fois depuis la DRAM (mesuré +12% forme 131072², G=64).
+  // Bijection stricte (bande partielle gérée) ; le calcul PAR TUILE est inchangé
+  // → fold/transcript byte-identiques, seul l'ordre d'exécution des CTAs change.
+  int bx = blockIdx.x, by = blockIdx.y;
+  if (swz_g > 1) {
+    int gm = gridDim.x, gn = gridDim.y;
+    int bid  = bx + by * gm;                    // ordre de lancement réel (x fastest)
+    int band = bid / (swz_g * gn);
+    int r    = bid % (swz_g * gn);
+    int g    = min(swz_g, gm - band * swz_g);   // bande partielle en fin de grille
+    bx = band * swz_g + (r % g);
+    by = r / g;
+  }
+  auto cta_coord = make_coord(bx, by, _);
   Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});   // (bM,bK,k)
   Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});   // (bN,bK,k)
   Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});   // (bM,bN)
@@ -311,8 +327,8 @@ void gemm_device_tma_ms(ProblemShape shape_MNK, CtaTiler cta_tiler,
       auto cD = make_identity_tensor(make_shape(get<0>(cta_tiler), get<1>(cta_tiler)));
       auto tCcD = thr_mma.partition_C(cD);
       int cnt = size(tCcD);
-      int row0 = blockIdx.x * (int)get<0>(cta_tiler);
-      int col0 = blockIdx.y * (int)get<1>(cta_tiler);
+      int row0 = bx * (int)get<0>(cta_tiler);   // bx/by swizzlés = la tuile RÉELLE
+      int col0 = by * (int)get<1>(cta_tiler);
       for (int i=0;i<cnt;++i){
         hit_rows[slot*128 + i] = row0 + get<0>(tCcD(i));
         hit_cols[slot*128 + i] = col0 + get<1>(tCcD(i));

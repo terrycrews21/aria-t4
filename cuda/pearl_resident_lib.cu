@@ -14,6 +14,15 @@
 #include "pearl_gpu_kernel_tma.cuh"    // gemm_device_tma_ms (grind multistage TMA 128×256, v0.6.0-ws)
 using namespace cute;
 
+// v0.6.1 : largeur de bande (en tuiles-M) du swizzle de grille du grind multistage.
+// ARIA_SWZ_G (défaut 64, 0 = off). Optimum mesuré RTX 5080 forme 131072² : plateau
+// 64-96 (+12%) ; 128 déborde du L2. Changement d'ORDRE des CTAs uniquement.
+static int aria_swz_g() {
+  static int v = -1;
+  if (v < 0) { const char* e = getenv("ARIA_SWZ_G"); v = e ? atoi(e) : 64; if (v < 0) v = 0; }
+  return v;
+}
+
 // --- helpers noise (miroir de pearl_noise_lib.cu, inline) ---
 __device__ __forceinline__ void rh_(uint32_t index, const uint32_t* seed,
                                      const uint32_t* key, int prep, uint32_t out[8]) {
@@ -341,14 +350,14 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
           int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),
           int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false, /*BE=*/true>;
       kfn<<<grd2,blk2,smem,c->sA>>>(prob,cta2, c->d_A,dA,sAm,copyA2,s2rA2, c->d_B,dB,tma_b,sBm,s2rB2,
-          c->d_C,dC,sCm,mma2, reduce_every_k, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+          c->d_C,dC,sCm,mma2, reduce_every_k, aria_swz_g(), c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
     } else {
       auto kfn = gemm_device_tma_ms<decltype(prob),decltype(cta2),
           int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
           int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),
           int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false, /*BE=*/false>;
       kfn<<<grd2,blk2,smem,c->sA>>>(prob,cta2, c->d_A,dA,sAm,copyA2,s2rA2, c->d_B,dB,tma_b,sBm,s2rB2,
-          c->d_C,dC,sCm,mma2, reduce_every_k, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+          c->d_C,dC,sCm,mma2, reduce_every_k, aria_swz_g(), c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
     }
   } else if (c->tile2x64) {
     // v1.1 AlphaPool : grind 2×64 (fold tuile 2 lignes {r,r+32} × 64 cols).
@@ -567,7 +576,7 @@ static void launch_chain2(Ctx2* c, int slot, uint64_t seed, const uint8_t job_ke
     auto kfn=gemm_device_tma_ms<decltype(prob),decltype(cta2),int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),int32_t,decltype(dC),decltype(sCm),decltype(mma2),false>;
     cudaFuncSetAttribute(kfn,cudaFuncAttributeMaxDynamicSharedMemorySize,smem2);
     dim3 grd2(size(ceil_div(m,bM2)),size(ceil_div(n,bN2))),blk2(size(mma2));
-    kfn<<<grd2,blk2,smem2,s>>>(prob,cta2,c->d_A[slot],dA,sAm,copyA2,s2rA2,c->d_B[slot],dB,tma_b,sBm,s2rB2,c->d_C,dC,sCm,mma2,rek,c->d_as[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64);
+    kfn<<<grd2,blk2,smem2,s>>>(prob,cta2,c->d_A[slot],dA,sAm,copyA2,s2rA2,c->d_B[slot],dB,tma_b,sBm,s2rB2,c->d_C,dC,sCm,mma2,rek,aria_swz_g(),c->d_as[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64);
   } else if (c->grind_blocks > 0) {
     // v0.5.0 : grind PERSISTANT à occupation bridée (G blocs grid-stride) → laisse
     // des SM libres pour que le prologue du slot suivant tourne en concurrence.
