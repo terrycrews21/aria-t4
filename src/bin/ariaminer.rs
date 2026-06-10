@@ -243,6 +243,9 @@ fn spawn_grind(
 
                     let fixb = std::env::var("ARIA_FIXB").is_ok(); // fix-B : B figé/job, A streamé
                     let mut b_seed_job: Option<u64> = None;        // seed de B (figé), reset au job
+                    // v0.6.2 : overlap prologue — le seed du setup SUIVANT est pré-tiré pour
+                    // que le kernel préfetche son prologue pendant le grind courant.
+                    let mut next_seed: u64 = rng.next_u64();
                     let mut gpu_ctx: Option<ariaminer::gpu_ffi::ResidentCtx> = None;
                     // (job_ptr, job_key, gm, gn, k, rank, tile_h, tile_w, bound_le)
                     let mut cache: Option<(usize, [u8; 32], usize, usize, usize, usize, usize, usize, [u8; 32])> = None;
@@ -277,11 +280,12 @@ fn spawn_grind(
                         let ctx = gpu_ctx.as_ref().unwrap();
 
                         // Boucle TIGHT : SEULEMENT le grind GPU (gen→commit→noise→GEMM→powcheck).
-                        let setup_seed = rng.next_u64();
+                        let setup_seed = next_seed;
+                        next_seed = rng.next_u64();
                         // fix-B : b_seed figé au 1er grind du job (= ce que le kernel ARIA_FIXB garde) ; sinon = setup_seed
                         let b_seed = if fixb { *b_seed_job.get_or_insert(setup_seed) } else { setup_seed };
                         let gt0 = Instant::now();
-                        let (found, hits) = ctx.grind(setup_seed, job_key, bound_le);
+                        let (found, hits) = ctx.grind2(setup_seed, next_seed, job_key, bound_le);
                         if mouchard.enabled() {
                             let wall = gt0.elapsed().as_nanos() as u64;
                             let (gc, no, gr) = ctx.last_times4();

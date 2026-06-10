@@ -42,6 +42,11 @@ unsafe extern "C" {
         job_key: *const u8, pow_bound_le: *const u8,
         hit_rows: *mut c_int, hit_cols: *mut c_int,
     ) -> c_int;
+    fn pearl_resident_grind2_ctx(
+        ctx: *mut core::ffi::c_void, setup_seed: u64, next_seed: u64, has_next: c_int,
+        job_key: *const u8, pow_bound_le: *const u8,
+        hit_rows: *mut c_int, hit_cols: *mut c_int,
+    ) -> c_int;
     fn pearl_resident_destroy(ctx: *mut core::ffi::c_void);
     fn pearl_resident_set_timing(ctx: *mut core::ffi::c_void, on: c_int);
     fn pearl_resident_last_times(ctx: *mut core::ffi::c_void, prologue_ms: *mut f32, grind_ms: *mut f32);
@@ -146,6 +151,25 @@ impl ResidentCtx {
         let found = unsafe {
             pearl_resident_grind_ctx(self.ptr, setup_seed, job_key.as_ptr(), bound_le.as_ptr(),
                 hr.as_mut_ptr(), hc.as_mut_ptr())
+        };
+        let nret = (found.max(0) as usize).min(self.max_hits);
+        let mut hits = Vec::with_capacity(nret);
+        for s in 0..nret {
+            let mut rows: Vec<usize> = hr[s*128..s*128+128].iter().map(|&x| x as usize).collect();
+            let mut cols: Vec<usize> = hc[s*128..s*128+128].iter().map(|&x| x as usize).collect();
+            rows.sort_unstable(); rows.dedup(); cols.sort_unstable(); cols.dedup();
+            hits.push(Hit { rows, cols });
+        }
+        (found, hits)
+    }
+    /// v0.6.2 : grind avec OVERLAP PROLOGUE — le prologue de `next_seed` est préfetché
+    /// pendant ce grind (chemin LuckyPool ARIA_TMA_MS+ARIA_FIXB ; sinon identique à `grind`).
+    pub fn grind2(&self, setup_seed: u64, next_seed: u64, job_key: &[u8; 32], bound_le: &[u8; 32]) -> (i32, Vec<Hit>) {
+        let mut hr = vec![0i32; self.max_hits * 128];
+        let mut hc = vec![0i32; self.max_hits * 128];
+        let found = unsafe {
+            pearl_resident_grind2_ctx(self.ptr, setup_seed, next_seed, 1,
+                job_key.as_ptr(), bound_le.as_ptr(), hr.as_mut_ptr(), hc.as_mut_ptr())
         };
         let nret = (found.max(0) as usize).min(self.max_hits);
         let mut hits = Vec::with_capacity(nret);

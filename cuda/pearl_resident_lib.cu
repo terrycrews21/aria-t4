@@ -23,6 +23,16 @@ static int aria_swz_g() {
   return v;
 }
 
+// v0.6.2 : overlap prologue (prefetch N+1 pendant le grind N). ARIA_OVERLAP=1 pour activer.
+// DÉFAUT 0 (OFF) : mesuré WASH à toutes les puissances/priorités — le kernel est SM 100%
+// compute-bound, aucun trou à remplir, cacher le prologue déplace le même ALU (11/06).
+// Code gardé (A/B validé byte-exact via overlap_check) : resservira si le prologue grossit.
+static int aria_overlap() {
+  static int v = -1;
+  if (v < 0) { const char* e = getenv("ARIA_OVERLAP"); v = e ? atoi(e) : 0; }
+  return v;
+}
+
 // --- helpers noise (miroir de pearl_noise_lib.cu, inline) ---
 __device__ __forceinline__ void rh_(uint32_t index, const uint32_t* seed,
                                      const uint32_t* key, int prep, uint32_t out[8]) {
@@ -237,6 +247,15 @@ struct Ctx {
   bool tile2x64;   // false = grind 8×16 (v1.0) ; true = grind 2×64 (v1.1 AlphaPool)
   // --- instrumentation (v0.5.0) : split prologue vs grind par cudaEvents timés ---
   cudaEvent_t tStart, tMid, tPro, tEnd; float last_pro_ms, last_grind_ms, last_genc_ms, last_noise_ms; bool do_timing;
+  // --- v0.6.2 : OVERLAP PROLOGUE (pipeline 2 slots A, prefetch N+1 pendant le grind N) ---
+  // Slot 1 = d_A2/d_ha2/d_as2. Le grind N lit slot p pendant que le prologue N+1
+  // (gen+commit+stir+perm+noise A, fix-B : B résident intouché) écrit le slot 1-p sur
+  // sP (stream HAUTE PRIORITÉ non-bloquant). Scratch prologue (d_sla/d_faA/d_saA/d_ra)
+  // partagé : UN seul prologue en vol à la fois. nullptr = pipeline désactivé.
+  int8_t* d_A2; uint32_t *d_ha2, *d_as2;
+  cudaStream_t sP; cudaEvent_t ePro, p0, pMid, p1;
+  bool bfilled;                       // fix-B : B résident construit pour ce job (membre Ctx, pas static)
+  bool pend_valid; uint64_t pend_seed; int pend_slot;   // prologue préfetché en attente
 };
 
 // Lance la chaîne résidente — côtés A‖B sur 2 streams (overlap prologue). Grind sur sA.
@@ -396,6 +415,154 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   return found;
 }
 
+// ============================================================================
+// v0.6.2 — OVERLAP PROLOGUE.
+// Pendant que le grind(N) tourne sur sA (~342 ms), le prologue du setup N+1
+// (gen A → commit → stir → perm → noise, ~2.7 ms) tourne sur sP (haute priorité)
+// dans le slot opposé (d_A2/d_ha2/d_as2). Au setup suivant le grind démarre
+// immédiatement (waitEvent ePro). Réservé au chemin LuckyPool (ARIA_TMA_MS +
+// ARIA_FIXB : B résident → le prologue prefetch ne touche QUE le côté A) ;
+// sinon fallback resident_run. Le kernel grind est INCHANGÉ : mêmes entrées
+// par setup ⇒ mêmes sorties (validé A/B par overlap_check + live).
+// Races éliminées par construction : grind lit slot p / prefetch écrit 1-p ;
+// d_hb,d_jk,d_sla stables ; d_bs écrit sans lecteur (fix-B) ; scratch commit
+// d_ra protégé par eStir sur le chemin froid ; prefetch-vs-prefetch sérialisés
+// par sP lui-même.
+// ============================================================================
+static void prologue_A_slot(Ctx* c, uint64_t seed, int8_t* dA, uint32_t* dha, uint32_t* das,
+                            cudaStream_t s) {
+  int m=c->m, k=c->k;
+  cudaEventRecord(c->p0, s);
+  gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,s>>>(dA, seed, 0, m, k);
+  commit_nokey<256,2,256>((const uint8_t*)dA,(uint32_t)((size_t)m*k),(uint8_t*)dha,c->nbA,c->d_ra,s);
+  stir_kernel<<<1,1,0,s>>>(dha,c->d_hb,c->d_jk,das,c->d_bs);
+  cudaEventRecord(c->pMid, s);
+  perm_k_<<<(k+255)/256,256,0,s>>>(c->d_sla, das, k, c->d_faA, c->d_saA, c->rank);
+  noise_add_k_<<<m,256,0,s>>>(c->d_sla, das, m, k, c->d_faA, c->d_saA, dA, c->rank);
+  cudaEventRecord(c->p1, s);
+}
+
+static int resident_run2(Ctx* c, uint64_t seed, uint64_t next_seed, int has_next,
+                         const uint8_t job_key[32], int* hit_rows, int* hit_cols) {
+  bool fixb = (getenv("ARIA_FIXB") != nullptr);
+  if (!(fixb && getenv("ARIA_TMA_MS") && c->d_A2 && aria_overlap()))
+    return resident_run(c, seed, job_key, hit_rows, hit_cols);
+  int m=c->m, n=c->n, k=c->k, max_hits=c->max_hits;
+  // job change → set_key + reset pipeline (pending de l'ancien job jeté)
+  if (!c->jk_set || memcmp(c->last_jk, job_key, 32) != 0) {
+    cudaDeviceSynchronize(); set_key(job_key);
+    for (int i=0;i<32;i++) c->last_jk[i]=job_key[i]; c->jk_set=true;
+    c->bfilled=false; c->pend_valid=false;
+  }
+  int8_t*   dA_[2]  = { c->d_A,  c->d_A2 };
+  uint32_t* dha_[2] = { c->d_ha, c->d_ha2 };
+  uint32_t* das_[2] = { c->d_as, c->d_as2 };
+  int slot; bool cold;
+  cudaMemsetAsync(c->d_found,0,4,c->sA);
+  if (c->pend_valid && c->pend_seed == seed && c->bfilled) {
+    // ✓ prologue déjà préfetché pendant le grind précédent → grind direct
+    slot = c->pend_slot; cold = false;
+    cudaStreamWaitEvent(c->sA, c->ePro, 0);
+    if (c->do_timing) {  // events du prefetch déjà complétés (fini pendant le grind N-1)
+      cudaEventElapsedTime(&c->last_genc_ms, c->p0, c->pMid);
+      cudaEventElapsedTime(&c->last_noise_ms, c->pMid, c->p1);
+      c->last_pro_ms = c->last_genc_ms + c->last_noise_ms;
+    }
+  } else {
+    // pipeline froid (1er setup du job) : prologue complet inline, B compris si besoin
+    slot = 0; cold = true;
+    if (c->do_timing) cudaEventRecord(c->tStart, c->sA);
+    gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,c->sA>>>(dA_[0], seed, 0, m, k);
+    commit_nokey<256,2,256>((const uint8_t*)dA_[0],(uint32_t)((size_t)m*k),(uint8_t*)dha_[0],c->nbA,c->d_ra,c->sA);
+    if (!c->bfilled) {
+      gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256,0,c->sB>>>(c->d_B, seed, 1, n, k);
+      commit_nokey<256,2,256>((const uint8_t*)c->d_B,(uint32_t)((size_t)n*k),(uint8_t*)c->d_hb,c->nbB,c->d_rb,c->sB);
+    }
+    cudaEventRecord(c->eB, c->sB);
+    cudaStreamWaitEvent(c->sA, c->eB, 0);
+    stir_kernel<<<1,1,0,c->sA>>>(dha_[0],c->d_hb,c->d_jk,das_[0],c->d_bs);
+    cudaEventRecord(c->eStir, c->sA);
+    if (c->do_timing) cudaEventRecord(c->tMid, c->sA);
+    perm_k_<<<(k+255)/256,256,0,c->sA>>>(c->d_sla, das_[0], k, c->d_faA, c->d_saA, c->rank);
+    noise_add_k_<<<m,256,0,c->sA>>>(c->d_sla, das_[0], m, k, c->d_faA, c->d_saA, dA_[0], c->rank);
+    if (!c->bfilled) {
+      cudaStreamWaitEvent(c->sB, c->eStir, 0);
+      perm_k_<<<(k+255)/256,256,0,c->sB>>>(c->d_slb, c->d_bs, k, c->d_faB, c->d_saB, c->rank);
+      noise_add_k_<<<n,256,0,c->sB>>>(c->d_slb, c->d_bs, n, k, c->d_faB, c->d_saB, c->d_B, c->rank);
+    }
+    cudaEventRecord(c->eB, c->sB);
+    c->bfilled = true;
+    cudaStreamWaitEvent(c->sA, c->eB, 0);
+  }
+  c->pend_valid = false;
+  if (c->do_timing) cudaEventRecord(c->tPro, c->sA);
+  // ---- grind multistage TMA sur sA, slot courant (mêmes types que resident_run) ----
+  {
+    int reduce_every_k = c->rank / 32;
+    auto prob = make_shape(m, n, k);
+    auto dA = make_stride(k, Int<1>{}); auto dB = make_stride(k, Int<1>{}); auto dC = make_stride(n, Int<1>{});
+    auto bM2=Int<128>{}; auto bN2=Int<256>{}; auto bK2=Int<128>{};
+    auto cta2 = make_shape(bM2,bN2,bK2);
+    auto sAm = composition(Swizzle<3,4,3>{},
+        Layout<Shape<Shape<_16,_8 >,Shape<_128,_1>,_2>, Stride<Stride<_128,Int<2048>>,Stride<_1,_0>,Int<16384>>>{});
+    auto sBm = composition(Swizzle<3,4,3>{},
+        Layout<Shape<Shape<_16,_16>,Shape<_128,_1>,_2>, Stride<Stride<_128,Int<2048>>,Stride<_1,_0>,Int<32768>>>{});
+    auto sB1 = composition(Swizzle<3,4,3>{},
+        Layout<Shape<Shape<_16,_16>,Shape<_128,_1>>, Stride<Stride<_128,Int<2048>>,Stride<_1,_0>>>{});
+    auto sCm = make_layout(make_shape(bM2,bN2));
+    using AtomG2 = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, int8_t>;
+    using TVcopy2 = Layout<Shape<Shape<_8,_32>,_16>, Stride<Stride<_512,_1>,_32>>;
+    using TilerC2 = Shape<_32,_128>;
+    TiledCopy<AtomG2,TVcopy2,TilerC2> copyA2;
+    TiledMMA mma2 = make_tiled_mma(SM80_16x8x32_S32S8S8S32_TN{}, Layout<Shape<_2,_4,_1>,Stride<_1,_2,_0>>{}, Tile<_32,_32,_32>{});
+    Copy_Atom<SM75_U32x4_LDSM_N,int8_t> s2rA2; Copy_Atom<SM75_U32x2_LDSM_N,int8_t> s2rB2;
+    Tensor gB_t = make_tensor(make_gmem_ptr<int8_t>(c->d_B), make_layout(make_shape(n,k), make_stride(k,Int<1>{})));
+    auto tma_b = make_tma_copy<int8_t>(SM90_TMA_LOAD{}, gB_t, sB1, make_shape(bN2,bK2), Int<1>{});
+    int smem = int(sizeof(SharedStorageTMA_MS<int8_t,int8_t,decltype(sAm),decltype(sBm)>));
+    dim3 grd2(size(ceil_div(m,bM2)), size(ceil_div(n,bN2))), blk2(size(mma2));
+    if (c->big_endian) {
+      auto kfn = gemm_device_tma_ms<decltype(prob),decltype(cta2),
+          int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
+          int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),
+          int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false, /*BE=*/true>;
+      cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+      kfn<<<grd2,blk2,smem,c->sA>>>(prob,cta2, dA_[slot],dA,sAm,copyA2,s2rA2, c->d_B,dB,tma_b,sBm,s2rB2,
+          c->d_C,dC,sCm,mma2, reduce_every_k, aria_swz_g(), das_[slot], c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+    } else {
+      auto kfn = gemm_device_tma_ms<decltype(prob),decltype(cta2),
+          int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
+          int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),
+          int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false, /*BE=*/false>;
+      cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+      kfn<<<grd2,blk2,smem,c->sA>>>(prob,cta2, dA_[slot],dA,sAm,copyA2,s2rA2, c->d_B,dB,tma_b,sBm,s2rB2,
+          c->d_C,dC,sCm,mma2, reduce_every_k, aria_swz_g(), das_[slot], c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+    }
+  }
+  if (c->do_timing) cudaEventRecord(c->tEnd, c->sA);
+  // ---- prefetch du prologue N+1 sur sP (slot opposé), recouvert par le grind ----
+  if (has_next) {
+    int nxt = 1 - slot;
+    if (cold) cudaStreamWaitEvent(c->sP, c->eStir, 0);  // scratch commit d_ra libre
+    prologue_A_slot(c, next_seed, dA_[nxt], dha_[nxt], das_[nxt], c->sP);
+    cudaEventRecord(c->ePro, c->sP);
+    c->pend_valid = true; c->pend_seed = next_seed; c->pend_slot = nxt;
+  }
+  CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
+  if (c->do_timing) {
+    cudaEventElapsedTime(&c->last_grind_ms, c->tPro, c->tEnd);
+    if (cold) {
+      cudaEventElapsedTime(&c->last_pro_ms,   c->tStart, c->tPro);
+      cudaEventElapsedTime(&c->last_genc_ms,  c->tStart, c->tMid);
+      cudaEventElapsedTime(&c->last_noise_ms, c->tMid,   c->tPro);
+    }
+  }
+  int found=0; CKR(cudaMemcpy(&found,c->d_found,4,cudaMemcpyDeviceToHost));
+  int nret = found<max_hits?found:max_hits;
+  if(nret>0 && hit_rows) CKR(cudaMemcpy(hit_rows,c->d_hr,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+  if(nret>0 && hit_cols) CKR(cudaMemcpy(hit_cols,c->d_hc,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+  return found;
+}
+
 extern "C" {
 // ---- contexte persistant : alloc 1× (create), réutilise (grind), free (destroy) ----
 void* pearl_resident_create(int m, int n, int k, int max_hits) {
@@ -443,6 +610,27 @@ void* pearl_resident_create(int m, int n, int k, int max_hits) {
   c->do_timing = false; c->last_pro_ms = 0.f; c->last_grind_ms = 0.f; c->last_genc_ms = 0.f; c->last_noise_ms = 0.f;
   c->jk_set = false;
   c->tile2x64 = false;   // défaut = grind 8×16 (v1.0 AriaPool)
+  // v0.6.2 : pipeline overlap prologue — slot 2 (+m·k octets VRAM) + stream haute priorité.
+  // Alloué seulement pour le chemin multistage (ARIA_TMA_MS) avec overlap actif ;
+  // échec d'alloc = dégradé silencieux (d_A2=nullptr → fallback resident_run).
+  c->d_A2=nullptr; c->d_ha2=nullptr; c->d_as2=nullptr; c->sP=nullptr;
+  c->bfilled=false; c->pend_valid=false; c->pend_seed=0; c->pend_slot=0;
+  if (getenv("ARIA_TMA_MS") && aria_overlap()) {
+    if (ok(cudaMalloc(&c->d_A2,(size_t)m*k)) && ok(cudaMalloc(&c->d_ha2,32)) && ok(cudaMalloc(&c->d_as2,32))) {
+      int lo=0, hi=0; cudaDeviceGetStreamPriorityRange(&lo,&hi);
+      // ARIA_OVERLAP_PRIO=low → le prefetch REMPLIT les trous d'occupation du grind
+      // (pas de préemption) ; défaut high → le prefetch passe devant (peut voler du SM).
+      const char* pp = getenv("ARIA_OVERLAP_PRIO");
+      int prio = (pp && pp[0]=='l') ? lo : hi;
+      cudaStreamCreateWithPriority(&c->sP, cudaStreamNonBlocking, prio);
+      cudaEventCreateWithFlags(&c->ePro, cudaEventDisableTiming);
+      cudaEventCreate(&c->p0); cudaEventCreate(&c->pMid); cudaEventCreate(&c->p1);
+    } else {
+      if(c->d_A2) cudaFree(c->d_A2); if(c->d_ha2) cudaFree(c->d_ha2); if(c->d_as2) cudaFree(c->d_as2);
+      c->d_A2=nullptr; c->d_ha2=nullptr; c->d_as2=nullptr;
+      fprintf(stderr, "ariaminer: VRAM insuffisante pour l'overlap prologue — désactivé\n");
+    }
+  }
   return c;
 }
 
@@ -461,6 +649,19 @@ int pearl_resident_grind_ctx(void* ctx, uint64_t setup_seed,
   cudaMemcpy(c->d_jk, jk, 32, cudaMemcpyHostToDevice);
   cudaMemcpy(c->d_bnd, bnd, 32, cudaMemcpyHostToDevice);
   return resident_run(c, setup_seed, job_key, hit_rows, hit_cols);
+}
+
+// v0.6.2 : grind avec OVERLAP PROLOGUE — `next_seed` (si has_next) = seed du setup
+// suivant, dont le prologue est préfetché pendant ce grind. Fallback automatique
+// resident_run hors chemin LuckyPool (ARIA_TMA_MS+ARIA_FIXB) ou si ARIA_OVERLAP=0.
+int pearl_resident_grind2_ctx(void* ctx, uint64_t setup_seed, uint64_t next_seed, int has_next,
+                              const uint8_t job_key[32], const uint8_t pow_bound_le[32],
+                              int* hit_rows, int* hit_cols) {
+  Ctx* c = (Ctx*)ctx;
+  uint32_t jk[8], bnd[8]; b2w(job_key, jk, 8); b2w(pow_bound_le, bnd, 8);
+  cudaMemcpy(c->d_jk, jk, 32, cudaMemcpyHostToDevice);
+  cudaMemcpy(c->d_bnd, bnd, 32, cudaMemcpyHostToDevice);
+  return resident_run2(c, setup_seed, next_seed, has_next, job_key, hit_rows, hit_cols);
 }
 
 // --- instrumentation (v0.5.0) ---
@@ -487,6 +688,11 @@ void pearl_resident_destroy(void* ctx) {
   cudaFree(c->d_found);cudaFree(c->d_hr);cudaFree(c->d_hc);cudaFree(c->d_ra);cudaFree(c->d_rb);
   cudaStreamDestroy(c->sA); cudaStreamDestroy(c->sB);
   cudaEventDestroy(c->eA); cudaEventDestroy(c->eB); cudaEventDestroy(c->eStir);
+  if (c->d_A2) {   // v0.6.2 : pipeline overlap
+    cudaFree(c->d_A2); cudaFree(c->d_ha2); cudaFree(c->d_as2);
+    cudaStreamDestroy(c->sP);
+    cudaEventDestroy(c->ePro); cudaEventDestroy(c->p0); cudaEventDestroy(c->pMid); cudaEventDestroy(c->p1);
+  }
   delete (cudaDeviceProp*)c->prop; delete c;
 }
 
