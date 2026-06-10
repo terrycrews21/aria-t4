@@ -290,7 +290,11 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   TiledMMA mma = make_tiled_mma(SM80_16x8x32_S32S8S8S32_TN{},
       Layout<Shape<_2,_2,_1>, Stride<_1,_2,_0>>{}, Tile<_32,_32,_32>{});
   Copy_Atom<SM75_U32x4_LDSM_N, int8_t> s2rA, s2rB;
-  int reduce_every_k = 128/32;
+  // Le fold officiel (zk-pow compute_jackpot) réduit l'accumulateur partiel tous
+  // les `rank` colonnes de K : `for ll in (rank..=k).step_by(rank)`. Le kernel
+  // réduit tous les `reduce_every_k` MMA-steps (32 cols chacun) → reduce_every_k =
+  // rank/32. ⚠️ ÉTAIT hardcodé 128/32=4 (rank 128) → FAUX à rank 256 (doit être 8).
+  int reduce_every_k = c->rank / 32;
   dim3 grd(size(ceil_div(m,bM)), size(ceil_div(n,bN))), blk(size(mma));
   if (getenv("ARIA_TMA_MS")) {
     // étape 1 (v0.6.0-ws) : grind MULTISTAGE TMA 128×256 (8 warps, A cp.async + B TMA ring).
