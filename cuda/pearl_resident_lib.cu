@@ -301,6 +301,9 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
     // DumpC=false. ⚠️ PERF ONLY : coords 2×4 PAS encore consensus-validées (bound=0 → 0 hit).
     auto bM2=Int<128>{}; auto bN2=Int<256>{}; auto bK2=Int<128>{};
     auto cta2 = make_shape(bM2,bN2,bK2);
+    // K_PIPE = dernière dim du Shape (étages du ring TMA). =2 : smem ~96KB déjà au
+    // plafond du 5080 (~100KB/SM) → impossible d'ajouter un stage (tâtonnement : _3 =
+    // cudaErrorInvalidValue). Le vrai goulot = occupation 1 CTA/SM (smem trop gros).
     auto sAm = composition(Swizzle<3,4,3>{},
         Layout<Shape<Shape<_16,_8 >,Shape<_128,_1>,_2>, Stride<Stride<_128,Int<2048>>,Stride<_1,_0>,Int<16384>>>{});
     auto sBm = composition(Swizzle<3,4,3>{},

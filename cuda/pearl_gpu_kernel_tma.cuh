@@ -168,7 +168,7 @@ template <class ProblemShape, class CtaTiler,
           class TB, class BStride, class TmaB, class BSmemLayout, class S2RAtomB,
           class TC, class CStride, class CSmemLayout, class TiledMma, bool DumpC = true,
           bool BigEndian = false>
-__global__ static __launch_bounds__(decltype(size(TiledMma{}))::value)
+__global__ static __launch_bounds__(decltype(size(TiledMma{}))::value, 1)
 void gemm_device_tma_ms(ProblemShape shape_MNK, CtaTiler cta_tiler,
     TA const* A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, S2RAtomA s2r_atom_a,
     TB const* B, BStride dB, CUTE_GRID_CONSTANT TmaB const tma_b, BSmemLayout sB_layout, S2RAtomB s2r_atom_b,
