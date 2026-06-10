@@ -50,7 +50,7 @@ struct Args {
     /// Expose a JSON stats endpoint on 127.0.0.1:<port> (for HiveOS / monitoring).
     #[arg(long)]
     stats_port: Option<u16>,
-    /// Wire dialect: "pearl" (AriaPool/AlphaPool) or "luckypool". Default:
+    /// Wire dialect: "pearl" (AriaPool object-wire) or "luckypool". Default:
     /// auto-detected from the pool host ("luckypool" substring).
     #[arg(long)]
     dialect: Option<String>,
@@ -591,12 +591,12 @@ async fn main() -> anyhow::Result<()> {
     let hashrate_hs = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
 
-    // Mouchard (approche A) : télémétrie LIVE haute précision, gated par ARIA_MOUCHARD=1.
+    // Mouchard (approche A) : télémétrie LIVE haute précision, gated par ARIA_TELEMETRY=1.
     // Désactivé → zéro coût, le chemin 151 reste byte-identique.
     let mouchard = Arc::new(Mouchard::new());
     mouchard.start_hw_sampler();
     if mouchard.enabled() {
-        tracing::info!("🔎 mouchard ON — télémétrie per-phase + HW (ARIA_MOUCHARD=1)");
+        tracing::info!("🔎 telemetry ON — per-phase + HW (ARIA_TELEMETRY=1)");
     }
 
     // Optional JSON stats endpoint (HiveOS / monitoring).

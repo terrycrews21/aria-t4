@@ -191,7 +191,7 @@ async fn run_session(
                 &mut wr,
                 next_id,
                 "mining.authorize",
-                json!({"wallet": login, "worker": worker, "agent": "ariaminer/0.6.0"}),
+                json!({"wallet": login, "worker": worker, "agent": concat!("ariaminer/", env!("CARGO_PKG_VERSION"))}),
             )
             .await?;
             next_id += 1;

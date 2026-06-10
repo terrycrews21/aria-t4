@@ -1,6 +1,6 @@
 [package]
 name = "ariaminer"
-version = "0.5.0"
+version = "0.6.1"
 edition = "2024"
 license = "LicenseRef-Proprietary"
 description = "ARIAMiner GPU — Blackwell-native Pearl (PRL) miner. Canonical GEMM Int7×Int7 proof-of-work on the IMMA int8 tensor cores. 1% dev-fee (announced)."

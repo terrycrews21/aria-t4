@@ -54,12 +54,13 @@ pub struct Mouchard {
 }
 
 impl Mouchard {
-    /// Construit depuis l'environnement. `ARIA_MOUCHARD=1` active la collecte.
+    /// Construit depuis l'environnement. `ARIA_TELEMETRY=1` active la collecte.
+    /// (Nom public neutre — release Discord ; en interne le module reste « mouchard ».)
     pub fn new() -> Self {
-        let enabled = std::env::var("ARIA_MOUCHARD").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
-        let log_path = std::env::var("ARIA_MOUCHARD_LOG").unwrap_or_else(|_| {
+        let enabled = std::env::var("ARIA_TELEMETRY").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        let log_path = std::env::var("ARIA_TELEMETRY_LOG").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            format!("{home}/pearl-rnd-logs/mouchard.jsonl")
+            format!("{home}/pearl-rnd-logs/telemetry.jsonl")
         });
         Self::with(enabled, log_path)
     }
