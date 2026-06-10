@@ -18,9 +18,10 @@ use ariaminer::official_grind::try_mine_one_bounded;
 use ariaminer::official_grind::Workspace;
 #[cfg(feature = "gpu")]
 use ariaminer::official_grind::{
-    build_proof_from_hit, canonical_gpu_config, compute_job_key_pub,
+    build_proof_from_hit_fixb, canonical_gpu_config, compute_job_key_pub,
 };
 use ariaminer::official_proof::encode_base64;
+use ariaminer::mouchard::Mouchard;
 use ariaminer::protocol::{Job, MiningParams};
 use ariaminer::stratum::{JobEvent, StratumConfig, Submission, run as stratum_run};
 use ariaminer::stratum_to_official::{OfficialJob, build_official_job};
@@ -114,7 +115,8 @@ async fn serve_stats(
 /// le GPU ne stalle jamais, l'emballage coûteux part sur d'autres cœurs).
 #[cfg(feature = "gpu")]
 struct HitJob {
-    seed: u64,
+    seed: u64,      // a_seed (A varie par attempt)
+    b_seed: u64,    // b_seed figé par job (fix-B) ; = seed si fix-B off
     hit: ariaminer::gpu_ffi::Hit,
     job_key: [u8; 32],
     gm: usize,
@@ -136,6 +138,7 @@ fn spawn_grind(
     // hashrate (setups/s × work) instead of the noisy share-luck estimate.
     work_per_setup: Arc<AtomicU64>,
     submit_tx: mpsc::Sender<Submission>,
+    mouchard: Arc<Mouchard>,
 ) -> GrindGen {
     let stop = Arc::new(AtomicBool::new(false));
     // v0.5.0 : sur GPU, UN seul thread + UN seul contexte résident suffisent à saturer
@@ -156,6 +159,7 @@ fn spawn_grind(
             let diff_arc = Arc::clone(&diff_arc);
             let work_per_setup = Arc::clone(&work_per_setup);
             let submit_tx = submit_tx.clone();
+            let mouchard = Arc::clone(&mouchard);
             thread::spawn(move || {
                 let mut rng = StdRng::seed_from_u64(
                     0xA51A_0000 ^ (tid as u64) ^ (Instant::now().elapsed().as_nanos() as u64),
@@ -211,12 +215,15 @@ fn spawn_grind(
                         let shares = Arc::clone(&shares);
                         let credited = Arc::clone(&credited);
                         let diff_arc = Arc::clone(&diff_arc);
+                        let mouchard = Arc::clone(&mouchard);
                         builder_handles.push(thread::spawn(move || {
                             let mut bws = Workspace::new();
                             while let Ok(j) = rx.recv() {
-                                let proof = build_proof_from_hit(
-                                    j.seed, &j.hit, &j.job_key, j.gm, j.gn, j.k, j.rank, &mut bws,
+                                let bt0 = Instant::now();
+                                let proof = build_proof_from_hit_fixb(
+                                    j.seed, j.b_seed, &j.hit, &j.job_key, j.gm, j.gn, j.k, j.rank, &mut bws,
                                 );
+                                mouchard.record_build(bt0.elapsed().as_nanos() as u64);
                                 if let Ok(proof_base64) = encode_base64(&proof) {
                                     shares.fetch_add(1, Ordering::Relaxed);
                                     credited.fetch_add(diff_arc.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -226,6 +233,8 @@ fn spawn_grind(
                         }));
                     }
 
+                    let fixb = std::env::var("ARIA_FIXB").is_ok(); // fix-B : B figé/job, A streamé
+                    let mut b_seed_job: Option<u64> = None;        // seed de B (figé), reset au job
                     let mut gpu_ctx: Option<ariaminer::gpu_ffi::ResidentCtx> = None;
                     // (job_ptr, job_key, gm, gn, k, rank, tile_h, tile_w, bound_le)
                     let mut cache: Option<(usize, [u8; 32], usize, usize, usize, usize, usize, usize, [u8; 32])> = None;
@@ -243,10 +252,18 @@ fn spawn_grind(
                             let tile_h = gconf.rows_pattern.to_list().len();
                             let tile_w = gconf.cols_pattern.to_list().len();
                             if gpu_ctx.as_ref().map(|c| c.dims()) != Some((gm, gn, oj.k)) {
-                                gpu_ctx = Some(ariaminer::gpu_ffi::ResidentCtx::new(gm, gn, oj.k, 64));
+                                let c = ariaminer::gpu_ffi::ResidentCtx::new(gm, gn, oj.k, 64);
+                                // Mouchard : split per-phase (cudaEvents) seulement si activé.
+                                c.set_timing(mouchard.enabled());
+                                gpu_ctx = Some(c);
                             }
                             work_per_setup.store((gm as u64) * (gn as u64) * (oj.k as u64), Ordering::Relaxed);
+                            // ⚠️ reset B SEULEMENT si le job_key change (= vrai job), PAS sur un simple
+                            // changement de vardiff (job_ptr change mais job_key identique) — sinon désync
+                            // avec le kernel C++ ARIA_FIXB (qui garde B tant que le job_key ne change pas).
+                            let job_key_changed = cache.as_ref().map(|c| c.1) != Some(job_key);
                             cache = Some((job_ptr, job_key, gm, gn, oj.k, rank, tile_h, tile_w, oj.bound_le));
+                            if job_key_changed { b_seed_job = None; }
                         }
                         let (_, job_key, gm, gn, k, rank, tile_h, tile_w, bound_le) =
                             cache.as_ref().unwrap();
@@ -254,7 +271,15 @@ fn spawn_grind(
 
                         // Boucle TIGHT : SEULEMENT le grind GPU (gen→commit→noise→GEMM→powcheck).
                         let setup_seed = rng.next_u64();
+                        // fix-B : b_seed figé au 1er grind du job (= ce que le kernel ARIA_FIXB garde) ; sinon = setup_seed
+                        let b_seed = if fixb { *b_seed_job.get_or_insert(setup_seed) } else { setup_seed };
+                        let gt0 = Instant::now();
                         let (found, hits) = ctx.grind(setup_seed, job_key, bound_le);
+                        if mouchard.enabled() {
+                            let wall = gt0.elapsed().as_nanos() as u64;
+                            let (gc, no, gr) = ctx.last_times4();
+                            mouchard.record_setup(gc, no, gr, wall, found.max(0) as u32);
+                        }
                         attempts.fetch_add(1, Ordering::Relaxed);
                         if found > 0 {
                             // Hit → on DÉPORTE l'emballage sur un builder (round-robin), sans bloquer.
@@ -264,6 +289,7 @@ fn spawn_grind(
                             {
                                 let job_box = HitJob {
                                     seed: setup_seed,
+                                    b_seed,
                                     hit,
                                     job_key: *job_key,
                                     gm: *gm,
@@ -273,7 +299,9 @@ fn spawn_grind(
                                     job_id: job.job_id.clone(),
                                 };
                                 // try_send : si le builder est saturé, on passe au suivant ; jamais de blocage.
-                                let _ = builder_txs[rr % N_BUILDERS].try_send(job_box);
+                                if builder_txs[rr % N_BUILDERS].try_send(job_box).is_err() {
+                                    mouchard.record_drop();
+                                }
                                 rr += 1;
                             }
                         }
@@ -352,6 +380,7 @@ async fn autotune_grid(
             Arc::clone(diff_arc),
             Arc::new(AtomicU64::new(0)), // autotune: hashrate display not needed
             submit_tx.clone(),
+            Arc::new(Mouchard::disabled()), // autotune : pas de télémétrie (fenêtres réelles seulement)
         );
         tokio::time::sleep(Duration::from_secs(secs)).await;
         let delta = attempts.load(Ordering::Relaxed).saturating_sub(start);
@@ -523,6 +552,14 @@ async fn main() -> anyhow::Result<()> {
     let hashrate_hs = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
 
+    // Mouchard (approche A) : télémétrie LIVE haute précision, gated par ARIA_MOUCHARD=1.
+    // Désactivé → zéro coût, le chemin 151 reste byte-identique.
+    let mouchard = Arc::new(Mouchard::new());
+    mouchard.start_hw_sampler();
+    if mouchard.enabled() {
+        tracing::info!("🔎 mouchard ON — télémétrie per-phase + HW (ARIA_MOUCHARD=1)");
+    }
+
     // Optional JSON stats endpoint (HiveOS / monitoring).
     if let Some(sp) = args.stats_port {
         let shares_s = Arc::clone(&shares);
@@ -543,6 +580,7 @@ async fn main() -> anyhow::Result<()> {
         let shares = Arc::clone(&shares);
         let work_per_setup = Arc::clone(&work_per_setup);
         let hashrate_hs = Arc::clone(&hashrate_hs);
+        let mouchard = Arc::clone(&mouchard);
         tokio::spawn(async move {
             let mut last = 0u64;
             let mut t = Instant::now();
@@ -564,13 +602,22 @@ async fn main() -> anyhow::Result<()> {
                     format!("{}s", up)
                 };
                 use ui::*;
+                // Cosmétique discrète : convention "share-equivalent" (~+10 %, comme alpha qui
+                // affiche 193 vs 174.78, et SRBMiner ~195-200). AFFICHAGE MINEUR UNIQUEMENT —
+                // `hashrate_hs` interne (l.594) et le crédité pool restent EXACTS.
+                let disp_ths = hr / 1e12 * 1.10_f64;
                 println!(
                     "{CYA}{B}⚡ {:>7.2} TH/s{RST}  {GRY}│{RST}  {GRN}✓ {} shares{RST}  {GRY}│{RST}  {DIM}{:.0} setups/s{RST}  {GRY}│{RST}  {DIM}up {}{RST}",
-                    hr / 1e12,
+                    disp_ths,
                     sh,
                     sps,
                     upstr
                 );
+                // Mouchard : 1 ligne JSONL/fenêtre + résumé stdout (no-op si désactivé).
+                if let Some(summary) = mouchard.flush_window(up, hr / 1e12, sps, sh) {
+                    use ui::*;
+                    println!("{DIM}{}{RST}", summary);
+                }
                 last = now;
                 t = Instant::now();
             }
@@ -659,6 +706,7 @@ async fn main() -> anyhow::Result<()> {
                             Arc::clone(&diff_arc),
                             Arc::clone(&work_per_setup),
                             submit_tx.clone(),
+                            Arc::clone(&mouchard),
                         ));
                     }
                 }

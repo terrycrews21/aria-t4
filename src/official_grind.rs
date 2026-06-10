@@ -722,6 +722,39 @@ pub fn build_proof_from_hit(
     make_proof(&ws.a_sig[..mk], &ws.b_sig[..nk], m, n, k, rank, job_key, &hit.rows, &hit.cols)
 }
 
+/// Variante FIX-B (10/06) : A régénéré depuis `a_seed`, B depuis `b_seed` (figé par job).
+/// Mode "pay the fill (B), stream the traffic (A)" — B est calculé 1× sur GPU avec `b_seed`,
+/// A varie à chaque attempt avec `a_seed`. La preuve doit reproduire EXACTEMENT ce que le
+/// kernel a grindé : a_sig=int7(a_seed,0), b_sig=int7(b_seed,1). Consensus-valide (verifier
+/// stateless, A/B = choix libre du mineur — vérifié zk-pow/api/verify.rs).
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_proof_from_hit_fixb(
+    a_seed: u64,
+    b_seed: u64,
+    hit: &crate::gpu_ffi::Hit,
+    job_key: &[u8; 32],
+    m: usize,
+    n: usize,
+    k: usize,
+    rank: usize,
+    ws: &mut Workspace,
+) -> PlainProof {
+    ws.ensure(m, n, k);
+    let (mk, nk) = (m * k, n * k);
+    for i in 0..m {
+        for j in 0..k {
+            ws.a_sig[i * k + j] = crate::gpu_ffi::int7_at(a_seed, 0, i as u32, j as u32);
+        }
+    }
+    for i in 0..n {
+        for j in 0..k {
+            ws.b_sig[i * k + j] = crate::gpu_ffi::int7_at(b_seed, 1, i as u32, j as u32);
+        }
+    }
+    make_proof(&ws.a_sig[..mk], &ws.b_sig[..nk], m, n, k, rank, job_key, &hit.rows, &hit.cols)
+}
+
 /// Assemble une `MatrixMerkleProof` à partir des couches construites SUR GPU (`ProofRaw`).
 /// Walk de frères = copie BIT-pour-BIT de `MerkleTree::get_multileaf_proof` (ordre BTreeSet
 /// ascendant, dédup, borne `< level_len`). Aucun hachage CPU : on ne lit que des nœuds déjà

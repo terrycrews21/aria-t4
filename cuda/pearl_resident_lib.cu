@@ -11,6 +11,7 @@
 #include "tensor_hash/tensor_hash_host.hpp"
 #include "pearl_gpu_kernel.cuh"        // gemm_device (grind 8×16, v1.0)
 #include "pearl_gpu_kernel_2x64.cuh"   // gemm_device_2x64 (grind 2×64, v1.1 AlphaPool)
+#include "pearl_gpu_kernel_tma.cuh"    // gemm_device_tma_ms (grind multistage TMA 128×256, v0.6.0-ws)
 using namespace cute;
 
 // --- helpers noise (miroir de pearl_noise_lib.cu, inline) ---
@@ -227,10 +228,16 @@ struct Ctx {
 static int resident_run(Ctx* c, uint64_t setup_seed,
                         const uint8_t job_key[32], int* hit_rows, int* hit_cols) {
   int m=c->m, n=c->n, k=c->k, max_hits=c->max_hits;
+  // VALIDATION étape A (10/06) : mode fix-B (ARIA_FIXB) — b_noise_seed ne dépend QUE de B
+  // (official_grind compute_commitment_hash) → on fixe B (gen+commit+noise B faits 1×),
+  // on ne fait varier qu'A. Mesure le gain prologue. s_bfilled réinit si job_key change.
+  static bool s_bfilled = false;
+  bool fixb = (getenv("ARIA_FIXB") != nullptr);
   // set_key 1× (job_key change rarement → pas de cudaMemcpyToSymbol sync par setup)
   if (!c->jk_set || memcmp(c->last_jk, job_key, 32) != 0) {
     cudaDeviceSynchronize(); set_key(job_key);
     for (int i=0;i<32;i++) c->last_jk[i]=job_key[i]; c->jk_set=true;
+    s_bfilled = false;
   }
   cudaMemsetAsync(c->d_found,0,4,c->sA);
   if (c->do_timing) cudaEventRecord(c->tStart, c->sA);
@@ -238,8 +245,10 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,c->sA>>>(c->d_A, setup_seed, 0, m, k);
   commit_nokey<256,2,256>((const uint8_t*)c->d_A,(uint32_t)((size_t)m*k),(uint8_t*)c->d_ha,c->nbA,c->d_ra,c->sA);
   cudaEventRecord(c->eA, c->sA);
-  gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256,0,c->sB>>>(c->d_B, setup_seed, 1, n, k);
-  commit_nokey<256,2,256>((const uint8_t*)c->d_B,(uint32_t)((size_t)n*k),(uint8_t*)c->d_hb,c->nbB,c->d_rb,c->sB);
+  if (!(fixb && s_bfilled)) {   // fix-B : gen+commit B faits 1× seulement
+    gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256,0,c->sB>>>(c->d_B, setup_seed, 1, n, k);
+    commit_nokey<256,2,256>((const uint8_t*)c->d_B,(uint32_t)((size_t)n*k),(uint8_t*)c->d_hb,c->nbB,c->d_rb,c->sB);
+  }
   cudaEventRecord(c->eB, c->sB);
   // Phase 2 : stir sur sA (attend hash_b côté sB)
   cudaStreamWaitEvent(c->sA, c->eB, 0);
@@ -250,9 +259,12 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   perm_k_<<<(k+255)/256,256,0,c->sA>>>(c->d_sla, c->d_as, k, c->d_faA, c->d_saA);
   noise_add_k_<<<m,256,0,c->sA>>>(c->d_sla, c->d_as, m, k, c->d_faA, c->d_saA, c->d_A);
   cudaStreamWaitEvent(c->sB, c->eStir, 0);
-  perm_k_<<<(k+255)/256,256,0,c->sB>>>(c->d_slb, c->d_bs, k, c->d_faB, c->d_saB);
-  noise_add_k_<<<n,256,0,c->sB>>>(c->d_slb, c->d_bs, n, k, c->d_faB, c->d_saB, c->d_B);
+  if (!(fixb && s_bfilled)) {   // fix-B : noise B fait 1× → d_B garde b_eff résident
+    perm_k_<<<(k+255)/256,256,0,c->sB>>>(c->d_slb, c->d_bs, k, c->d_faB, c->d_saB);
+    noise_add_k_<<<n,256,0,c->sB>>>(c->d_slb, c->d_bs, n, k, c->d_faB, c->d_saB, c->d_B);
+  }
   cudaEventRecord(c->eB, c->sB);
+  if (fixb) s_bfilled = true;
   // Phase 4 : GEMM sur sA (attend noise B via eB) ; pow_key=a_seed, bound=d_bnd
   cudaStreamWaitEvent(c->sA, c->eB, 0);
   if (c->do_timing) cudaEventRecord(c->tPro, c->sA); // fin prologue = juste avant le GEMM
@@ -274,7 +286,36 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   Copy_Atom<SM75_U32x4_LDSM_N, int8_t> s2rA, s2rB;
   int reduce_every_k = 128/32;
   dim3 grd(size(ceil_div(m,bM)), size(ceil_div(n,bN))), blk(size(mma));
-  if (c->tile2x64) {
+  if (getenv("ARIA_TMA_MS")) {
+    // étape 1 (v0.6.0-ws) : grind MULTISTAGE TMA 128×256 (8 warps, A cp.async + B TMA ring).
+    // DumpC=false. ⚠️ PERF ONLY : coords 2×4 PAS encore consensus-validées (bound=0 → 0 hit).
+    auto bM2=Int<128>{}; auto bN2=Int<256>{}; auto bK2=Int<128>{};
+    auto cta2 = make_shape(bM2,bN2,bK2);
+    auto sAm = composition(Swizzle<3,4,3>{},
+        Layout<Shape<Shape<_16,_8 >,Shape<_128,_1>,_2>, Stride<Stride<_128,Int<2048>>,Stride<_1,_0>,Int<16384>>>{});
+    auto sBm = composition(Swizzle<3,4,3>{},
+        Layout<Shape<Shape<_16,_16>,Shape<_128,_1>,_2>, Stride<Stride<_128,Int<2048>>,Stride<_1,_0>,Int<32768>>>{});
+    auto sB1 = composition(Swizzle<3,4,3>{},
+        Layout<Shape<Shape<_16,_16>,Shape<_128,_1>>, Stride<Stride<_128,Int<2048>>,Stride<_1,_0>>>{});
+    auto sCm = make_layout(make_shape(bM2,bN2));
+    using AtomG2 = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, int8_t>;
+    using TVcopy2 = Layout<Shape<Shape<_8,_32>,_16>, Stride<Stride<_512,_1>,_32>>;
+    using TilerC2 = Shape<_32,_128>;
+    TiledCopy<AtomG2,TVcopy2,TilerC2> copyA2;
+    TiledMMA mma2 = make_tiled_mma(SM80_16x8x32_S32S8S8S32_TN{}, Layout<Shape<_2,_4,_1>,Stride<_1,_2,_0>>{}, Tile<_32,_32,_32>{});
+    Copy_Atom<SM75_U32x4_LDSM_N,int8_t> s2rA2; Copy_Atom<SM75_U32x2_LDSM_N,int8_t> s2rB2;
+    Tensor gB_t = make_tensor(make_gmem_ptr<int8_t>(c->d_B), make_layout(make_shape(n,k), make_stride(k,Int<1>{})));
+    auto tma_b = make_tma_copy<int8_t>(SM90_TMA_LOAD{}, gB_t, sB1, make_shape(bN2,bK2), Int<1>{});
+    int smem = int(sizeof(SharedStorageTMA_MS<int8_t,int8_t,decltype(sAm),decltype(sBm)>));
+    auto kfn = gemm_device_tma_ms<decltype(prob),decltype(cta2),
+        int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
+        int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),
+        int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false>;
+    cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    dim3 grd2(size(ceil_div(m,bM2)), size(ceil_div(n,bN2))), blk2(size(mma2));
+    kfn<<<grd2,blk2,smem,c->sA>>>(prob,cta2, c->d_A,dA,sAm,copyA2,s2rA2, c->d_B,dB,tma_b,sBm,s2rB2,
+        c->d_C,dC,sCm,mma2, reduce_every_k, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+  } else if (c->tile2x64) {
     // v1.1 AlphaPool : grind 2×64 (fold tuile 2 lignes {r,r+32} × 64 cols).
     int smem = int(sizeof(SharedStorage2x64<int8_t,int8_t,decltype(sA),decltype(sB)>));
     auto kfn = gemm_device_2x64<decltype(prob),decltype(cta),
@@ -461,7 +502,27 @@ static void launch_chain2(Ctx2* c, int slot, uint64_t seed, const uint8_t job_ke
   int rek=128/32, smem=int(sizeof(SharedStorage<int8_t,int8_t,decltype(sA),decltype(sB)>));
   int nbx=size(ceil_div(m,bM)), nby=size(ceil_div(n,bN));
   dim3 blk(size(mma));
-  if (c->grind_blocks > 0) {
+  if (getenv("ARIA_TMA_MS")) {
+    // étape 1 dans le pipeline overlap : grind multistage TMA 128×256 (basse occupation).
+    // teste si le prologue du slot concurrent se recouvre enfin (l'angle neuf de l'idée 1).
+    auto bM2=Int<128>{}; auto bN2=Int<256>{}; auto bK2=Int<128>{};
+    auto cta2=make_shape(bM2,bN2,bK2);
+    auto sAm=composition(Swizzle<3,4,3>{},Layout<Shape<Shape<_16,_8 >,Shape<_128,_1>,_2>,Stride<Stride<_128,Int<2048>>,Stride<_1,_0>,Int<16384>>>{});
+    auto sBm=composition(Swizzle<3,4,3>{},Layout<Shape<Shape<_16,_16>,Shape<_128,_1>,_2>,Stride<Stride<_128,Int<2048>>,Stride<_1,_0>,Int<32768>>>{});
+    auto sB1=composition(Swizzle<3,4,3>{},Layout<Shape<Shape<_16,_16>,Shape<_128,_1>>,Stride<Stride<_128,Int<2048>>,Stride<_1,_0>>>{});
+    auto sCm=make_layout(make_shape(bM2,bN2));
+    using AtomG2=Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>,int8_t>;
+    TiledCopy<AtomG2,Layout<Shape<Shape<_8,_32>,_16>,Stride<Stride<_512,_1>,_32>>,Shape<_32,_128>> copyA2;
+    TiledMMA mma2=make_tiled_mma(SM80_16x8x32_S32S8S8S32_TN{},Layout<Shape<_2,_4,_1>,Stride<_1,_2,_0>>{},Tile<_32,_32,_32>{});
+    Copy_Atom<SM75_U32x4_LDSM_N,int8_t> s2rA2; Copy_Atom<SM75_U32x2_LDSM_N,int8_t> s2rB2;
+    Tensor gB_t=make_tensor(make_gmem_ptr<int8_t>(c->d_B[slot]),make_layout(make_shape(n,k),make_stride(k,Int<1>{})));
+    auto tma_b=make_tma_copy<int8_t>(SM90_TMA_LOAD{},gB_t,sB1,make_shape(bN2,bK2),Int<1>{});
+    int smem2=int(sizeof(SharedStorageTMA_MS<int8_t,int8_t,decltype(sAm),decltype(sBm)>));
+    auto kfn=gemm_device_tma_ms<decltype(prob),decltype(cta2),int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),int32_t,decltype(dC),decltype(sCm),decltype(mma2),false>;
+    cudaFuncSetAttribute(kfn,cudaFuncAttributeMaxDynamicSharedMemorySize,smem2);
+    dim3 grd2(size(ceil_div(m,bM2)),size(ceil_div(n,bN2))),blk2(size(mma2));
+    kfn<<<grd2,blk2,smem2,s>>>(prob,cta2,c->d_A[slot],dA,sAm,copyA2,s2rA2,c->d_B[slot],dB,tma_b,sBm,s2rB2,c->d_C,dC,sCm,mma2,rek,c->d_as[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64);
+  } else if (c->grind_blocks > 0) {
     // v0.5.0 : grind PERSISTANT à occupation bridée (G blocs grid-stride) → laisse
     // des SM libres pour que le prologue du slot suivant tourne en concurrence.
     auto kfn=gemm_device_persist<decltype(prob),decltype(cta),int8_t,decltype(dA),decltype(sA),decltype(copyA),decltype(s2rA),int8_t,decltype(dB),decltype(sB),decltype(copyB),decltype(s2rB),int32_t,decltype(dC),decltype(sC),decltype(mma)>;

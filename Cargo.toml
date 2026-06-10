@@ -69,6 +69,11 @@ path = "src/bin/proof_check.rs"
 required-features = ["gpu"]
 
 [[bin]]
+name = "proof_check_fixb"
+path = "src/bin/proof_check_fixb.rs"
+required-features = ["gpu"]
+
+[[bin]]
 name = "proof_check_131k"
 path = "src/bin/proof_check_131k.rs"
 required-features = ["gpu"]

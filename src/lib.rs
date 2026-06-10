@@ -12,6 +12,7 @@ pub mod gemm;
 pub mod gpu_ffi;
 pub mod merkle;
 pub mod microkernel;
+pub mod mouchard;
 pub mod official_grind;
 pub mod official_proof;
 pub mod pearl_compute;
