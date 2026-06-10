@@ -890,6 +890,45 @@ pub fn build_proofs_from_setup_gpu(
     out
 }
 
+/// Variante GÉNÉRALE de [`build_proofs_from_setup_gpu`] : tuile `tile_h×tile_w`
+/// quelconque + **fix-B** (seeds A et B distincts). Bâtit les 2 arbres Merkle
+/// SUR GPU une seule fois (~33 Mo CPU de couches, PAS les matrices 512 Mo), puis
+/// gather + assemble chaque hit. Remplace `build_proof_from_hit_fixb` (CPU, qui
+/// régénère les matrices entières → OOM à 131072²). Pour fix-B off : a_seed=b_seed.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_proofs_from_setup_gpu_fixb(
+    ctx_a: &crate::gpu_ffi::ProofGpuCtx,
+    ctx_b: &crate::gpu_ffi::ProofGpuCtx,
+    a_seed: u64,
+    b_seed: u64,
+    hits: &[crate::gpu_ffi::Hit],
+    job_key: &[u8; 32],
+    m: usize,
+    n: usize,
+    k: usize,
+    rank: usize,
+    tile_h: usize,
+    tile_w: usize,
+) -> Vec<PlainProof> {
+    let (a_layers, a_lens, a_root) = ctx_a.build_tree(a_seed, 0, m, k, job_key);
+    let (b_layers, b_lens, b_root) = ctx_b.build_tree(b_seed, 1, n, k, job_key);
+    let mut out = Vec::with_capacity(hits.len());
+    for hit in hits {
+        if hit.rows.len() != tile_h || hit.cols.len() != tile_w {
+            continue;
+        }
+        let a_leaves = MerkleTree::compute_leaf_indices_from_rows(&hit.rows, (m, k));
+        let b_leaves = MerkleTree::compute_leaf_indices_from_rows(&hit.cols, (n, k));
+        let a_leaf_data = ctx_a.gather(&a_leaves);
+        let b_leaf_data = ctx_b.gather(&b_leaves);
+        let a = assemble_matrix_proof(&a_layers, &a_lens, a_root, &a_leaf_data, &a_leaves, &hit.rows);
+        let bt = assemble_matrix_proof(&b_layers, &b_lens, b_root, &b_leaf_data, &b_leaves, &hit.cols);
+        out.push(PlainProof { m, n, k, noise_rank: rank, a, bt });
+    }
+    out
+}
+
 /// Boucle le grind RÉSIDENT jusqu'à un hit ; renvoie la preuve canonique.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]

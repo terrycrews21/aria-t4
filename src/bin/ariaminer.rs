@@ -18,7 +18,7 @@ use ariaminer::official_grind::try_mine_one_bounded;
 use ariaminer::official_grind::Workspace;
 #[cfg(feature = "gpu")]
 use ariaminer::official_grind::{
-    build_proof_from_hit_fixb, canonical_gpu_config, compute_job_key_pub,
+    build_proofs_from_setup_gpu_fixb, canonical_gpu_config, compute_job_key_pub,
 };
 use ariaminer::official_proof::encode_base64;
 use ariaminer::mouchard::Mouchard;
@@ -151,6 +151,8 @@ struct HitJob {
     gn: usize,
     k: usize,
     rank: usize,
+    tile_h: usize,
+    tile_w: usize,
     job_id: String,
 }
 
@@ -228,45 +230,22 @@ fn spawn_grind(
                 // on ne les recalcule QUE quand le job change (sinon ils affament le GPU).
                 #[cfg(feature = "gpu")]
                 {
-                    let _ = &mut ws; // le grind n'emballe plus de preuve : les builders ont leur propre ws.
+                    let _ = &mut ws; // le grind n'emballe plus de preuve sur CPU.
 
-                    // POOL DE BUILDERS (pattern ethminer) : le grind ne fait QUE grinder ; chaque hit
-                    // part sur un thread builder qui régénère le signal + Merkle + soumet, SANS
-                    // bloquer le GPU. Canal borné + try_send → si saturé on lâche (jamais de stall grind).
-                    const N_BUILDERS: usize = 6;
-                    let mut builder_txs: Vec<std::sync::mpsc::SyncSender<HitJob>> = Vec::new();
-                    let mut builder_handles: Vec<thread::JoinHandle<()>> = Vec::new();
-                    for _ in 0..N_BUILDERS {
-                        let (tx, rx) = std::sync::mpsc::sync_channel::<HitJob>(64);
-                        builder_txs.push(tx);
-                        let submit_tx = submit_tx.clone();
-                        let shares = Arc::clone(&shares);
-                        let credited = Arc::clone(&credited);
-                        let diff_arc = Arc::clone(&diff_arc);
-                        let mouchard = Arc::clone(&mouchard);
-                        builder_handles.push(thread::spawn(move || {
-                            let mut bws = Workspace::new();
-                            while let Ok(j) = rx.recv() {
-                                let bt0 = Instant::now();
-                                let proof = build_proof_from_hit_fixb(
-                                    j.seed, j.b_seed, &j.hit, &j.job_key, j.gm, j.gn, j.k, j.rank, &mut bws,
-                                );
-                                mouchard.record_build(bt0.elapsed().as_nanos() as u64);
-                                if let Ok(proof_base64) = encode_base64(&proof) {
-                                    shares.fetch_add(1, Ordering::Relaxed);
-                                    credited.fetch_add(diff_arc.load(Ordering::Relaxed), Ordering::Relaxed);
-                                    let _ = submit_tx.try_send(Submission { job_id: j.job_id, proof_base64 });
-                                }
-                            }
-                        }));
-                    }
+                    // EMBALLAGE GPU SÉRIALISÉ (dans CE thread, entre 2 grinds) : le builder
+                    // GPU (arbres Merkle sur GPU, ~33 Mo CPU/setup) DOIT être sérialisé avec le
+                    // grind multistage TMA — un emballage GPU CONCURRENT (autre thread) corrompt
+                    // le kernel TMA (« unspecified launch failure »). On bâtit donc la preuve
+                    // INLINE quand un hit tombe (build GPU = rapide, seulement sur hit) → RAM
+                    // bornée (160 Mo, plus d'OOM 23 Go) ET pas de conflit GPU.
+                    use ariaminer::gpu_ffi::ProofGpuCtx;
+                    let mut pctx: Option<(usize, usize, usize, ProofGpuCtx, ProofGpuCtx)> = None;
 
                     let fixb = std::env::var("ARIA_FIXB").is_ok(); // fix-B : B figé/job, A streamé
                     let mut b_seed_job: Option<u64> = None;        // seed de B (figé), reset au job
                     let mut gpu_ctx: Option<ariaminer::gpu_ffi::ResidentCtx> = None;
                     // (job_ptr, job_key, gm, gn, k, rank, tile_h, tile_w, bound_le)
                     let mut cache: Option<(usize, [u8; 32], usize, usize, usize, usize, usize, usize, [u8; 32])> = None;
-                    let mut rr = 0usize; // round-robin builder
                     while !stop.load(Ordering::Relaxed) {
                         let job = job_slot.lock().clone();
                         let job_ptr = Arc::as_ptr(&job) as usize;
@@ -310,34 +289,37 @@ fn spawn_grind(
                         }
                         attempts.fetch_add(1, Ordering::Relaxed);
                         if found > 0 {
-                            // Hit → on DÉPORTE l'emballage sur un builder (round-robin), sans bloquer.
+                            // Hit → emballage GPU INLINE (sérialisé avec le grind : pas de
+                            // conflit TMA). ctx.grind() a déjà sync (memcpy résultats) → le
+                            // kernel grind est fini avant qu'on lance les kernels de preuve.
                             if let Some(hit) = hits
                                 .into_iter()
                                 .find(|h| h.rows.len() == *tile_h && h.cols.len() == *tile_w)
                             {
-                                let job_box = HitJob {
-                                    seed: setup_seed,
-                                    b_seed,
-                                    hit,
-                                    job_key: *job_key,
-                                    gm: *gm,
-                                    gn: *gn,
-                                    k: *k,
-                                    rank: *rank,
-                                    job_id: job.job_id.clone(),
-                                };
-                                // try_send : si le builder est saturé, on passe au suivant ; jamais de blocage.
-                                if builder_txs[rr % N_BUILDERS].try_send(job_box).is_err() {
-                                    mouchard.record_drop();
+                                let (gm, gn, k) = (*gm, *gn, *k);
+                                if pctx.as_ref().map(|c| (c.0, c.1, c.2)) != Some((gm, gn, k)) {
+                                    let a = ProofGpuCtx::new(gm, k, 256);
+                                    let b = ProofGpuCtx::new(gn, k, 256);
+                                    pctx = Some((gm, gn, k, a, b));
                                 }
-                                rr += 1;
+                                let (_, _, _, ca, cb) = pctx.as_ref().unwrap();
+                                let bt0 = Instant::now();
+                                let proofs = build_proofs_from_setup_gpu_fixb(
+                                    ca, cb, setup_seed, b_seed, std::slice::from_ref(&hit),
+                                    job_key, gm, gn, k, *rank, *tile_h, *tile_w,
+                                );
+                                mouchard.record_build(bt0.elapsed().as_nanos() as u64);
+                                for proof in &proofs {
+                                    if let Ok(proof_base64) = encode_base64(proof) {
+                                        shares.fetch_add(1, Ordering::Relaxed);
+                                        credited.fetch_add(diff_arc.load(Ordering::Relaxed), Ordering::Relaxed);
+                                        let _ = submit_tx.try_send(Submission {
+                                            job_id: job.job_id.clone(), proof_base64,
+                                        });
+                                    }
+                                }
                             }
                         }
-                    }
-                    // Arrêt propre : on lâche les senders → les builders sortent de recv() → join.
-                    drop(builder_txs);
-                    for h in builder_handles {
-                        let _ = h.join();
                     }
                 }
             })
