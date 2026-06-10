@@ -436,6 +436,17 @@ pub fn mine_share<R: Rng>(
 // indices soumis → job_key identique → `verify_plain_proof` valide. Cf §VERROU mémoire.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// noise_rank effectif : env `ARIA_RANK` (défaut mainnet 128). DOIT matcher le
+/// kernel GPU (pearl_resident_lib lit le même env) — sinon job_key/noise désync.
+/// ≤256 car les index de permutation GPU sont stockés en uint8.
+pub fn rank_from_env() -> u16 {
+    std::env::var("ARIA_RANK")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|v| (32..=256).contains(v) && v.is_power_of_two())
+        .unwrap_or(128)
+}
+
 /// The `MiningConfiguration` whose tile shape reproduces the GPU MMA fragment
 /// (8×16, canonical normalized pattern). MUST be used to mine on the GPU so the
 /// node-side `parse_plain_proof` reconstructs an identical config (→ same job_key).
@@ -444,7 +455,7 @@ pub fn canonical_gpu_config(common_dim: u32) -> MiningConfiguration {
     use zk_pow::api::proof::MMAType;
     MiningConfiguration {
         common_dim,
-        rank: 128,
+        rank: rank_from_env(),
         mma_type: MMAType::Int7xInt7ToInt32,
         rows_pattern: PeriodicPattern::from_list(&[0, 8, 32, 40, 64, 72, 96, 104]).unwrap(),
         cols_pattern: PeriodicPattern::from_list(&[

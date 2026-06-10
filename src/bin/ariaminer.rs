@@ -23,8 +23,8 @@ use ariaminer::official_grind::{
 use ariaminer::official_proof::encode_base64;
 use ariaminer::mouchard::Mouchard;
 use ariaminer::protocol::{Job, MiningParams};
-use ariaminer::stratum::{JobEvent, StratumConfig, Submission, run as stratum_run};
-use ariaminer::stratum_to_official::{OfficialJob, build_official_job};
+use ariaminer::stratum::{Dialect, JobEvent, StratumConfig, Submission, run as stratum_run};
+use ariaminer::stratum_to_official::{OfficialJob, build_official_job, scaled_bound_le_from_target_be};
 use clap::Parser;
 use parking_lot::Mutex;
 use rand::SeedableRng;
@@ -50,6 +50,34 @@ struct Args {
     /// Expose a JSON stats endpoint on 127.0.0.1:<port> (for HiveOS / monitoring).
     #[arg(long)]
     stats_port: Option<u16>,
+    /// Wire dialect: "pearl" (AriaPool/AlphaPool) or "luckypool". Default:
+    /// auto-detected from the pool host ("luckypool" substring).
+    #[arg(long)]
+    dialect: Option<String>,
+}
+
+/// LuckyPool sends no `pearl.set_mining_params` — the Pearl mainnet defaults
+/// apply (m=n=131072, k=4096, rank=256). m/n are advisory (the miner picks its
+/// own batch via ARIA_BATCH_M/N — they are not part of the job_key); the
+/// patterns are the canonical GPU MMA fragment (same lists as
+/// `canonical_gpu_config`, which the GPU path re-derives anyway).
+fn luckypool_default_params() -> MiningParams {
+    MiningParams {
+        m: 131_072,
+        n: 131_072,
+        k: 4096,
+        rank: 256,
+        rows_pattern: vec![0, 8, 32, 40, 64, 72, 96, 104],
+        cols_pattern: vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
+        mma_type: "Int7xInt7ToInt32".into(),
+    }
+}
+
+/// LuckyPool job ids look like `45173737_500000` — the suffix is the share
+/// difficulty. Used for the display/credited counters (the grind bound itself
+/// comes from the job's full 256-bit `target`).
+fn diff_from_job_id(job_id: &str) -> Option<u64> {
+    job_id.rsplit_once('_').and_then(|(_, d)| d.parse().ok())
 }
 
 /// A job ready to grind: the stratum job id (echoed in the submit) plus the
@@ -531,12 +559,24 @@ async fn main() -> anyhow::Result<()> {
     let (job_tx, mut job_rx) = broadcast::channel::<JobEvent>(64);
     let (submit_tx, submit_rx) = mpsc::channel::<Submission>(256);
 
+    let dialect = match args.dialect.as_deref() {
+        Some("luckypool") => Dialect::LuckyPool,
+        Some("pearl") => Dialect::Pearl,
+        Some(other) => anyhow::bail!("--dialect must be \"pearl\" or \"luckypool\", got {other}"),
+        None if host.contains("luckypool") => Dialect::LuckyPool,
+        None => Dialect::Pearl,
+    };
+    if dialect == Dialect::LuckyPool {
+        tracing::info!("dialecte LuckyPool (object wire, target par job)");
+    }
+
     let scfg = StratumConfig {
         host: host.to_string(),
         port,
         wallet: args.wallet.clone(),
         worker: args.worker.clone(),
         password: args.password.clone(),
+        dialect,
     };
     tokio::spawn(async move {
         if let Err(e) = stratum_run(scfg, job_tx, submit_rx).await {
@@ -624,7 +664,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let mut cur_params: Option<MiningParams> = None;
+    // LuckyPool never sends set_mining_params → start with the mainnet defaults
+    // so the first notify mines immediately.
+    let mut cur_params: Option<MiningParams> = match dialect {
+        Dialect::LuckyPool => Some(luckypool_default_params()),
+        Dialect::Pearl => None,
+    };
     let mut cur_difficulty: u64 = 524_288;
     let mut grind_gen: Option<GrindGen> = None;
     let mut job_slot: Option<Arc<Mutex<Arc<GrindJob>>>> = None;
@@ -663,8 +708,30 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!("job before params — waiting for set_mining_params");
                     continue;
                 };
+                // LuckyPool: no set_difficulty — the diff rides in the job_id
+                // suffix (display/credited counters) and the authoritative bound
+                // is the job's full 256-bit target (applied below).
+                if dialect == Dialect::LuckyPool {
+                    if let Some(d) = diff_from_job_id(&job.job_id) {
+                        if d != cur_difficulty {
+                            tracing::info!(difficulty = d, "difficulty (from job_id)");
+                        }
+                        cur_difficulty = d;
+                        diff_arc.store(d, Ordering::Relaxed);
+                    }
+                }
                 let gj = match build_grind_job(&params, &job, cur_difficulty) {
-                    Ok(g) => Arc::new(g),
+                    Ok(mut g) => {
+                        if dialect == Dialect::LuckyPool {
+                            if let Some(t) = job.full_target {
+                                // Official rule: jackpot ≤ target × h·w·k (the
+                                // canonical GPU tile is 8×16 → h·w = 128).
+                                let factor = 128u64 * params.k as u64;
+                                g.official.bound_le = scaled_bound_le_from_target_be(&t, factor);
+                            }
+                        }
+                        Arc::new(g)
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "build official job failed");
                         continue;

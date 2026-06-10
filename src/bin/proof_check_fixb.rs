@@ -10,7 +10,10 @@ use zk_pow::api::proof::IncompleteBlockHeader;
 
 fn main() {
     unsafe { std::env::set_var("ARIA_FIXB", "1"); } // active fix-B dans resident_run (kernel C++)
-    let (m, n, k) = (8192usize, 8192usize, 4096usize);
+    // Forme paramétrable (ARIA_BATCH_M/N) pour valider aussi la forme officielle 131072².
+    let dim = |v: &str, d: usize| std::env::var(v).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let (m, n, k) = (dim("ARIA_BATCH_M", 8192), dim("ARIA_BATCH_N", 8192), 4096usize);
+    println!("  forme {m}×{n}×{k}");
     let header = IncompleteBlockHeader {
         version: 0,
         prev_block: [1u8; 32],

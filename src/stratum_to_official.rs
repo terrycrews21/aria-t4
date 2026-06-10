@@ -68,6 +68,27 @@ pub fn share_bound_le(difficulty: u64) -> [u8; 32] {
     t
 }
 
+/// LuckyPool-style bound: the wire carries a full 256-bit big-endian target and
+/// the official rule (`zk-pow sanity_checks::extract_difficulty_bound`) is
+/// `jackpot ≤ target × h·w·k` — the threshold scales with the work of one
+/// opened tile. Returns the little-endian byte bound `official_grind` compares
+/// against, saturating at 2^256−1.
+pub fn scaled_bound_le_from_target_be(target_be: &[u8; 32], factor: u64) -> [u8; 32] {
+    let mut le = *target_be;
+    le.reverse();
+    let mut out = [0u8; 32];
+    let mut carry: u128 = 0;
+    for i in 0..32 {
+        let v = le[i] as u128 * factor as u128 + carry;
+        out[i] = (v & 0xff) as u8;
+        carry = v >> 8;
+    }
+    if carry != 0 {
+        return [0xff; 32];
+    }
+    out
+}
+
 /// Everything `official_grind::mine_share` needs for one job, derived from the
 /// live stratum state.
 #[derive(Clone)]

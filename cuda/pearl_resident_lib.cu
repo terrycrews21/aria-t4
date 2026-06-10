@@ -32,23 +32,27 @@ __device__ __forceinline__ uint32_t mulhi_(uint32_t a, uint32_t b) {
 __device__ __forceinline__ uint8_t bo_(const uint32_t* h, int k) {
   return (uint8_t)((h[k >> 2] >> (8 * (k & 3))) & 0xff);
 }
-// perm (1 thr = 1 col)
+// perm (1 thr = 1 col). `rank` = noise_rank (puissance de 2, ≤256 : les index
+// first/second sont stockés en uint8). Formules = zk-pow pearl_noise.rs
+// generate_permutation_matrix, paramétriques en rank.
 __global__ void perm_k_(const uint32_t* seed, const uint32_t* key, int k,
-                        uint8_t* first, uint8_t* second) {
+                        uint8_t* first, uint8_t* second, int rank) {
   int j = blockIdx.x * blockDim.x + threadIdx.x; if (j >= k) return;
   uint32_t h[8]; rh_((uint32_t)(j / 8), seed, key, 1, h);
-  uint32_t ru = h[j & 7]; uint32_t f = ru & 127u;
-  first[j] = (uint8_t)f; second[j] = (uint8_t)(f ^ (1u + mulhi_(127u, ru)));
+  uint32_t ru = h[j & 7]; uint32_t f = ru & (uint32_t)(rank - 1);
+  first[j] = (uint8_t)f; second[j] = (uint8_t)(f ^ (1u + mulhi_((uint32_t)(rank - 1), ru)));
 }
 // noise-add FUSÉ : mat (signal in-place) += noise. mat devient a_eff/b_eff.
 // 1 BLOC = 1 ligne ; les threads coopèrent sur les k colonnes (e_al en shared).
-// 4 threads calculent les 4 blake3 d'e_al, puis tous parcourent k en grid-stride.
+// rank/32 threads calculent les blake3 d'e_al, puis tous parcourent k en grid-stride.
 __global__ void noise_add_k_(const uint32_t* seed, const uint32_t* key, int m, int k,
-                             const uint8_t* first, const uint8_t* second, int8_t* mat) {
+                             const uint8_t* first, const uint8_t* second, int8_t* mat,
+                             int rank) {
   int i = blockIdx.x; if (i >= m) return;
-  __shared__ int8_t e_al[128];
-  if (threadIdx.x < 4) {
-    uint32_t h[8]; rh_((uint32_t)(i * 4 + threadIdx.x), seed, key, 0, h);
+  __shared__ int8_t e_al[256];          // dimensionné au rank max supporté (uint8 idx)
+  int nblk = rank >> 5;                  // rank/32 octets-blocs blake3
+  if (threadIdx.x < (unsigned)nblk) {
+    uint32_t h[8]; rh_((uint32_t)(i * nblk + threadIdx.x), seed, key, 0, h);
     for (int kk = 0; kk < 32; ++kk) e_al[threadIdx.x * 32 + kk] = (int8_t)((bo_(h, kk) & 63) - 32);
   }
   __syncthreads();
@@ -211,6 +215,7 @@ static void commit_nokey(const uint8_t* data, uint32_t data_size, uint8_t* out,
 // côtés A et B indépendants (gen‖, commit‖, noise‖) jusqu'au stir.
 struct Ctx {
   int m, n, k, max_hits;
+  int rank;                         // noise_rank (env ARIA_RANK, défaut 128, ≤256)
   uint32_t nbA, nbB;
   void* prop;                       // cudaDeviceProp*
   int8_t *d_A, *d_B; int32_t* d_C;
@@ -256,12 +261,12 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   cudaEventRecord(c->eStir, c->sA);
   if (c->do_timing) cudaEventRecord(c->tMid, c->sA); // fin gen+commit+stir, avant noise
   // Phase 3 : noise A‖B (sB attend les seeds via eStir)
-  perm_k_<<<(k+255)/256,256,0,c->sA>>>(c->d_sla, c->d_as, k, c->d_faA, c->d_saA);
-  noise_add_k_<<<m,256,0,c->sA>>>(c->d_sla, c->d_as, m, k, c->d_faA, c->d_saA, c->d_A);
+  perm_k_<<<(k+255)/256,256,0,c->sA>>>(c->d_sla, c->d_as, k, c->d_faA, c->d_saA, c->rank);
+  noise_add_k_<<<m,256,0,c->sA>>>(c->d_sla, c->d_as, m, k, c->d_faA, c->d_saA, c->d_A, c->rank);
   cudaStreamWaitEvent(c->sB, c->eStir, 0);
   if (!(fixb && s_bfilled)) {   // fix-B : noise B fait 1× → d_B garde b_eff résident
-    perm_k_<<<(k+255)/256,256,0,c->sB>>>(c->d_slb, c->d_bs, k, c->d_faB, c->d_saB);
-    noise_add_k_<<<n,256,0,c->sB>>>(c->d_slb, c->d_bs, n, k, c->d_faB, c->d_saB, c->d_B);
+    perm_k_<<<(k+255)/256,256,0,c->sB>>>(c->d_slb, c->d_bs, k, c->d_faB, c->d_saB, c->rank);
+    noise_add_k_<<<n,256,0,c->sB>>>(c->d_slb, c->d_bs, n, k, c->d_faB, c->d_saB, c->d_B, c->rank);
   }
   cudaEventRecord(c->eB, c->sB);
   if (fixb) s_bfilled = true;
@@ -356,6 +361,13 @@ extern "C" {
 // ---- contexte persistant : alloc 1× (create), réutilise (grind), free (destroy) ----
 void* pearl_resident_create(int m, int n, int k, int max_hits) {
   Ctx* c = new Ctx(); c->m=m; c->n=n; c->k=k; c->max_hits=max_hits;
+  // noise_rank : env ARIA_RANK (défaut mainnet 128). ≤256 car first/second en uint8.
+  c->rank = 128;
+  if (const char* r = getenv("ARIA_RANK")) {
+    int v = atoi(r);
+    if (v >= 32 && v <= 256 && (v & (v-1)) == 0) c->rank = v;
+    else { fprintf(stderr, "ARIA_RANK=%s invalide (puissance de 2, 32..256)\n", r); delete c; return nullptr; }
+  }
   c->prop = new cudaDeviceProp(); if(cudaGetDeviceProperties((cudaDeviceProp*)c->prop,0)){delete c; return nullptr;}
   const uint32_t tpb=256, chunk=1024;
   c->nbA=(((uint32_t)((size_t)m*k)+chunk-1)/chunk + tpb-1)/tpb;
@@ -481,10 +493,13 @@ static void launch_chain2(Ctx2* c, int slot, uint64_t seed, const uint8_t job_ke
   commit_nokey<256,2,256>((const uint8_t*)c->d_A[slot],(uint32_t)((size_t)m*k),(uint8_t*)c->d_ha[slot],c->nbA,c->d_ra[slot],s);
   commit_nokey<256,2,256>((const uint8_t*)c->d_B[slot],(uint32_t)((size_t)n*k),(uint8_t*)c->d_hb[slot],c->nbB,c->d_rb[slot],s);
   stir_kernel<<<1,1,0,s>>>(c->d_ha[slot],c->d_hb[slot],c->d_jk,c->d_as[slot],c->d_bs[slot]);
-  perm_k_<<<(k+255)/256,256,0,s>>>(c->d_sla, c->d_as[slot], k, c->d_faA[slot], c->d_saA[slot]);
-  perm_k_<<<(k+255)/256,256,0,s>>>(c->d_slb, c->d_bs[slot], k, c->d_faB[slot], c->d_saB[slot]);
-  noise_add_k_<<<m,256,0,s>>>(c->d_sla, c->d_as[slot], m, k, c->d_faA[slot], c->d_saA[slot], c->d_A[slot]);
-  noise_add_k_<<<n,256,0,s>>>(c->d_slb, c->d_bs[slot], n, k, c->d_faB[slot], c->d_saB[slot], c->d_B[slot]);
+  // noise_rank : même env ARIA_RANK que le chemin résident (lu 1×, défaut 128).
+  static const int rank = [](){ const char* r = getenv("ARIA_RANK"); int v = r ? atoi(r) : 128;
+    return (v >= 32 && v <= 256 && (v & (v-1)) == 0) ? v : 128; }();
+  perm_k_<<<(k+255)/256,256,0,s>>>(c->d_sla, c->d_as[slot], k, c->d_faA[slot], c->d_saA[slot], rank);
+  perm_k_<<<(k+255)/256,256,0,s>>>(c->d_slb, c->d_bs[slot], k, c->d_faB[slot], c->d_saB[slot], rank);
+  noise_add_k_<<<m,256,0,s>>>(c->d_sla, c->d_as[slot], m, k, c->d_faA[slot], c->d_saA[slot], c->d_A[slot], rank);
+  noise_add_k_<<<n,256,0,s>>>(c->d_slb, c->d_bs[slot], n, k, c->d_faB[slot], c->d_saB[slot], c->d_B[slot], rank);
   // grind (recette alpha)
   using namespace cute;
   auto prob = make_shape(m,n,k);

@@ -28,12 +28,25 @@ pub struct Submission {
     pub proof_base64: String,
 }
 
+/// Wire dialect spoken by the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// Pearl stratum v1 (AriaPool/AlphaPool) : subscribe + authorize/submit en
+    /// params-tableau, vardiff via `mining.set_difficulty`.
+    Pearl,
+    /// LuckyPool Pearl GPU (`pearl-eu2.luckypool.io:3360`) : pas de subscribe,
+    /// params-OBJET (`authorize {wallet, worker, agent}`, `submit {job_id,
+    /// plain_proof}`), pas de set_difficulty (le target voyage dans le job).
+    LuckyPool,
+}
+
 pub struct StratumConfig {
     pub host: String,
     pub port: u16,
     pub wallet: String,
     pub worker: String,
     pub password: String,
+    pub dialect: Dialect,
 }
 
 /// **Disclosed 1% dev-fee.** For ~1% of mining time the miner authorizes with
@@ -153,21 +166,37 @@ async fn run_session(
     let mut next_id: u64 = 1;
     let login = format!("{}.{}", wallet, worker);
 
-    // 1. mining.subscribe — params empty. The pool detects the Pearl wire and
-    //    pushes `pearl.set_mining_params` automatically; an explicit
-    //    `mining.subscribe.pearl` call is rejected as "unknown method".
-    send(&mut wr, next_id, "mining.subscribe", json!([])).await?;
-    next_id += 1;
+    match cfg.dialect {
+        Dialect::Pearl => {
+            // 1. mining.subscribe — params empty. The pool detects the Pearl wire and
+            //    pushes `pearl.set_mining_params` automatically; an explicit
+            //    `mining.subscribe.pearl` call is rejected as "unknown method".
+            send(&mut wr, next_id, "mining.subscribe", json!([])).await?;
+            next_id += 1;
 
-    // 2. mining.authorize.
-    send(
-        &mut wr,
-        next_id,
-        "mining.authorize",
-        json!([login, cfg.password]),
-    )
-    .await?;
-    next_id += 1;
+            // 2. mining.authorize.
+            send(
+                &mut wr,
+                next_id,
+                "mining.authorize",
+                json!([login, cfg.password]),
+            )
+            .await?;
+            next_id += 1;
+        }
+        Dialect::LuckyPool => {
+            // LuckyPool: no subscribe; a single object-based authorize. The pool
+            // answers with `mining.notify` directly (no set_mining_params).
+            send(
+                &mut wr,
+                next_id,
+                "mining.authorize",
+                json!({"wallet": login, "worker": worker, "agent": "ariaminer/0.6.0"}),
+            )
+            .await?;
+            next_id += 1;
+        }
+    }
 
     loop {
         tokio::select! {
@@ -192,12 +221,11 @@ async fn run_session(
             }
             sub = submit_rx.recv() => {
                 let Some(sub) = sub else { return Ok(SessionEnd::Shutdown); };
-                send(
-                    &mut wr,
-                    next_id,
-                    "mining.submit",
-                    json!([login, sub.job_id, sub.proof_base64]),
-                ).await?;
+                let params = match cfg.dialect {
+                    Dialect::Pearl => json!([login, sub.job_id, sub.proof_base64]),
+                    Dialect::LuckyPool => json!({"job_id": sub.job_id, "plain_proof": sub.proof_base64}),
+                };
+                send(&mut wr, next_id, "mining.submit", params).await?;
                 next_id += 1;
             }
             _ = wait_deadline(deadline) => {
