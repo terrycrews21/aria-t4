@@ -48,6 +48,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel.cuh");
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_2x64_lib.cu");
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_2x64.cuh");
+    println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_tma.cuh");
     println!("cargo:rerun-if-changed=cuda/pearl_fold.cuh");
     println!("cargo:rerun-if-changed=cuda/pearl_commit_lib.cu");
     println!("cargo:rerun-if-changed=cuda/pearl_noise_lib.cu");

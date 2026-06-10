@@ -166,7 +166,8 @@ struct SharedStorageTMA_MS {
 template <class ProblemShape, class CtaTiler,
           class TA, class AStride, class ASmemLayout, class TiledCopyA, class S2RAtomA,
           class TB, class BStride, class TmaB, class BSmemLayout, class S2RAtomB,
-          class TC, class CStride, class CSmemLayout, class TiledMma, bool DumpC = true>
+          class TC, class CStride, class CSmemLayout, class TiledMma, bool DumpC = true,
+          bool BigEndian = false>
 __global__ static __launch_bounds__(decltype(size(TiledMma{}))::value)
 void gemm_device_tma_ms(ProblemShape shape_MNK, CtaTiler cta_tiler,
     TA const* A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a, S2RAtomA s2r_atom_a,
@@ -291,7 +292,19 @@ void gemm_device_tma_ms(ProblemShape shape_MNK, CtaTiler cta_tiler,
   for (int i=0;i<8;i++) cv(i)=pow_key[i];
   blake3::compress_msg_block_u32(msg, cv, blake3::COMPRESS_PARAMS_SINGLE_BLOCK_KEYED);
   bool found = true;
-  for (int i=7;i>=0;--i){ if(cv(i)>pow_bound[i]){found=false;break;} if(cv(i)<pow_bound[i])break; }
+  if constexpr (BigEndian) {
+    // LuckyPool : jackpot lu BIG-ENDIAN (byte 0 = MSB) < target. On byteswap cv ET
+    // pow_bound (chargés en mots LE depuis les octets) puis on compare du mot 0
+    // (poids fort) au mot 7 — équivaut à comparer les octets en big-endian.
+    // pow_bound = octets du target big-endian passés tels quels (cf ARIA_BE côté lib).
+    for (int i=0;i<8;++i){
+      uint32_t h = __byte_perm(cv(i), 0, 0x0123);        // jackpot bytes [4i..] big-endian
+      uint32_t b = __byte_perm(pow_bound[i], 0, 0x0123); // target  bytes [4i..] big-endian
+      if(h>b){found=false;break;} if(h<b)break;
+    }
+  } else {
+    for (int i=7;i>=0;--i){ if(cv(i)>pow_bound[i]){found=false;break;} if(cv(i)<pow_bound[i])break; }
+  }
   if (found) {
     int slot = atomicAdd(found_count, 1);
     if (slot < max_hits) {

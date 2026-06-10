@@ -34,9 +34,26 @@ fn main() {
     );
     let mut target_be = [0u8; 32];
     hex::decode_to_slice(TARGET_HEX, &mut target_be).unwrap();
+    // Pour itérer vite tout en exerçant le VRAI chemin BE, on peut éclaircir le
+    // target (ARIA_TEST_TARGET_BYTE0=0x0f → 1ᵉ octet, reste 0xff). Le mécanisme
+    // big-endian est identique, juste plus facile à trouver.
+    if let Ok(b0) = std::env::var("ARIA_TEST_TARGET_BYTE0") {
+        let b0 = u8::from_str_radix(b0.trim_start_matches("0x"), 16).unwrap_or(0x0f);
+        target_be = [0xffu8; 32];
+        target_be[0] = b0;
+        println!("  (test) target éclairci big-endian = {:02x}ff..ff", b0);
+    }
     let config = canonical_gpu_config(k as u32);
     let rank = config.rank as usize;
-    println!("  config rank={rank} (ARIA_RANK)");
+    let be = std::env::var("ARIA_BE").is_ok();
+    println!("  config rank={rank} cols={:?}  BE={be}", config.cols_pattern.to_list());
+    // En mode BE (LuckyPool) le kernel attend les OCTETS du target big-endian tels
+    // quels (il les byteswappe). Sinon (legacy) bound little-endian = target inversé.
+    let bound_for_kernel: [u8; 32] = if be {
+        target_be
+    } else {
+        let mut b = target_be; b.reverse(); b
+    };
     let factor = 128u64 * k as u64;
     let bound_scaled = scaled_bound_le_from_target_be(&target_be, factor);
     let mut target_le = target_be;
@@ -45,15 +62,15 @@ fn main() {
     let ctx = ResidentCtx::new(m, n, k, 64);
     let mut rng = StdRng::seed_from_u64(0x10C4_9001);
 
-    println!("▶ grind #1 (remplit B) … (~12s/hit attendu)");
+    println!("▶ grind #1 (remplit B) …");
     let (s0, _h0, _jk0) = loop {
-        if let Some(t) = grind_only_ctx(&ctx, &mut rng, &header, &config, &bound_scaled) {
+        if let Some(t) = grind_only_ctx(&ctx, &mut rng, &header, &config, &bound_for_kernel) {
             break t;
         }
     };
     println!("▶ grind #2 (A varie, B figé) …");
     let (s1, hit, jk) = loop {
-        if let Some(t) = grind_only_ctx(&ctx, &mut rng, &header, &config, &bound_scaled) {
+        if let Some(t) = grind_only_ctx(&ctx, &mut rng, &header, &config, &bound_for_kernel) {
             break t;
         }
     };
@@ -73,15 +90,18 @@ fn main() {
             let noise = compute_noise(&compiled);
             let jackpot = compute_jackpot(&compiled, &privp.s_a, &privp.s_b, &noise);
             let j = compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
-            println!("  jackpot OFFICIEL recalculé (LE) = {}", hex::encode(j));
+            println!("  jackpot OFFICIEL recalculé (bytes) = {}", hex::encode(j));
+            // j est l'array de 32 octets du jackpot. Teste les 2 conventions :
+            let mut j_rev = j; j_rev.reverse();
+            // LA règle LuckyPool : j lu BIG-endian < target_be  ⇔  j_rev (LE) < target_le.
+            let be_ok = le_leq(&j_rev, &target_le) && j_rev != target_le;
             println!(
-                "  ≤ target×h·w·k (notre bound) : {}",
-                if le_leq(&j, &bound_scaled) { "✅ OUI → header/job_key/pipeline COHÉRENTS, le bound POOL diffère" } else { "❌ NON → désync header/job_key" }
+                "  [BE LuckyPool] jackpot big-endian < target : {}",
+                if be_ok { "✅✅ OUI → notre grind BE trouve des shares VALIDES LuckyPool !" } else { "❌ NON" }
             );
-            println!(
-                "  ≤ target brut                : {}",
-                if le_leq(&j, &target_le) { "✅ OUI" } else { "❌ NON (attendu si bound pool = scaled)" }
-            );
+            // (référence) ce que l'ancienne convention LE aurait donné
+            println!("  (réf LE)  j little-endian ≤ target_le  : {}", if le_leq(&j, &target_le) { "oui" } else { "non" });
+            println!("  (réf bloc) j ≤ target×h·w·k            : {}", if le_leq(&j, &bound_scaled) { "oui" } else { "non" });
         }
     }
 }

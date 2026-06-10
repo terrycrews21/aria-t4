@@ -453,15 +453,22 @@ pub fn rank_from_env() -> u16 {
 #[cfg(feature = "gpu")]
 pub fn canonical_gpu_config(common_dim: u32) -> MiningConfiguration {
     use zk_pow::api::proof::MMAType;
+    let rank = rank_from_env();
+    // Les cols dépendent de la LARGEUR de tuile du grind : kernel 8×16 (bN=128,
+    // défaut AriaPool) → période 128 `[0,1,16,17,…]` ; kernel MULTISTAGE TMA
+    // (bN=256, gate ARIA_TMA_MS) → période 256 `[0,1,32,33,…]` (= mainnet/LuckyPool).
+    // Mesuré bit-exact via tma_coords_dump (les rows sont identiques dans les 2 cas).
+    let cols: Vec<u32> = if std::env::var("ARIA_TMA_MS").is_ok() {
+        vec![0, 1, 32, 33, 64, 65, 96, 97, 128, 129, 160, 161, 192, 193, 224, 225]
+    } else {
+        vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113]
+    };
     MiningConfiguration {
         common_dim,
-        rank: rank_from_env(),
+        rank,
         mma_type: MMAType::Int7xInt7ToInt32,
         rows_pattern: PeriodicPattern::from_list(&[0, 8, 32, 40, 64, 72, 96, 104]).unwrap(),
-        cols_pattern: PeriodicPattern::from_list(&[
-            0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113,
-        ])
-        .unwrap(),
+        cols_pattern: PeriodicPattern::from_list(&cols).unwrap(),
         reserved: MiningConfiguration::RESERVED_VALUE,
     }
 }

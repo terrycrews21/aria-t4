@@ -216,6 +216,7 @@ static void commit_nokey(const uint8_t* data, uint32_t data_size, uint8_t* out,
 struct Ctx {
   int m, n, k, max_hits;
   int rank;                         // noise_rank (env ARIA_RANK, défaut 128, ≤256)
+  bool big_endian;                  // ARIA_BE : pow-check big-endian (LuckyPool) sur le multistage
   uint32_t nbA, nbB;
   void* prop;                       // cudaDeviceProp*
   int8_t *d_A, *d_B; int32_t* d_C;
@@ -312,14 +313,36 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
     Tensor gB_t = make_tensor(make_gmem_ptr<int8_t>(c->d_B), make_layout(make_shape(n,k), make_stride(k,Int<1>{})));
     auto tma_b = make_tma_copy<int8_t>(SM90_TMA_LOAD{}, gB_t, sB1, make_shape(bN2,bK2), Int<1>{});
     int smem = int(sizeof(SharedStorageTMA_MS<int8_t,int8_t,decltype(sAm),decltype(sBm)>));
-    auto kfn = gemm_device_tma_ms<decltype(prob),decltype(cta2),
-        int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
-        int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),
-        int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false>;
-    cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(
+        gemm_device_tma_ms<decltype(prob),decltype(cta2),
+          int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
+          int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),
+          int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false, /*BE=*/false>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(
+        gemm_device_tma_ms<decltype(prob),decltype(cta2),
+          int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
+          int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),
+          int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false, /*BE=*/true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     dim3 grd2(size(ceil_div(m,bM2)), size(ceil_div(n,bN2))), blk2(size(mma2));
-    kfn<<<grd2,blk2,smem,c->sA>>>(prob,cta2, c->d_A,dA,sAm,copyA2,s2rA2, c->d_B,dB,tma_b,sBm,s2rB2,
-        c->d_C,dC,sCm,mma2, reduce_every_k, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+    // ARIA_BE=1 (LuckyPool) → pow-check big-endian. d_bnd doit alors contenir les
+    // OCTETS du target big-endian tels quels (le grind FFI les reçoit ainsi).
+    if (c->big_endian) {
+      auto kfn = gemm_device_tma_ms<decltype(prob),decltype(cta2),
+          int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
+          int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),
+          int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false, /*BE=*/true>;
+      kfn<<<grd2,blk2,smem,c->sA>>>(prob,cta2, c->d_A,dA,sAm,copyA2,s2rA2, c->d_B,dB,tma_b,sBm,s2rB2,
+          c->d_C,dC,sCm,mma2, reduce_every_k, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+    } else {
+      auto kfn = gemm_device_tma_ms<decltype(prob),decltype(cta2),
+          int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
+          int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),
+          int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false, /*BE=*/false>;
+      kfn<<<grd2,blk2,smem,c->sA>>>(prob,cta2, c->d_A,dA,sAm,copyA2,s2rA2, c->d_B,dB,tma_b,sBm,s2rB2,
+          c->d_C,dC,sCm,mma2, reduce_every_k, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+    }
   } else if (c->tile2x64) {
     // v1.1 AlphaPool : grind 2×64 (fold tuile 2 lignes {r,r+32} × 64 cols).
     int smem = int(sizeof(SharedStorage2x64<int8_t,int8_t,decltype(sA),decltype(sB)>));
@@ -368,6 +391,7 @@ void* pearl_resident_create(int m, int n, int k, int max_hits) {
     if (v >= 32 && v <= 256 && (v & (v-1)) == 0) c->rank = v;
     else { fprintf(stderr, "ARIA_RANK=%s invalide (puissance de 2, 32..256)\n", r); delete c; return nullptr; }
   }
+  c->big_endian = (getenv("ARIA_BE") != nullptr);   // LuckyPool : pow-check big-endian
   c->prop = new cudaDeviceProp(); if(cudaGetDeviceProperties((cudaDeviceProp*)c->prop,0)){delete c; return nullptr;}
   const uint32_t tpb=256, chunk=1024;
   c->nbA=(((uint32_t)((size_t)m*k)+chunk-1)/chunk + tpb-1)/tpb;
