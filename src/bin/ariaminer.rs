@@ -24,7 +24,7 @@ use ariaminer::official_proof::encode_base64;
 use ariaminer::mouchard::Mouchard;
 use ariaminer::protocol::{Job, MiningParams};
 use ariaminer::stratum::{Dialect, JobEvent, StratumConfig, Submission, run as stratum_run};
-use ariaminer::stratum_to_official::{OfficialJob, build_official_job, scaled_bound_le_from_target_be};
+use ariaminer::stratum_to_official::{OfficialJob, build_official_job};
 use clap::Parser;
 use parking_lot::Mutex;
 use rand::SeedableRng;
@@ -567,7 +567,21 @@ async fn main() -> anyhow::Result<()> {
         None => Dialect::Pearl,
     };
     if dialect == Dialect::LuckyPool {
-        tracing::info!("dialecte LuckyPool (object wire, target par job)");
+        // LuckyPool mainnet impose : kernel MULTISTAGE TMA (cols période-256), rank
+        // 256, pow-check BIG-ENDIAN. On force les gates AVANT toute création de
+        // contexte GPU / appel à canonical_gpu_config (qui les lisent via env).
+        // (Respecté seulement si l'opérateur n'a rien forcé lui-même.)
+        unsafe {
+            if std::env::var("ARIA_TMA_MS").is_err() { std::env::set_var("ARIA_TMA_MS", "1"); }
+            if std::env::var("ARIA_RANK").is_err() { std::env::set_var("ARIA_RANK", "256"); }
+            // Forme mainnet figée (la pool valide m=n=131072 dans le proof soumis).
+            if std::env::var("ARIA_BATCH_M").is_err() { std::env::set_var("ARIA_BATCH_M", "131072"); }
+            if std::env::var("ARIA_BATCH_N").is_err() { std::env::set_var("ARIA_BATCH_N", "131072"); }
+        }
+        // Bound = règle CONSENSUS (jackpot LE ≤ target × h·w·k) : le ×h·w·k donne
+        // la difficulté effective réaliste (~2^31 pour target 2^50) qui colle au
+        // rythme de partage observé. Mode LE (pas ARIA_BE). [[fold validé byte-exact]]
+        tracing::info!("dialecte LuckyPool : multistage TMA + rank 256 + 131072² + bound consensus ×h·w·k");
     }
 
     let scfg = StratumConfig {
@@ -724,10 +738,11 @@ async fn main() -> anyhow::Result<()> {
                     Ok(mut g) => {
                         if dialect == Dialect::LuckyPool {
                             if let Some(t) = job.full_target {
-                                // Official rule: jackpot ≤ target × h·w·k (the
-                                // canonical GPU tile is 8×16 → h·w = 128).
+                                // Règle CONSENSUS : jackpot little-endian ≤ target ×
+                                // h·w·k (h·w = tuile 8×16 = 128, k = common_dim).
+                                // Le ×h·w·k donne la difficulté effective réaliste.
                                 let factor = 128u64 * params.k as u64;
-                                g.official.bound_le = scaled_bound_le_from_target_be(&t, factor);
+                                g.official.bound_le = ariaminer::stratum_to_official::scaled_bound_le_from_target_be(&t, factor);
                             }
                         }
                         Arc::new(g)

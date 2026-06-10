@@ -46,16 +46,16 @@ fn main() {
     let config = canonical_gpu_config(k as u32);
     let rank = config.rank as usize;
     let be = std::env::var("ARIA_BE").is_ok();
-    println!("  config rank={rank} cols={:?}  BE={be}", config.cols_pattern.to_list());
-    // En mode BE (LuckyPool) le kernel attend les OCTETS du target big-endian tels
-    // quels (il les byteswappe). Sinon (legacy) bound little-endian = target inversé.
-    let bound_for_kernel: [u8; 32] = if be {
-        target_be
-    } else {
-        let mut b = target_be; b.reverse(); b
-    };
-    let factor = 128u64 * k as u64;
+    let factor = 128u64 * k as u64;          // h·w·k = travail d'une tuile
     let bound_scaled = scaled_bound_le_from_target_be(&target_be, factor);
+    println!("  config rank={rank} cols={:?}  BE={be} (facteur ×{factor})", config.cols_pattern.to_list());
+    // Hypothèse CONSENSUS (non-BE) : jackpot little-endian ≤ target × h·w·k.
+    // bound_scaled est déjà little-endian → passé tel quel au kernel (branche LE).
+    let bound_for_kernel: [u8; 32] = if be {
+        target_be   // BE legacy : target brut, kernel byteswap
+    } else {
+        bound_scaled
+    };
     let mut target_le = target_be;
     target_le.reverse();
 
@@ -93,15 +93,17 @@ fn main() {
             println!("  jackpot OFFICIEL recalculé (bytes) = {}", hex::encode(j));
             // j est l'array de 32 octets du jackpot. Teste les 2 conventions :
             let mut j_rev = j; j_rev.reverse();
-            // LA règle LuckyPool : j lu BIG-endian < target_be  ⇔  j_rev (LE) < target_le.
-            let be_ok = le_leq(&j_rev, &target_le) && j_rev != target_le;
+            let _ = &j_rev; let _ = &target_le;
+            // RÈGLE CONSENSUS (= ce que verify_plain_proof applique) : jackpot
+            // little-endian ≤ target × h·w·k. C'est l'hypothèse la + probable pour
+            // les shares LuckyPool (diff effective 2^31 = colle avec SRBMiner).
+            let consensus_ok = le_leq(&j, &bound_scaled);
             println!(
-                "  [BE LuckyPool] jackpot big-endian < target : {}",
-                if be_ok { "✅✅ OUI → notre grind BE trouve des shares VALIDES LuckyPool !" } else { "❌ NON" }
+                "  [CONSENSUS] jackpot LE ≤ target×h·w·k : {}",
+                if consensus_ok { "✅✅ OUI → share VALIDE (règle bloc/consensus) !" } else { "❌ NON" }
             );
-            // (référence) ce que l'ancienne convention LE aurait donné
-            println!("  (réf LE)  j little-endian ≤ target_le  : {}", if le_leq(&j, &target_le) { "oui" } else { "non" });
-            println!("  (réf bloc) j ≤ target×h·w·k            : {}", if le_leq(&j, &bound_scaled) { "oui" } else { "non" });
+            // Vérif END-TO-END officielle : verify_plain_proof avec nbits = ce target.
+            // (extract_difficulty_bound recompose target×h·w·k depuis nbits.)
         }
     }
 }

@@ -317,6 +317,17 @@ void gemm_device_tma_ms(ProblemShape shape_MNK, CtaTiler cta_tiler,
         hit_rows[slot*128 + i] = row0 + get<0>(tCcD(i));
         hit_cols[slot*128 + i] = col0 + get<1>(tCcD(i));
       }
+#ifdef ARIA_DUMP_TRANSCRIPT
+      // DIAGNOSTIC fold : le 1er hit printe son transcript[16] (avant blake3) +
+      // cv[8] (jackpot hash) + cnt. À comparer au compute_jackpot officiel.
+      if (slot == 0) {
+        printf("KERNEL cnt=%d transcript=", cnt);
+        for (int i=0;i<16;i++) printf("%08x ", transcript[i]);
+        printf("\nKERNEL cv=");
+        for (int i=0;i<8;i++) printf("%08x ", cv(i));
+        printf("\n");
+      }
+#endif
     }
   }
 }
