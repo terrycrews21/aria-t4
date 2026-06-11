@@ -12,7 +12,16 @@
 #include "pearl_gpu_kernel.cuh"        // gemm_device (grind 8×16, v1.0)
 #include "pearl_gpu_kernel_2x64.cuh"   // gemm_device_2x64 (grind 2×64, v1.1 AlphaPool)
 #include "pearl_gpu_kernel_tma.cuh"    // gemm_device_tma_ms (grind multistage TMA 128×256, v0.6.0-ws)
+#include "pearl_gpu_kernel_cpasync_ms.cuh" // gemm_device_cpasync_ms (jumeau PORTABLE Ampere/Ada, v0.6.3-beta)
 using namespace cute;
+
+// v0.6.3 : faut-il le path PORTABLE cp.async (au lieu du TMA Blackwell) ?
+// Vrai si le GPU n'a pas le TMA (major < 9 = Ampere sm_80/86, Ada sm_89) OU si forcé
+// par ARIA_FORCE_CPASYNC=1 (validation byte-exact du path cp.async sur 5080).
+static bool aria_use_cpasync(int major) {
+  if (getenv("ARIA_FORCE_CPASYNC")) return true;
+  return major < 9;   // TMA dispo seulement sm_90 (Hopper) + sm_100/120 (Blackwell)
+}
 
 // v0.6.1 : largeur de bande (en tuiles-M) du swizzle de grille du grind multistage.
 // ARIA_SWZ_G (défaut 64, 0 = off). Optimum mesuré RTX 5080 forme 131072² : plateau
@@ -343,10 +352,50 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
     using TVcopy2 = Layout<Shape<Shape<_8,_32>,_16>, Stride<Stride<_512,_1>,_32>>;
     using TilerC2 = Shape<_32,_128>;
     TiledCopy<AtomG2,TVcopy2,TilerC2> copyA2;
+    // copyB2 : MÊME type de TiledCopy que A — le tiler 32×128 partitionne aussi la
+    // tuile B (256×128) en 8 répétitions N → B chargeable en cp.async (path portable).
+    TiledCopy<AtomG2,TVcopy2,TilerC2> copyB2;
     TiledMMA mma2 = make_tiled_mma(SM80_16x8x32_S32S8S8S32_TN{}, Layout<Shape<_2,_4,_1>,Stride<_1,_2,_0>>{}, Tile<_32,_32,_32>{});
     Copy_Atom<SM75_U32x4_LDSM_N,int8_t> s2rA2; Copy_Atom<SM75_U32x2_LDSM_N,int8_t> s2rB2;
     Tensor gB_t = make_tensor(make_gmem_ptr<int8_t>(c->d_B), make_layout(make_shape(n,k), make_stride(k,Int<1>{})));
     auto tma_b = make_tma_copy<int8_t>(SM90_TMA_LOAD{}, gB_t, sB1, make_shape(bN2,bK2), Int<1>{});
+    bool use_cpa = aria_use_cpasync(((cudaDeviceProp*)c->prop)->major);
+    // ---- v0.6.3-beta : path PORTABLE cp.async (Ampere/Ada, ou forcé pour validation) ----
+    if (use_cpa) {
+      int smem_c = int(sizeof(SharedStorageCPA_MS<int8_t,int8_t,decltype(sAm),decltype(sBm)>));
+      dim3 grd2(size(ceil_div(m,bM2)), size(ceil_div(n,bN2))), blk2(size(mma2));
+      auto setattr = [&](auto kfn){ cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_c); };
+      if (c->big_endian) {
+        auto kfn = gemm_device_cpasync_ms<decltype(prob),decltype(cta2),
+            int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
+            int8_t,decltype(dB),decltype(copyB2),decltype(sBm),decltype(s2rB2),
+            int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false, /*BE=*/true>;
+        setattr(kfn);
+        kfn<<<grd2,blk2,smem_c,c->sA>>>(prob,cta2, c->d_A,dA,sAm,copyA2,s2rA2, c->d_B,dB,copyB2,sBm,s2rB2,
+            c->d_C,dC,sCm,mma2, reduce_every_k, aria_swz_g(), c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+      } else {
+        auto kfn = gemm_device_cpasync_ms<decltype(prob),decltype(cta2),
+            int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),
+            int8_t,decltype(dB),decltype(copyB2),decltype(sBm),decltype(s2rB2),
+            int32_t,decltype(dC),decltype(sCm),decltype(mma2), /*DumpC=*/false, /*BE=*/false>;
+        setattr(kfn);
+        kfn<<<grd2,blk2,smem_c,c->sA>>>(prob,cta2, c->d_A,dA,sAm,copyA2,s2rA2, c->d_B,dB,copyB2,sBm,s2rB2,
+            c->d_C,dC,sCm,mma2, reduce_every_k, aria_swz_g(), c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+      }
+      if (c->do_timing) cudaEventRecord(c->tEnd, c->sA);
+      CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
+      if (c->do_timing) {
+        cudaEventElapsedTime(&c->last_pro_ms,   c->tStart, c->tPro);
+        cudaEventElapsedTime(&c->last_grind_ms, c->tPro,   c->tEnd);
+        cudaEventElapsedTime(&c->last_genc_ms,  c->tStart, c->tMid);
+        cudaEventElapsedTime(&c->last_noise_ms, c->tMid,   c->tPro);
+      }
+      int found=0; CKR(cudaMemcpy(&found,c->d_found,4,cudaMemcpyDeviceToHost));
+      int nret = found<max_hits?found:max_hits;
+      if(nret>0 && hit_rows) CKR(cudaMemcpy(hit_rows,c->d_hr,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+      if(nret>0 && hit_cols) CKR(cudaMemcpy(hit_cols,c->d_hc,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+      return found;
+    }
     int smem = int(sizeof(SharedStorageTMA_MS<int8_t,int8_t,decltype(sAm),decltype(sBm)>));
     cudaFuncSetAttribute(
         gemm_device_tma_ms<decltype(prob),decltype(cta2),

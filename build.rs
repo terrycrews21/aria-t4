@@ -27,13 +27,25 @@ fn main() {
         ("cuda/pearl_gpu_proof_lib.cu", "pearl_gpu_proof_lib.o"), // preuve Merkle FULL GPU (v2.0)
     ];
     let lib = format!("{}/libpearl_gpu.a", out);
+    // v0.6.3-beta : build FATBIN multi-archi → un seul binaire pour RTX 30 (sm_86),
+    // 40 (sm_89) et 50 (sm_120a). Le path TMA (Blackwell) compile partout (CuTe trappe
+    // ses intrinsics SM90 sur les archis sans TMA, jamais appelés) ; le path cp.async
+    // (portable) sert Ampere/Ada via dispatch runtime (cudaDeviceProp.major).
+    // Override : ARIA_CUDA_ARCHES="86,89,120a" (défaut). "120a" seul = build mono-5080 (perf dev).
+    let arches = env::var("ARIA_CUDA_ARCHES").unwrap_or_else(|_| "86,89,120a".into());
+    let mut gencode: Vec<String> = Vec::new();
+    for a in arches.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        gencode.push("-gencode".into());
+        gencode.push(format!("arch=compute_{a},code=sm_{a}"));
+    }
     for (src, obj_name) in units {
         let obj = format!("{}/{}", out, obj_name);
-        let status = Command::new(&nvcc)
-            .args(["-arch=sm_120a", "-O3", "-std=c++17",
+        let mut args: Vec<String> = gencode.clone();
+        args.extend(["-O3", "-std=c++17",
                    "-Icuda", &format!("-I{}", shim), &format!("-I{}", cutlass), &format!("-I{}", csrc),
                    "--expt-relaxed-constexpr", "-Xcompiler", "-fPIC",
-                   "-c", src, "-o", &obj])
+                   "-c", src, "-o", &obj].iter().map(|s| s.to_string()));
+        let status = Command::new(&nvcc).args(&args)
             .status().expect("nvcc introuvable");
         assert!(status.success(), "compilation CUDA échouée: {src}");
         Command::new("ar").args(["crus", &lib, &obj]).status().expect("ar");
@@ -49,6 +61,8 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_2x64_lib.cu");
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_2x64.cuh");
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_tma.cuh");
+    println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_cpasync_ms.cuh");
+    println!("cargo:rerun-if-env-changed=ARIA_CUDA_ARCHES");
     println!("cargo:rerun-if-changed=cuda/pearl_fold.cuh");
     println!("cargo:rerun-if-changed=cuda/pearl_commit_lib.cu");
     println!("cargo:rerun-if-changed=cuda/pearl_noise_lib.cu");
