@@ -13,6 +13,7 @@
 #include "pearl_gpu_kernel_2x64.cuh"   // gemm_device_2x64 (grind 2×64, v1.1 AlphaPool)
 #include "pearl_gpu_kernel_tma.cuh"    // gemm_device_tma_ms (grind multistage TMA 128×256, v0.6.0-ws)
 #include "pearl_gpu_kernel_cpasync_ms.cuh" // gemm_device_cpasync_ms (jumeau PORTABLE Ampere/Ada, v0.6.3-beta)
+#include "merkle_roots_cpasync.cuh"        // MerkleTreeRootsKernelCpAsync (commit PORTABLE — l'officiel est TMA/SM90-only)
 using namespace cute;
 
 // v0.6.3 : faut-il le path PORTABLE cp.async (au lieu du TMA Blackwell) ?
@@ -23,12 +24,30 @@ static bool aria_use_cpasync(int major) {
   return major < 9;   // TMA dispo seulement sm_90 (Hopper) + sm_100/120 (Blackwell)
 }
 
+// Major du device courant, caché (pour les helpers sans accès au Ctx, ex commit_nokey).
+static int aria_device_major() {
+  static int m = -1;
+  if (m < 0) { int d = 0; cudaGetDevice(&d); cudaDeviceProp p; cudaGetDeviceProperties(&p, d); m = p.major; }
+  return m;
+}
+
 // v0.6.1 : largeur de bande (en tuiles-M) du swizzle de grille du grind multistage.
 // ARIA_SWZ_G (défaut 64, 0 = off). Optimum mesuré RTX 5080 forme 131072² : plateau
 // 64-96 (+12%) ; 128 déborde du L2. Changement d'ORDRE des CTAs uniquement.
 static int aria_swz_g() {
   static int v = -1;
-  if (v < 0) { const char* e = getenv("ARIA_SWZ_G"); v = e ? atoi(e) : 64; if (v < 0) v = 0; }
+  if (v < 0) {
+    const char* e = getenv("ARIA_SWZ_G");
+    if (e) { v = atoi(e); if (v < 0) v = 0; }
+    else {
+      // Défaut AUTO par taille de L2 (la bande de tuiles-M doit tenir dans le L2).
+      // Mesuré : 5080 L2 64Mo → 64 (plateau 64-96) ; 4060 L2 24Mo → 32 (plateau 16-32).
+      int dev = 0, l2 = 0; cudaGetDevice(&dev);
+      cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev);
+      const int l2mb = l2 >> 20;
+      v = (l2mb >= 48) ? 64 : (l2mb >= 16) ? 32 : (l2mb >= 8) ? 16 : 8;
+    }
+  }
   return v;
 }
 
@@ -204,6 +223,18 @@ int pearl_gpu_commit_seeds(uint64_t setup_seed, int m, int n, int k,
 template <int kNumConsumerThreads, int kNumStages, int kLeavesPerMTBlock, int kThreadLoadSize = 128>
 static void commit_nokey(const uint8_t* data, uint32_t data_size, uint8_t* out,
                          uint32_t num_blocks, uint8_t* roots, cudaStream_t stream) {
+  if (aria_use_cpasync(aria_device_major())) {
+    // Jumeau portable : même mapping/réduction, staging cp.async (l'officiel crée un
+    // descripteur TMA côté hôte → erreur 801 sur Ampere/Ada avant même le launch).
+    using KCpa = pearl::MerkleTreeRootsKernelCpAsync<kNumConsumerThreads, kNumStages, kThreadLoadSize>;
+    constexpr static int smem_cpa = KCpa::SharedStorageSize;
+    typename KCpa::Arguments args{ data, data_size, reinterpret_cast<uint8_t*>(roots) };
+    typename KCpa::Params kp = KCpa::to_underlying_arguments(args);
+    auto rk = cutlass::device_kernel<KCpa>;
+    dim3 grid = KCpa::get_grid_shape(kp), block = KCpa::get_block_shape();
+    if (smem_cpa >= 48*1024) cudaFuncSetAttribute(reinterpret_cast<const void*>(rk), cudaFuncAttributeMaxDynamicSharedMemorySize, smem_cpa);
+    rk<<<grid, block, smem_cpa, stream>>>(kp);
+  } else {
   using MerkleTreeRootsKernel = pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages, kThreadLoadSize>;
   constexpr static int merkle_roots_smem_size = MerkleTreeRootsKernel::SharedStorageSize;
   typename MerkleTreeRootsKernel::Arguments args{ data, data_size, reinterpret_cast<uint8_t*>(roots) };
@@ -212,6 +243,7 @@ static void commit_nokey(const uint8_t* data, uint32_t data_size, uint8_t* out,
   dim3 grid = MerkleTreeRootsKernel::get_grid_shape(kp), block = MerkleTreeRootsKernel::get_block_shape();
   if (merkle_roots_smem_size >= 48*1024) cudaFuncSetAttribute(reinterpret_cast<const void*>(rk), cudaFuncAttributeMaxDynamicSharedMemorySize, merkle_roots_smem_size);
   rk<<<grid, block, merkle_roots_smem_size, stream>>>(kp);
+  }
   const int nbmt = (num_blocks + kLeavesPerMTBlock - 1) / kLeavesPerMTBlock;
   if (nbmt == 1) {
     using K = pearl::ComputeBlakeMTKernel<kLeavesPerMTBlock, true>;
@@ -357,8 +389,6 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
     TiledCopy<AtomG2,TVcopy2,TilerC2> copyB2;
     TiledMMA mma2 = make_tiled_mma(SM80_16x8x32_S32S8S8S32_TN{}, Layout<Shape<_2,_4,_1>,Stride<_1,_2,_0>>{}, Tile<_32,_32,_32>{});
     Copy_Atom<SM75_U32x4_LDSM_N,int8_t> s2rA2; Copy_Atom<SM75_U32x2_LDSM_N,int8_t> s2rB2;
-    Tensor gB_t = make_tensor(make_gmem_ptr<int8_t>(c->d_B), make_layout(make_shape(n,k), make_stride(k,Int<1>{})));
-    auto tma_b = make_tma_copy<int8_t>(SM90_TMA_LOAD{}, gB_t, sB1, make_shape(bN2,bK2), Int<1>{});
     bool use_cpa = aria_use_cpasync(((cudaDeviceProp*)c->prop)->major);
     // ---- v0.6.3-beta : path PORTABLE cp.async (Ampere/Ada, ou forcé pour validation) ----
     if (use_cpa) {
@@ -396,6 +426,10 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
       if(nret>0 && hit_cols) CKR(cudaMemcpy(hit_cols,c->d_hc,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
       return found;
     }
+    // Descripteur TMA créé APRÈS le dispatch : cuTensorMapEncode échoue (801,
+    // cudaErrorNotSupported) sur pré-SM90, et le path cp.async ne l'utilise pas.
+    Tensor gB_t = make_tensor(make_gmem_ptr<int8_t>(c->d_B), make_layout(make_shape(n,k), make_stride(k,Int<1>{})));
+    auto tma_b = make_tma_copy<int8_t>(SM90_TMA_LOAD{}, gB_t, sB1, make_shape(bN2,bK2), Int<1>{});
     int smem = int(sizeof(SharedStorageTMA_MS<int8_t,int8_t,decltype(sAm),decltype(sBm)>));
     cudaFuncSetAttribute(
         gemm_device_tma_ms<decltype(prob),decltype(cta2),
@@ -494,7 +528,9 @@ static void prologue_A_slot(Ctx* c, uint64_t seed, int8_t* dA, uint32_t* dha, ui
 static int resident_run2(Ctx* c, uint64_t seed, uint64_t next_seed, int has_next,
                          const uint8_t job_key[32], int* hit_rows, int* hit_cols) {
   bool fixb = (getenv("ARIA_FIXB") != nullptr);
-  if (!(fixb && getenv("ARIA_TMA_MS") && c->d_A2 && aria_overlap()))
+  // L'overlap n'a pas de jumeau cp.async (TMA only) → fallback classique sur Ampere/Ada.
+  if (!(fixb && getenv("ARIA_TMA_MS") && c->d_A2 && aria_overlap())
+      || aria_use_cpasync(((cudaDeviceProp*)c->prop)->major))
     return resident_run(c, seed, job_key, hit_rows, hit_cols);
   int m=c->m, n=c->n, k=c->k, max_hits=c->max_hits;
   // job change → set_key + reset pipeline (pending de l'ancien job jeté)
