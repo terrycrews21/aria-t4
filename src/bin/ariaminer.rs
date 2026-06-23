@@ -677,8 +677,20 @@ async fn main() -> anyhow::Result<()> {
     let mut grind_gen: Option<GrindGen> = None;
     let mut job_slot: Option<Arc<Mutex<Arc<GrindJob>>>> = None;
 
+    // Arrêt gracieux. Sans handler, un signal (SIGINT/SIGTERM, ou SIGHUP émis quand on
+    // FERME un `screen`) tue le process AVANT que les `Drop` ne tournent → le contexte
+    // CUDA (ResidentCtx/ProofGpuCtx) n'est jamais détruit et le GPU reste coincé en
+    // P0/100 %/no-process (oblige un `nvidia-smi --gpu-reset`). On capte ces signaux pour
+    // sortir proprement de la boucle : `grind_gen.retire()` ci-dessous fait alors tomber
+    // les threads de grind → leurs `Drop` appellent `pearl_*_destroy` → GPU rendu en idle.
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+
     loop {
-        match job_rx.recv().await {
+        tokio::select! {
+            ev = job_rx.recv() => { match ev {
             Ok(JobEvent::Params(p)) => {
                 tracing::info!(m = p.m, n = p.n, k = p.k, rank = p.rank, "mining params");
                 cur_params = Some(p);
@@ -789,6 +801,10 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("job channel closed — exiting");
                 break;
             }
+            } }
+            _ = sigint.recv()  => { tracing::info!("signal SIGINT reçu — arrêt propre (libération du GPU)…"); break; }
+            _ = sigterm.recv() => { tracing::info!("signal SIGTERM reçu — arrêt propre (libération du GPU)…"); break; }
+            _ = sighup.recv()  => { tracing::info!("signal SIGHUP reçu — arrêt propre (libération du GPU)…"); break; }
         }
     }
 

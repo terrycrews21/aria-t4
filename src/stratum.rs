@@ -166,6 +166,22 @@ async fn run_session(
     let mut next_id: u64 = 1;
     let login = format!("{}.{}", wallet, worker);
 
+    // Stale-share guard. The pool sends `clean_jobs` jobs: the moment a new job
+    // arrives the previous `job_id` is expired pool-side. Submitting an expired
+    // share earns "job not found / stale" (code 21), and a *burst* of those gets
+    // the connection reset for spam — which (combined with grind threads that keep
+    // producing for the frozen job during a drop) turns into an endless
+    // reconnect/stale loop with 0 accepted shares. We fix it by only ever
+    // submitting shares whose `job_id` matches the live job:
+    //  - `current_job_id` is updated on every `mining.notify`,
+    //  - the submit queue is drained on (re)connect (everything buffered is from
+    //    the pre-disconnect job → stale),
+    //  - the submit arm drops any share whose id ≠ the live job.
+    let mut current_job_id: Option<String> = None;
+    let mut dropped_stale: u64 = 0;
+    // Drain shares buffered from the previous (dead) session — all stale now.
+    while submit_rx.try_recv().is_ok() {}
+
     match cfg.dialect {
         Dialect::Pearl => {
             // 1. mining.subscribe — params empty. The pool detects the Pearl wire and
@@ -212,8 +228,10 @@ async fn run_session(
                 let v: Value = serde_json::from_str(&line)
                     .with_context(|| format!("invalid JSON-RPC: {line}"))?;
                 if let Some(method) = v.get("method").and_then(Value::as_str) {
-                    if let Err(e) = handle_notification(method, &v, job_tx) {
-                        tracing::warn!(method, error = %e, "notification parse failed (ignored)");
+                    match handle_notification(method, &v, job_tx) {
+                        Ok(Some(jid)) => current_job_id = Some(jid),
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(method, error = %e, "notification parse failed (ignored)"),
                     }
                 } else {
                     handle_response(&v);
@@ -221,6 +239,15 @@ async fn run_session(
             }
             sub = submit_rx.recv() => {
                 let Some(sub) = sub else { return Ok(SessionEnd::Shutdown); };
+                // Drop shares for any job that is no longer the live one (expired
+                // pool-side). Submitting them only earns code 21 and risks a reset.
+                if share_is_stale(current_job_id.as_deref(), &sub.job_id) {
+                    dropped_stale += 1;
+                    if dropped_stale.is_power_of_two() {
+                        tracing::debug!(stale_job = %sub.job_id, live = ?current_job_id, total = dropped_stale, "dropping stale share");
+                    }
+                    continue;
+                }
                 let params = match cfg.dialect {
                     Dialect::Pearl => json!([login, sub.job_id, sub.proof_base64]),
                     Dialect::LuckyPool => json!({"job_id": sub.job_id, "plain_proof": sub.proof_base64}),
@@ -235,11 +262,20 @@ async fn run_session(
     }
 }
 
+/// A share is stale unless its job id is exactly the live job. Before the first
+/// job of a session (`live == None`) every share is stale (and must be dropped).
+fn share_is_stale(live: Option<&str>, share_job: &str) -> bool {
+    live != Some(share_job)
+}
+
+/// Handle one pool→client notification. Returns `Ok(Some(job_id))` when it was a
+/// new job (so the caller can track the live job for the stale-share guard),
+/// `Ok(None)` otherwise.
 fn handle_notification(
     method: &str,
     msg: &Value,
     job_tx: &broadcast::Sender<JobEvent>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     match method {
         "mining.set_difficulty" => {
@@ -268,19 +304,23 @@ fn handle_notification(
         }
         "mining.notify" => {
             let job = Job::from_params(&params)?;
+            let jid = job.job_id.clone();
             tracing::info!(job_id = %job.job_id, clean = job.clean_jobs, "new job");
             let _ = job_tx.send(JobEvent::NewJob(job));
+            return Ok(Some(jid));
         }
         "pearl.challenge" => {
             // pearl.challenge is an alternative wire payload some pools send instead
             // of `mining.notify`. Same shape: forward as a NewJob if parseable.
             if let Ok(job) = Job::from_params(&params) {
+                let jid = job.job_id.clone();
                 let _ = job_tx.send(JobEvent::NewJob(job));
+                return Ok(Some(jid));
             }
         }
         other => tracing::debug!(method = other, "stratum notification ignored"),
     }
-    Ok(())
+    Ok(None)
 }
 
 fn handle_response(msg: &Value) {
@@ -316,3 +356,20 @@ async fn send(
 // doesn't redefine them).
 pub use crate::protocol::RpcRequest as _StratumRpcRequest;
 pub use crate::protocol::RpcResponse as _StratumRpcResponse;
+
+#[cfg(test)]
+mod tests {
+    use super::share_is_stale;
+
+    #[test]
+    fn stale_guard_semantics() {
+        // No live job yet → everything is stale (dropped until the first notify).
+        assert!(share_is_stale(None, "45173737_500000"));
+        // Live job matches → not stale, gets submitted.
+        assert!(!share_is_stale(Some("45173737_500000"), "45173737_500000"));
+        // A different (older) job id → stale, dropped.
+        assert!(share_is_stale(Some("45173740_500000"), "45173737_500000"));
+        // Same header, different vardiff suffix → still a different job id → stale.
+        assert!(share_is_stale(Some("45173737_600000"), "45173737_500000"));
+    }
+}
