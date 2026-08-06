@@ -652,12 +652,13 @@ extern "C" {
 // ---- contexte persistant : alloc 1× (create), réutilise (grind), free (destroy) ----
 void* pearl_resident_create(int m, int n, int k, int max_hits) {
   Ctx* c = new Ctx(); c->m=m; c->n=n; c->k=k; c->max_hits=max_hits;
-  // noise_rank : env ARIA_RANK (défaut mainnet 128). ≤256 car first/second en uint8.
+  // noise_rank : env ARIA_RANK (défaut mainnet 128). ≥128 depuis le softfork
+  // rank-penalty (v1.3.0) ; ≤256 car first/second en uint8.
   c->rank = 128;
   if (const char* r = getenv("ARIA_RANK")) {
     int v = atoi(r);
-    if (v >= 32 && v <= 256 && (v & (v-1)) == 0) c->rank = v;
-    else { fprintf(stderr, "ARIA_RANK=%s invalide (puissance de 2, 32..256)\n", r); delete c; return nullptr; }
+    if (v >= 128 && v <= 256 && (v & (v-1)) == 0) c->rank = v;
+    else { fprintf(stderr, "ARIA_RANK=%s invalide (puissance de 2, 128..256)\n", r); delete c; return nullptr; }
   }
   c->big_endian = (getenv("ARIA_BE") != nullptr);   // LuckyPool : pow-check big-endian
   c->prop = new cudaDeviceProp(); if(cudaGetDeviceProperties((cudaDeviceProp*)c->prop,0)){delete c; return nullptr;}
@@ -826,7 +827,7 @@ static void launch_chain2(Ctx2* c, int slot, uint64_t seed, const uint8_t job_ke
   stir_kernel<<<1,1,0,s>>>(c->d_ha[slot],c->d_hb[slot],c->d_jk,c->d_as[slot],c->d_bs[slot]);
   // noise_rank : même env ARIA_RANK que le chemin résident (lu 1×, défaut 128).
   static const int rank = [](){ const char* r = getenv("ARIA_RANK"); int v = r ? atoi(r) : 128;
-    return (v >= 32 && v <= 256 && (v & (v-1)) == 0) ? v : 128; }();
+    return (v >= 128 && v <= 256 && (v & (v-1)) == 0) ? v : 128; }();
   perm_k_<<<(k+255)/256,256,0,s>>>(c->d_sla, c->d_as[slot], k, c->d_faA[slot], c->d_saA[slot], rank);
   perm_k_<<<(k+255)/256,256,0,s>>>(c->d_slb, c->d_bs[slot], k, c->d_faB[slot], c->d_saB[slot], rank);
   noise_add_k_<<<m,256,0,s>>>(c->d_sla, c->d_as[slot], m, k, c->d_faA[slot], c->d_saA[slot], c->d_A[slot], rank);

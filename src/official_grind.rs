@@ -443,7 +443,9 @@ pub fn rank_from_env() -> u16 {
     std::env::var("ARIA_RANK")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
-        .filter(|v| (32..=256).contains(v) && v.is_power_of_two())
+        // Min 128 depuis le softfork rank-penalty (v1.3.0) : rank < 128 = rejeté
+        // par le consensus. Max 256 : index de permutation GPU en uint8.
+        .filter(|v| (128..=256).contains(v) && v.is_power_of_two())
         .unwrap_or(128)
 }
 

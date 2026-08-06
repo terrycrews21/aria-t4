@@ -553,13 +553,15 @@ async fn main() -> anyhow::Result<()> {
         None => Dialect::Pearl,
     };
     if dialect == Dialect::LuckyPool {
-        // LuckyPool mainnet impose : kernel MULTISTAGE TMA (cols période-256), rank
-        // 256, pow-check BIG-ENDIAN. On force les gates AVANT toute création de
+        // LuckyPool mainnet impose : kernel MULTISTAGE TMA (cols période-256),
+        // pow-check BIG-ENDIAN. On force les gates AVANT toute création de
         // contexte GPU / appel à canonical_gpu_config (qui les lisent via env).
         // (Respecté seulement si l'opérateur n'a rien forcé lui-même.)
+        // rank 128 depuis le softfork rank-penalty (v1.3.0, mainnet h=96251) :
+        // bound × 128/rank ⇒ 128 = le point neutre, tout rank >128 est pénalisé.
         unsafe {
             if std::env::var("ARIA_TMA_MS").is_err() { std::env::set_var("ARIA_TMA_MS", "1"); }
-            if std::env::var("ARIA_RANK").is_err() { std::env::set_var("ARIA_RANK", "256"); }
+            if std::env::var("ARIA_RANK").is_err() { std::env::set_var("ARIA_RANK", "128"); }
             // Forme mainnet figée (la pool valide m=n=131072 dans le proof soumis).
             if std::env::var("ARIA_BATCH_M").is_err() { std::env::set_var("ARIA_BATCH_M", "131072"); }
             if std::env::var("ARIA_BATCH_N").is_err() { std::env::set_var("ARIA_BATCH_N", "131072"); }
@@ -567,10 +569,13 @@ async fn main() -> anyhow::Result<()> {
             // streamé → économise gen+commit+noise de B (~2.7ms) par setup.
             if std::env::var("ARIA_FIXB").is_err() { std::env::set_var("ARIA_FIXB", "1"); }
         }
-        // Bound = règle CONSENSUS (jackpot LE ≤ target × h·w·k) : le ×h·w·k donne
-        // la difficulté effective réaliste (~2^31 pour target 2^50) qui colle au
-        // rythme de partage observé. Mode LE (pas ARIA_BE). [[fold validé byte-exact]]
-        tracing::info!("dialecte LuckyPool : multistage TMA + rank 256 + 131072² + bound consensus ×h·w·k");
+        // Bound = règle CONSENSUS post-softfork (jackpot LE ≤ target × h·w ×
+        // (dpl/rank) × 128, dpl = k − k%rank) : à rank 128 c'est l'ancien ×h·w·k.
+        // Mode LE (pas ARIA_BE). [[fold validé byte-exact]]
+        tracing::info!(
+            "dialecte LuckyPool : multistage TMA + rank {} + 131072² + bound rank-penalty ×h·w·(dpl/rank)·128",
+            ariaminer::official_grind::rank_from_env()
+        );
     }
 
     let scfg = StratumConfig {
@@ -739,10 +744,14 @@ async fn main() -> anyhow::Result<()> {
                     Ok(mut g) => {
                         if dialect == Dialect::LuckyPool {
                             if let Some(t) = job.full_target {
-                                // Règle CONSENSUS : jackpot little-endian ≤ target ×
-                                // h·w·k (h·w = tuile 8×16 = 128, k = common_dim).
-                                // Le ×h·w·k donne la difficulté effective réaliste.
-                                let factor = 128u64 * params.k as u64;
+                                // Règle CONSENSUS rank-penalty (v1.3.0, mainnet 96251) :
+                                // jackpot LE ≤ target × h·w × (dpl/rank) × 128, avec
+                                // h·w = tuile 8×16 = 128 et dpl = k − k%rank (arithmétique
+                                // entière IDENTIQUE à zk-pow sanity_checks.rs). À rank 128
+                                // le facteur vaut l'ancien ×h·w·k exactement.
+                                let rank = ariaminer::official_grind::rank_from_env() as u64;
+                                let dpl = params.k as u64 - params.k as u64 % rank;
+                                let factor = 128u64 * (dpl / rank) * 128u64;
                                 g.official.bound_le = ariaminer::stratum_to_official::scaled_bound_le_from_target_be(&t, factor);
                             }
                         }
