@@ -38,9 +38,12 @@ fn main() {
         gencode.push("-gencode".into());
         gencode.push(format!("arch=compute_{a},code=sm_{a}"));
     }
+    // Flags nvcc additionnels (ex : ARIA_NVCC_EXTRA=-DARIA_DUMP_TRANSCRIPT pour jackpot_diff)
+    let extra: Vec<String> = env::var("ARIA_NVCC_EXTRA").map(|v| v.split_whitespace().map(String::from).collect()).unwrap_or_default();
     for (src, obj_name) in units {
         let obj = format!("{}/{}", out, obj_name);
         let mut args: Vec<String> = gencode.clone();
+        args.extend(extra.iter().cloned());
         args.extend(["-O3", "-std=c++17",
                    "-Icuda", &format!("-I{}", shim), &format!("-I{}", cutlass), &format!("-I{}", csrc),
                    "--expt-relaxed-constexpr", "-Xcompiler", "-fPIC",

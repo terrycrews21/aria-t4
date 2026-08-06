@@ -29,13 +29,32 @@ __device__ __forceinline__ uint32_t rotl_xor(uint32_t x, uint32_t y) {
   return r ^ y;
 }
 
-// XOR-réduction (arbre lop3) de tous les éléments d'un fragment CuTe (registres).
+// XOR-réduction de tous les éléments d'un fragment CuTe (registres) → 1 u32.
+// Implémentation DÉFAUT = 4 chaînes lop3 indépendantes (profondeur ~N/8) : mesurée
+// +0,8 % kernel vs chaîne série à rek=4 (rank 128, softfork v1.3.0), A/B 3 passes
+// alternées PC2 06/08/2026. XOR associatif/commutatif ⇒ BIT-IDENTIQUE à la série.
+// (ILP8 testé : régression ~0,4 — latence déjà couverte, débit ALU = plancher.)
+// -DARIA_FOLD_SERIAL restaure l'ancienne chaîne pour re-A/B.
 template <typename TensorType>
 __device__ __forceinline__ uint32_t xor_reduction(const TensorType& t) {
   constexpr int N = decltype(size(t))::value;
   static_assert(N > 0, "");
+#ifndef ARIA_FOLD_SERIAL
+  if constexpr (N >= 12) {
+    uint32_t a0 = (uint32_t)t(0), a1 = (uint32_t)t(1), a2 = (uint32_t)t(2), a3 = (uint32_t)t(3);
+    int i = 4;
+    for (; i + 7 < N; i += 8) {
+      a0 = xor3_lop3(a0, (uint32_t)t(i),   (uint32_t)t(i+1));
+      a1 = xor3_lop3(a1, (uint32_t)t(i+2), (uint32_t)t(i+3));
+      a2 = xor3_lop3(a2, (uint32_t)t(i+4), (uint32_t)t(i+5));
+      a3 = xor3_lop3(a3, (uint32_t)t(i+6), (uint32_t)t(i+7));
+    }
+    for (; i < N; ++i) a0 ^= (uint32_t)t(i);
+    return xor3_lop3(a0, a1, a2) ^ a3;
+  }
+#endif
   uint32_t acc = (uint32_t)t(0);
-  // arbre lop3 par triplets (équivalent au cute::fold officiel, déroulé linéaire)
+  // chaîne lop3 par triplets (équivalent au cute::fold officiel, déroulé linéaire)
   int i = 1;
   for (; i + 2 < N; i += 2) acc = xor3_lop3(acc, (uint32_t)t(i), (uint32_t)t(i+1));
   for (; i < N; ++i) acc ^= (uint32_t)t(i);
