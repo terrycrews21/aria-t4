@@ -965,18 +965,18 @@ static void launch_chain2(Ctx2* c, int slot, uint64_t seed, const uint8_t job_ke
     auto kfn=gemm_device_tma_ms<decltype(prob),decltype(cta2),int8_t,decltype(dA),decltype(sAm),decltype(copyA2),decltype(s2rA2),int8_t,decltype(dB),decltype(tma_b),decltype(sBm),decltype(s2rB2),int32_t,decltype(dC),decltype(sCm),decltype(mma2),false>;
     cudaFuncSetAttribute(kfn,cudaFuncAttributeMaxDynamicSharedMemorySize,smem2);
     dim3 grd2(size(ceil_div(m,bM2)),size(ceil_div(n,bN2))),blk2(size(mma2));
-    kfn<<<grd2,blk2,smem2,s>>>(prob,cta2,c->d_A[slot],dA,sAm,copyA2,s2rA2,c->d_B[slot],dB,tma_b,sBm,s2rB2,c->d_C,dC,sCm,mma2,rek,aria_swz_g(),c->d_as[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64);
+    kfn<<<grd2,blk2,smem2,s>>>(prob,cta2,c->d_A[slot],dA,sAm,copyA2,s2rA2,c->d_B[slot],dB,tma_b,sBm,s2rB2,c->d_C,dC,sCm,mma2,rek,aria_swz_g(),c->d_bs[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64);
   } else if (c->grind_blocks > 0) {
     // v0.5.0 : grind PERSISTANT à occupation bridée (G blocs grid-stride) → laisse
     // des SM libres pour que le prologue du slot suivant tourne en concurrence.
     auto kfn=gemm_device_persist<decltype(prob),decltype(cta),int8_t,decltype(dA),decltype(sA),decltype(copyA),decltype(s2rA),int8_t,decltype(dB),decltype(sB),decltype(copyB),decltype(s2rB),int32_t,decltype(dC),decltype(sC),decltype(mma)>;
     cudaFuncSetAttribute(kfn,cudaFuncAttributeMaxDynamicSharedMemorySize,smem);
-    kfn<<<dim3(c->grind_blocks),blk,smem,s>>>(prob,cta,c->d_A[slot],dA,sA,copyA,s2rA,c->d_B[slot],dB,sB,copyB,s2rB,c->d_C,dC,sC,mma,rek,c->d_as[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64,nbx,nby);
+    kfn<<<dim3(c->grind_blocks),blk,smem,s>>>(prob,cta,c->d_A[slot],dA,sA,copyA,s2rA,c->d_B[slot],dB,sB,copyB,s2rB,c->d_C,dC,sC,mma,rek,c->d_bs[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64,nbx,nby);
   } else {
     dim3 grd(nbx,nby);
     auto kfn=gemm_device<decltype(prob),decltype(cta),int8_t,decltype(dA),decltype(sA),decltype(copyA),decltype(s2rA),int8_t,decltype(dB),decltype(sB),decltype(copyB),decltype(s2rB),int32_t,decltype(dC),decltype(sC),decltype(mma)>;
     cudaFuncSetAttribute(kfn,cudaFuncAttributeMaxDynamicSharedMemorySize,smem);
-    kfn<<<grd,blk,smem,s>>>(prob,cta,c->d_A[slot],dA,sA,copyA,s2rA,c->d_B[slot],dB,sB,copyB,s2rB,c->d_C,dC,sC,mma,rek,c->d_as[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64);
+    kfn<<<grd,blk,smem,s>>>(prob,cta,c->d_A[slot],dA,sA,copyA,s2rA,c->d_B[slot],dB,sB,copyB,s2rB,c->d_C,dC,sC,mma,rek,c->d_bs[slot],c->d_bnd[slot],c->d_found[slot],c->d_hr[slot],c->d_hc[slot],64);
   }
 }
 
