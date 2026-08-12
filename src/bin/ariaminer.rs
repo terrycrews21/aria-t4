@@ -761,16 +761,11 @@ async fn main() -> anyhow::Result<()> {
                     Ok(mut g) => {
                         if dialect == Dialect::LuckyPool {
                             if let Some(t) = job.full_target {
-                                // Règle CONSENSUS rank-penalty (v1.3.0, mainnet 96251) :
-                                // jackpot LE ≤ target × h·w × (dpl/rank) × 128, avec
-                                // h·w = tuile 8×16 = 128 et dpl = k − k%rank (arithmétique
-                                // entière IDENTIQUE à zk-pow sanity_checks.rs). À rank 128
-                                // le facteur vaut l'ancien ×h·w·k exactement.
-                                let rank = (params.rank as u64).max(1);
-                                let dpl = params.k as u64 - params.k as u64 % rank;
-                                let tile_size = (params.rows_pattern.len() as u64) * (params.cols_pattern.len() as u64);
-                                let factor = tile_size * dpl;
-                                g.official.bound_le = ariaminer::stratum_to_official::scaled_bound_le_from_target_be(&t, factor);
+                                // LuckyPool's notify target is ALREADY scaled by factor (tile_size * dpl).
+                                // Convert big-endian target directly to little-endian bound.
+                                let mut bound = t;
+                                bound.reverse();
+                                g.official.bound_le = bound;
                             }
                         }
                         Arc::new(g)
