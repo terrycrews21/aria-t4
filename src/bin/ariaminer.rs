@@ -754,9 +754,10 @@ async fn main() -> anyhow::Result<()> {
                                 // h·w = tuile 8×16 = 128 et dpl = k − k%rank (arithmétique
                                 // entière IDENTIQUE à zk-pow sanity_checks.rs). À rank 128
                                 // le facteur vaut l'ancien ×h·w·k exactement.
-                                let rank = ariaminer::official_grind::rank_from_env() as u64;
+                                let rank = (params.rank as u64).max(1);
                                 let dpl = params.k as u64 - params.k as u64 % rank;
-                                let factor = 128u64 * (dpl / rank) * 128u64;
+                                let tile_size = (params.rows_pattern.len() as u64) * (params.cols_pattern.len() as u64);
+                                let factor = tile_size * dpl;
                                 g.official.bound_le = ariaminer::stratum_to_official::scaled_bound_le_from_target_be(&t, factor);
                             }
                         }
