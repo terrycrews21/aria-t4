@@ -129,6 +129,15 @@ void gemm_device_sm75(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor tXsA_p = tXsA(_,_,_,smem_pipe_read);
   Tensor tXsB_p = tXsB(_,_,_,smem_pipe_read);
   auto K_BLOCK_MAX = size<2>(tCrA);
+  // ── Turing double-buffering REGISTRE ────────────────────────────────────────
+  // Pas de cp.async sur sm_75 : une copie globale→smem est SYNCHRONE, donc le CTA
+  // bloque sur la latence DRAM juste avant la barrière de fin de tuile (mesuré :
+  // ~2.8 % du peak IMMA T4). On étage donc par REGISTRES — global→regs émis un
+  // tuile-k EN AVANCE (au k_block 0), regs→smem publié en fin de tuile — pour que
+  // la latence se recouvre avec les MMA de la tuile courante.
+  Tensor tArA = make_fragment_like(tAsA(_,_,_,0));
+  Tensor tBrB = make_fragment_like(tBsB(_,_,_,0));
+  int stage_fill = -1;   // stage smem que le prefetch registre doit publier
 
   if (K_BLOCK_MAX > 1) {
     if constexpr (K_PIPE_MAX > 1) {
@@ -144,6 +153,12 @@ void gemm_device_sm75(ProblemShape shape_MNK, CtaTiler cta_tiler,
     CUTE_UNROLL
     for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
       if (k_block == K_BLOCK_MAX - 1) {
+        // Publication du prefetch registre dans le stage préparé au k_block 0 :
+        // AVANT la barrière, donc visible pour les lectures de la tuile suivante.
+        if (stage_fill >= 0) {
+          copy(tArA, tAsA(_,_,_,stage_fill));
+          copy(tBrB, tBsB(_,_,_,stage_fill));
+        }
         tXsA_p = tXsA(_,_,_,smem_pipe_read);
         tXsB_p = tXsB(_,_,_,smem_pipe_read);
         if constexpr (K_PIPE_MAX > 1) {
@@ -155,8 +170,11 @@ void gemm_device_sm75(ProblemShape shape_MNK, CtaTiler cta_tiler,
       copy(s2r_atom_a, tXsA_p(_,_,k_block_next), tXrA(_,_,k_block_next));
       copy(s2r_atom_b, tXsB_p(_,_,k_block_next), tXrB(_,_,k_block_next));
       if (k_block == 0) {
-        copy(copy_a, tAgA(_,_,_,k_tile_next), tAsA(_,_,_,smem_pipe_write));
-        copy(copy_b, tBgB(_,_,_,k_tile_next), tBsB(_,_,_,smem_pipe_write));
+        // Émission ANTICIPÉE global→registres (latence recouverte par les MMA
+        // de cette tuile). La publication regs→smem a lieu en fin de tuile.
+        stage_fill = smem_pipe_write;
+        copy(copy_a, tAgA(_,_,_,k_tile_next), tArA);
+        copy(copy_b, tBgB(_,_,_,k_tile_next), tBrB);
         cp_async_fence();
         --k_tile_count; if (k_tile_count > 0) ++k_tile_next;
         smem_pipe_write = smem_pipe_read;
@@ -168,9 +186,16 @@ void gemm_device_sm75(ProblemShape shape_MNK, CtaTiler cta_tiler,
         __syncthreads();
         smem.tileacc[threadIdx.x] = 0;          // 128 threads ↔ 128 tuiles
         __syncthreads();
+        // Each thread's 128 cells cover exactly 64 canonical tiles, two cells each,
+        // and the pair is adjacent in the C fragment (verified: cell_tile[2g] ==
+        // cell_tile[2g+1] on every thread). XOR the pair in registers so the fold
+        // issues 64 shared atomics instead of 128 — XOR is associative/commutative,
+        // so the result is bit-identical. The fold, not the GEMM, dominates on
+        // Turing (measured 79% of setup time), so this is the hot loop.
         CUTE_UNROLL
-        for (int i = 0; i < NCELL; ++i)
-          atomicXor(&smem.tileacc[cell_tile[i]], (uint32_t)tCrC(i));
+        for (int g = 0; g < NCELL / 2; ++g)
+          atomicXor(&smem.tileacc[cell_tile[2 * g]],
+                    (uint32_t)tCrC(2 * g) ^ (uint32_t)tCrC(2 * g + 1));
         __syncthreads();
         int idx = (gk / reduce_every_k - 1) % pearl_fold::JACKPOT_SIZE;
         transcript[idx] = pearl_fold::rotl_xor<pearl_fold::HASH_ACCUMULATE_ROTATION>(
