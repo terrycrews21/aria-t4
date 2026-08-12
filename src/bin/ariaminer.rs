@@ -258,7 +258,7 @@ fn spawn_grind(
                         // the new header -> every share recomputed to a random jackpot.
                         if cache.as_ref().map(|c| c.0.as_str()) != Some(job.job_id.as_str()) {
                             let oj = &job.official;
-                            let gconf = canonical_gpu_config(oj.k as u32);
+                            let gconf = oj.config.clone();
                             let gm = oj.m.div_ceil(128) * 128;
                             let gn = oj.n.div_ceil(128) * 128;
                             let job_key = compute_job_key_pub(&oj.header, &gconf);
