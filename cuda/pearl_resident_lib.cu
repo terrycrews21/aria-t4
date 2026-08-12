@@ -347,14 +347,13 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   int m=c->m, n=c->n, k=c->k, max_hits=c->max_hits;
   // VALIDATION étape A (10/06) : mode fix-B (ARIA_FIXB) — b_noise_seed ne dépend QUE de B
   // (official_grind compute_commitment_hash) → on fixe B (gen+commit+noise B faits 1×),
-  // on ne fait varier qu'A. Mesure le gain prologue. s_bfilled réinit si job_key change.
-  static bool s_bfilled = false;
+  // on ne fait varier qu'A. Mesure le gain prologue. c->bfilled réinit si job_key change.
   bool fixb = (getenv("ARIA_FIXB") != nullptr);
   // set_key 1× (job_key change rarement → pas de cudaMemcpyToSymbol sync par setup)
   if (!c->jk_set || memcmp(c->last_jk, job_key, 32) != 0) {
     cudaDeviceSynchronize(); set_key(job_key);
     for (int i=0;i<32;i++) c->last_jk[i]=job_key[i]; c->jk_set=true;
-    s_bfilled = false;
+    c->bfilled = false;
   }
   cudaMemsetAsync(c->d_found,0,4,c->sA);
   if (c->do_timing) cudaEventRecord(c->tStart, c->sA);
@@ -362,7 +361,7 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,c->sA>>>(c->d_A, setup_seed, 0, m, k);
   pearl_simple::commit_simple((const uint8_t*)c->d_A,(size_t)m*k,(uint8_t*)c->d_ha,c->d_jk,c->d_mtA,c->sA);
   cudaEventRecord(c->eA, c->sA);
-  if (!(fixb && s_bfilled)) {   // fix-B : gen+commit B faits 1× seulement
+  if (!(fixb && c->bfilled)) {   // fix-B : gen+commit B faits 1× seulement
     gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256,0,c->sB>>>(c->d_B, setup_seed, 1, n, k);
     pearl_simple::commit_simple((const uint8_t*)c->d_B,(size_t)n*k,(uint8_t*)c->d_hb,c->d_jk,c->d_mtB,c->sB);
   }
@@ -376,12 +375,12 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   perm_k_<<<(k+255)/256,256,0,c->sA>>>(c->d_sla, c->d_as, k, c->d_faA, c->d_saA, c->rank);
   noise_add_k_<<<m,256,0,c->sA>>>(c->d_sla, c->d_as, m, k, c->d_faA, c->d_saA, c->d_A, c->rank);
   cudaStreamWaitEvent(c->sB, c->eStir, 0);
-  if (!(fixb && s_bfilled)) {   // fix-B : noise B fait 1× → d_B garde b_eff résident
+  if (!(fixb && c->bfilled)) {   // fix-B : noise B fait 1× → d_B garde b_eff résident
     perm_k_<<<(k+255)/256,256,0,c->sB>>>(c->d_slb, c->d_bs, k, c->d_faB, c->d_saB, c->rank);
     noise_add_k_<<<n,256,0,c->sB>>>(c->d_slb, c->d_bs, n, k, c->d_faB, c->d_saB, c->d_B, c->rank);
   }
   cudaEventRecord(c->eB, c->sB);
-  if (fixb) s_bfilled = true;
+  if (fixb) c->bfilled = true;
   // Phase 4 : GEMM sur sA (attend noise B via eB) ; pow_key=a_seed, bound=d_bnd
   cudaStreamWaitEvent(c->sA, c->eB, 0);
   if (c->do_timing) cudaEventRecord(c->tPro, c->sA); // fin prologue = juste avant le GEMM
