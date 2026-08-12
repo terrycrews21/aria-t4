@@ -572,7 +572,7 @@ async fn main() -> anyhow::Result<()> {
             if std::env::var("ARIA_BATCH_N").is_err() { std::env::set_var("ARIA_BATCH_N", "131072"); }
             // fix-B : B (b_eff) calculé 1× par job et gardé résident, seul A est
             // streamé → économise gen+commit+noise de B (~2.7ms) par setup.
-            if std::env::var("ARIA_FIXB").is_err() { std::env::set_var("ARIA_FIXB", "1"); }
+            if std::env::var("ARIA_FIXB").is_err() { std::env::set_var("ARIA_FIXB", "0"); }
         }
         // Bound = règle CONSENSUS post-softfork (jackpot LE ≤ target × h·w ×
         // (dpl/rank) × 128, dpl = k − k%rank) : à rank 128 c'est l'ancien ×h·w·k.
