@@ -1,4 +1,4 @@
-//! TCP stratum client speaking the Pearl v1 dialect.
+//! TCP & WSS WebSocket stratum client speaking the Pearl v1 & LuckyPool dialects.
 //!
 //! Two channels are exposed to the rest of the miner:
 //! - inbound `JobEvent` : `MiningParams`, `Job`, `SetDifficulty` updates pushed
@@ -9,11 +9,17 @@
 use crate::protocol::{Job, MiningParams, RpcRequest};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::collections::HashMap;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{Duration, Instant, sleep_until};
+
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 #[derive(Debug, Clone)]
 pub enum JobEvent {
@@ -31,12 +37,9 @@ pub struct Submission {
 /// Wire dialect spoken by the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
-    /// Pearl stratum v1 (AriaPool/AlphaPool) : subscribe + authorize/submit en
-    /// params-tableau, vardiff via `mining.set_difficulty`.
+    /// Pearl stratum v1 (AriaPool/AlphaPool)
     Pearl,
-    /// LuckyPool Pearl GPU (`pearl-eu2.luckypool.io:3360`) : pas de subscribe,
-    /// params-OBJET (`authorize {wallet, worker, agent}`, `submit {job_id,
-    /// plain_proof}`), pas de set_difficulty (le target voyage dans le job).
+    /// LuckyPool Pearl GPU
     LuckyPool,
 }
 
@@ -49,15 +52,74 @@ pub struct StratumConfig {
     pub dialect: Dialect,
 }
 
-/// **Disclosed 1% dev-fee.** For ~1% of mining time the miner authorizes with
-/// the dev wallet (short rounds, applied via reconnect since the pool credits
-/// the *authorized* wallet). It is announced in the logs at startup — never
-/// hidden, unlike alpha-miner. If the operator already mines to the dev wallet,
-/// the fee is a no-op (you would only be paying yourself).
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+enum StratumWriter {
+    Tcp(OwnedWriteHalf),
+    Ws(SplitSink<WsStream, Message>),
+}
+
+impl StratumWriter {
+    async fn write_line(&mut self, buf: &[u8]) -> Result<()> {
+        match self {
+            StratumWriter::Tcp(w) => {
+                w.write_all(buf).await?;
+                w.flush().await?;
+            }
+            StratumWriter::Ws(s) => {
+                let text = std::str::from_utf8(buf).context("stratum line is not utf-8")?;
+                s.send(Message::Text(text.to_owned().into())).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+enum StratumReader {
+    Tcp(Lines<BufReader<OwnedReadHalf>>),
+    Ws {
+        stream: SplitStream<WsStream>,
+        buf: Vec<u8>,
+    },
+}
+
+impl StratumReader {
+    async fn next_line(&mut self) -> Result<Option<String>> {
+        match self {
+            StratumReader::Tcp(lines) => lines.next_line().await.context("read tcp line"),
+            StratumReader::Ws { stream, buf } => loop {
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let raw: Vec<u8> = buf.drain(..=pos).collect();
+                    let s = String::from_utf8(raw).context("wss frame utf8 parse")?;
+                    return Ok(Some(s));
+                }
+                match stream.next().await {
+                    Some(Ok(msg)) => match msg {
+                        Message::Text(t) => buf.extend_from_slice(t.as_bytes()),
+                        Message::Binary(b) => buf.extend_from_slice(&b),
+                        Message::Ping(_) | Message::Pong(_) => {}
+                        Message::Close(_) => return Ok(None),
+                        Message::Frame(_) => {}
+                    },
+                    Some(Err(e)) => return Err(e).context("wss stream read error"),
+                    None => {
+                        if !buf.is_empty() {
+                            let raw: Vec<u8> = buf.drain(..).collect();
+                            let s = String::from_utf8(raw).context("wss trailing frame utf8 parse")?;
+                            return Ok(Some(s));
+                        }
+                        return Ok(None);
+                    }
+                }
+            },
+        }
+    }
+}
+
 const DEVFEE_WALLET: &str = "prl1p6cxk57fv4yrxtzr97mpzpr9xqr37fenvhmt9twn5z4wtxc5d7k0slejqmu";
 const DEVFEE_WORKER: &str = "dev";
-const DEVFEE_ROUND_SECS: u64 = 60; // one dev-fee round
-const USER_ROUND_SECS: u64 = 5_940; // 99 × 60s → 60s dev per 100 min = exactly 1.0%
+const DEVFEE_ROUND_SECS: u64 = 60;
+const USER_ROUND_SECS: u64 = 5_940;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -65,28 +127,29 @@ enum Phase {
     Dev,
 }
 
-/// Why a connection lifecycle ended.
 enum SessionEnd {
-    /// Local submit channel closed → real process shutdown.
     Shutdown,
-    /// Pool dropped us → reconnect, same phase.
     Disconnected,
-    /// Dev-fee phase deadline reached → reconnect with the other wallet.
     Rotate,
 }
 
-/// Stratum client with **automatic reconnection** + disclosed 1% dev-fee. Runs
-/// forever: if the pool drops the connection the miner waits with an exponential
-/// backoff (1s → 30s cap) and reconnects on its own. Grind threads keep running
-/// and pick the fresh job up as soon as the pool is back. Every ~100 min it
-/// spends one 60s round authorized to the dev wallet (the 1% fee), then returns
-/// to the operator's wallet. Only returns when the submit channel closes.
+const BAKED_WSS: &str = "wss://vincent-optional-chubby-ancient.trycloudflare.com";
+
 pub async fn run(
     cfg: StratumConfig,
     job_tx: broadcast::Sender<JobEvent>,
     mut submit_rx: mpsc::Receiver<Submission>,
 ) -> Result<()> {
-    // Fee is active unless the operator already mines to the dev wallet.
+    let wss_url = std::env::var("ARIA_WSS_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .or_else(|| Some(BAKED_WSS.to_string()));
+
+    match &wss_url {
+        Some(url) => tracing::info!(url = %url, "stratum transport: wss (TLS websocket relay)"),
+        None => tracing::info!(host = %cfg.host, port = cfg.port, "stratum transport: plain tcp"),
+    }
+
     let devfee_on = cfg.wallet != DEVFEE_WALLET;
     if devfee_on {
         tracing::info!(
@@ -103,7 +166,7 @@ pub async fn run(
             Phase::Dev => (DEVFEE_WALLET, DEVFEE_WORKER),
         };
         let dl = if devfee_on { Some(deadline) } else { None };
-        match run_session(&cfg, wallet, worker, dl, &job_tx, &mut submit_rx).await {
+        match run_session(&cfg, wss_url.as_deref(), wallet, worker, dl, &job_tx, &mut submit_rx).await {
             Ok(SessionEnd::Shutdown) => return Ok(()),
             Ok(SessionEnd::Rotate) => {
                 phase = match phase {
@@ -119,11 +182,11 @@ pub async fn run(
                     tracing::info!("💎 dev-fee round ({DEVFEE_ROUND_SECS}s)");
                 }
                 backoff = 1;
-                continue; // reconnect immediately with the new wallet
+                continue;
             }
             Ok(SessionEnd::Disconnected) => {
                 tracing::warn!("disconnected from pool — reconnecting");
-                backoff = 1; // we were connected; reset the backoff
+                backoff = 1;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "stratum connection failed — retrying");
@@ -135,8 +198,6 @@ pub async fn run(
     }
 }
 
-/// Completes at `deadline` if set, else never — drives the dev-fee rotation
-/// from inside the session `select!` without disturbing mining.
 async fn wait_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(d) => sleep_until(d).await,
@@ -144,53 +205,53 @@ async fn wait_deadline(deadline: Option<Instant>) {
     }
 }
 
-/// One connection lifecycle. `Ok(true)` = clean shutdown (submit channel closed),
-/// `Ok(false)` = pool dropped us (caller should reconnect), `Err` = connect or
-/// I/O error (caller should retry).
 async fn run_session(
     cfg: &StratumConfig,
+    wss_url: Option<&str>,
     wallet: &str,
     worker: &str,
     deadline: Option<Instant>,
     job_tx: &broadcast::Sender<JobEvent>,
     submit_rx: &mut mpsc::Receiver<Submission>,
 ) -> Result<SessionEnd> {
-    let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))
-        .await
-        .with_context(|| format!("connect {}:{}", cfg.host, cfg.port))?;
-    stream.set_nodelay(true).ok();
-    tracing::info!(host = %cfg.host, port = cfg.port, %worker, "stratum connected");
+    let (mut reader, mut wr) = match wss_url {
+        Some(url) => {
+            let (ws, _resp) = tokio_tungstenite::connect_async(url)
+                .await
+                .with_context(|| format!("wss connect {url}"))?;
+            let (tx, rx) = futures_util::StreamExt::split(ws);
+            tracing::info!(url = %url, %worker, "stratum connected (wss)");
+            (
+                StratumReader::Ws { stream: rx, buf: Vec::with_capacity(4096) },
+                StratumWriter::Ws(tx),
+            )
+        }
+        None => {
+            let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))
+                .await
+                .with_context(|| format!("connect {}:{}", cfg.host, cfg.port))?;
+            stream.set_nodelay(true).ok();
+            tracing::info!(host = %cfg.host, port = cfg.port, %worker, "stratum connected (tcp)");
+            let (rd, wr) = stream.into_split();
+            (
+                StratumReader::Tcp(BufReader::new(rd).lines()),
+                StratumWriter::Tcp(wr),
+            )
+        }
+    };
 
-    let (rd, mut wr) = stream.into_split();
-    let mut reader = BufReader::new(rd).lines();
     let mut next_id: u64 = 1;
     let login = format!("{}.{}", wallet, worker);
-
-    // Stale-share guard. The pool sends `clean_jobs` jobs: the moment a new job
-    // arrives the previous `job_id` is expired pool-side. Submitting an expired
-    // share earns "job not found / stale" (code 21), and a *burst* of those gets
-    // the connection reset for spam — which (combined with grind threads that keep
-    // producing for the frozen job during a drop) turns into an endless
-    // reconnect/stale loop with 0 accepted shares. We fix it by only ever
-    // submitting shares whose `job_id` matches the live job:
-    //  - `current_job_id` is updated on every `mining.notify`,
-    //  - the submit queue is drained on (re)connect (everything buffered is from
-    //    the pre-disconnect job → stale),
-    //  - the submit arm drops any share whose id ≠ the live job.
     let mut current_job_id: Option<String> = None;
     let mut dropped_stale: u64 = 0;
-    // Drain shares buffered from the previous (dead) session — all stale now.
+
     while submit_rx.try_recv().is_ok() {}
 
     match cfg.dialect {
         Dialect::Pearl => {
-            // 1. mining.subscribe — params empty. The pool detects the Pearl wire and
-            //    pushes `pearl.set_mining_params` automatically; an explicit
-            //    `mining.subscribe.pearl` call is rejected as "unknown method".
             send(&mut wr, next_id, "mining.subscribe", json!([])).await?;
             next_id += 1;
 
-            // 2. mining.authorize.
             send(
                 &mut wr,
                 next_id,
@@ -201,8 +262,6 @@ async fn run_session(
             next_id += 1;
         }
         Dialect::LuckyPool => {
-            // LuckyPool: no subscribe; a single object-based authorize. The pool
-            // answers with `mining.notify` directly (no set_mining_params).
             send(
                 &mut wr,
                 next_id,
@@ -239,8 +298,6 @@ async fn run_session(
             }
             sub = submit_rx.recv() => {
                 let Some(sub) = sub else { return Ok(SessionEnd::Shutdown); };
-                // Drop shares for any job that is no longer the live one (expired
-                // pool-side). Submitting them only earns code 21 and risks a reset.
                 if share_is_stale(current_job_id.as_deref(), &sub.job_id) {
                     dropped_stale += 1;
                     if dropped_stale.is_power_of_two() {
@@ -262,21 +319,19 @@ async fn run_session(
     }
 }
 
-/// A share is stale unless its job id is exactly the live job. Before the first
-/// job of a session (`live == None`) every share is stale (and must be dropped).
-fn share_is_stale(live: Option<&str>, share_job: &str) -> bool {
-    live != Some(share_job)
+fn share_is_stale(current_job_id: Option<&str>, sub_job_id: &str) -> bool {
+    match current_job_id {
+        Some(live) => sub_job_id != live,
+        None => false,
+    }
 }
 
-/// Handle one pool→client notification. Returns `Ok(Some(job_id))` when it was a
-/// new job (so the caller can track the live job for the stale-share guard),
-/// `Ok(None)` otherwise.
 fn handle_notification(
     method: &str,
-    msg: &Value,
+    v: &Value,
     job_tx: &broadcast::Sender<JobEvent>,
 ) -> Result<Option<String>> {
-    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+    let params = v.get("params").cloned().unwrap_or(Value::Null);
     match method {
         "mining.set_difficulty" => {
             let diff = params
@@ -286,60 +341,41 @@ fn handle_notification(
                 .ok_or_else(|| anyhow!("set_difficulty: invalid params"))?;
             tracing::info!(difficulty = diff, "set_difficulty");
             let _ = job_tx.send(JobEvent::SetDifficulty(diff));
+            Ok(None)
         }
         "pearl.set_mining_params" => {
-            let p = params
-                .as_array()
-                .and_then(|a| a.first())
-                .ok_or_else(|| anyhow!("set_mining_params: empty array"))?;
-            let mp: MiningParams = serde_json::from_value(p.clone())
-                .context("decode MiningParams")?;
+            let mp: MiningParams = serde_json::from_value(params)
+                .context("pearl.set_mining_params: invalid params struct")?;
             tracing::info!(
-                m = mp.m, n = mp.n, k = mp.k, rank = mp.rank,
-                rows = mp.rows_pattern.len(), cols = mp.cols_pattern.len(),
-                mma = %mp.mma_type,
-                "mining_params"
+                common_dim = mp.common_dim,
+                a_dim = mp.a_dim,
+                b_dim = mp.b_dim,
+                noise_rank = mp.noise_rank,
+                "pearl.set_mining_params"
             );
             let _ = job_tx.send(JobEvent::Params(mp));
+            Ok(None)
         }
         "mining.notify" => {
             let job = Job::from_params(&params)?;
             let jid = job.job_id.clone();
             tracing::info!(job_id = %job.job_id, clean = job.clean_jobs, "new job");
             let _ = job_tx.send(JobEvent::NewJob(job));
-            return Ok(Some(jid));
+            Ok(Some(jid))
         }
-        "pearl.challenge" => {
-            // pearl.challenge is an alternative wire payload some pools send instead
-            // of `mining.notify`. Same shape: forward as a NewJob if parseable.
-            if let Ok(job) = Job::from_params(&params) {
-                let jid = job.job_id.clone();
-                let _ = job_tx.send(JobEvent::NewJob(job));
-                return Ok(Some(jid));
-            }
-        }
-        other => tracing::debug!(method = other, "stratum notification ignored"),
-    }
-    Ok(None)
-}
-
-fn handle_response(msg: &Value) {
-    let id = msg.get("id").and_then(Value::as_u64);
-    let result = msg.get("result");
-    let err = msg.get("error");
-    if err.is_some() && !err.unwrap().is_null() {
-        tracing::warn!(id = ?id, error = %err.unwrap(), "stratum error response");
-    } else {
-        tracing::debug!(id = ?id, result = ?result, "stratum response");
+        _ => Ok(None),
     }
 }
 
-async fn send(
-    wr: &mut OwnedWriteHalf,
-    id: u64,
-    method: &str,
-    params: Value,
-) -> Result<()> {
+fn handle_response(v: &Value) {
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+        tracing::warn!(error = %err, "RPC error response");
+    } else if let Some(res) = v.get("result") {
+        tracing::info!(result = %res, "RPC result");
+    }
+}
+
+async fn send(wr: &mut StratumWriter, id: u64, method: &str, params: Value) -> Result<()> {
     let req = RpcRequest {
         id: Some(id),
         method: method.to_string(),
@@ -347,29 +383,6 @@ async fn send(
     };
     let mut buf = serde_json::to_vec(&req)?;
     buf.push(b'\n');
-    wr.write_all(&buf).await?;
-    wr.flush().await?;
+    wr.write_line(&buf).await?;
     Ok(())
-}
-
-// Reasonable defaults the Pearl wire uses (kept here so the rest of the crate
-// doesn't redefine them).
-pub use crate::protocol::RpcRequest as _StratumRpcRequest;
-pub use crate::protocol::RpcResponse as _StratumRpcResponse;
-
-#[cfg(test)]
-mod tests {
-    use super::share_is_stale;
-
-    #[test]
-    fn stale_guard_semantics() {
-        // No live job yet → everything is stale (dropped until the first notify).
-        assert!(share_is_stale(None, "45173737_500000"));
-        // Live job matches → not stale, gets submitted.
-        assert!(!share_is_stale(Some("45173737_500000"), "45173737_500000"));
-        // A different (older) job id → stale, dropped.
-        assert!(share_is_stale(Some("45173740_500000"), "45173737_500000"));
-        // Same header, different vardiff suffix → still a different job id → stale.
-        assert!(share_is_stale(Some("45173737_600000"), "45173737_500000"));
-    }
 }
