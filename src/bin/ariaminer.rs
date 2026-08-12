@@ -334,7 +334,7 @@ fn spawn_grind(
                                                 });
                                             }
                                         } else {
-                                            tracing::warn!("GPU false hit filtered out by Rust pre-submission check! hash_jackpot > bound");
+                                            tracing::warn!("GPU false hit filtered out by Rust pre-submission check! hash_jackpot={:x}, bound={:x}", hash_u256, bound_u256);
                                         }
                                     }
                                 }
