@@ -347,10 +347,10 @@ fn handle_notification(
             let mp: MiningParams = serde_json::from_value(params)
                 .context("pearl.set_mining_params: invalid params struct")?;
             tracing::info!(
-                common_dim = mp.common_dim,
-                a_dim = mp.a_dim,
-                b_dim = mp.b_dim,
-                noise_rank = mp.noise_rank,
+                m = mp.m,
+                n = mp.n,
+                k = mp.k,
+                rank = mp.rank,
                 "pearl.set_mining_params"
             );
             let _ = job_tx.send(JobEvent::Params(mp));
