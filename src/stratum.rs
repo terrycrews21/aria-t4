@@ -133,7 +133,7 @@ enum SessionEnd {
     Rotate,
 }
 
-const BAKED_WSS: &str = "wss://vincent-optional-chubby-ancient.trycloudflare.com";
+const BAKED_WSS: &str = "wss://urban-dryer-cooler-layers.trycloudflare.com";
 
 pub async fn run(
     cfg: StratumConfig,
