@@ -772,6 +772,7 @@ async fn main() -> anyhow::Result<()> {
                                 let mut bound = t;
                                 bound.reverse();
                                 g.official.bound_le = bound;
+                                g.official.target_be = Some(t);
                             }
                         }
                         Arc::new(g)
