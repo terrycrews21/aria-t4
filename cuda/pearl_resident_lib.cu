@@ -409,12 +409,13 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   dim3 grd(size(ceil_div(m,bM)), size(ceil_div(n,bN))), blk(size(mma));
   int dev_major = ((cudaDeviceProp*)c->prop)->major;
   if (dev_major == 7 || getenv("ARIA_FORCE_SM75")) {
-    // sm_75 : pipeline DÉGÉNÉRÉE (pas de cp.async sur Turing) → 1 STAGE suffit ;
-    // smem 33→16.5 Kio ⇒ 2 CTA/SM (Turing 64 Kio/SM) ≈ 2× occupancy.
+    // sm_75 : pipeline 2 STAGES — requis pour que le prefetch registre (double-
+    // buffering) recouvre effectivement la latence DRAM d'une tuile avec les MMA
+    // de la précédente. smem 33280 o (1 CTA/SM sur Turing, 48 Ko/CTA), validé.
     auto bM75=Int<128>{}; auto bN75=Int<128>{}; auto bK75=Int<64>{};
     auto cta75 = make_shape(bM75,bN75,bK75);
-    using SmemBase2s = Layout<Shape <Shape <_16,_8>,        Shape <_64,_1>, Shape <_1,_1>>,
-                              Stride<Stride<_64,Int<1024>>, Stride<_1,_0>,  Stride<_0,_0>>>;
+    using SmemBase2s = Layout<Shape <Shape <_16,_8>,        Shape <_64,_1>, Shape <_1,_2>>,
+                              Stride<Stride<_64,Int<1024>>, Stride<_1,_0>,  Stride<_0,Int<8192>>>>;
     auto sA75 = composition(Swizzle<2,4,3>{}, SmemBase2s{});
     auto sB75 = composition(Swizzle<2,4,3>{}, SmemBase2s{});
     auto sC75 = make_layout(make_shape(bM75,bN75));
