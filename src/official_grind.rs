@@ -1292,6 +1292,60 @@ mod tests {
         assert!(verified >= 3, "expected >=3 verified proofs, got {verified}");
     }
 
+    /// PRODUCTION-PATH GPU test: resident ctx + `grind2` + `build_proofs_from_setup_gpu_fixb`,
+    /// looped over SEVERAL attempts on ONE context — exactly what the live miner does.
+    /// The historic bug only showed from the 2nd attempt on (fix-B state was a
+    /// process-global static, and the B seed was inferred instead of agreed), so a
+    /// single-shot test could not catch it. Every produced proof must verify.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn resident_fixb_proofs_verify_across_attempts() {
+        use rand::RngCore;
+        let k = 4096usize;
+        let (gm, gn) = (256usize, 256usize);
+        let header = easy_header(0x207f_ffff);
+        let config = canonical_gpu_config(k as u32);
+        let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(header.nbits, &config);
+        let mut bound_le = [0u8; 32];
+        bound.to_little_endian(&mut bound_le);
+        let job_key = compute_job_key_pub(&header, &config);
+        let tile_h = config.rows_pattern.to_list().len();
+        let tile_w = config.cols_pattern.to_list().len();
+
+        let ctx = crate::gpu_ffi::ResidentCtx::new(gm, gn, k, 64);
+        let ca = crate::gpu_ffi::ProofGpuCtx::new(gm, k, 256);
+        let cb = crate::gpu_ffi::ProofGpuCtx::new(gn, k, 256);
+        let mut rng = StdRng::seed_from_u64(0xB0_0B_5EED);
+        let mut b_seed_job: Option<u64> = None;
+        let mut verified = 0usize;
+        for attempt in 0..6 {
+            let setup_seed = rng.next_u64();
+            let next_seed = rng.next_u64();
+            let b_seed = *b_seed_job.get_or_insert(setup_seed);
+            ctx.set_b_seed(b_seed);
+            let (found, hits) = ctx.grind2(setup_seed, next_seed, &job_key, &bound_le);
+            if found <= 0 {
+                continue;
+            }
+            let Some(hit) = hits
+                .into_iter()
+                .find(|h| h.rows.len() == tile_h && h.cols.len() == tile_w)
+            else {
+                continue;
+            };
+            let proofs = build_proofs_from_setup_gpu_fixb(
+                &ca, &cb, setup_seed, b_seed, std::slice::from_ref(&hit), &job_key,
+                gm, gn, k, config.rank as usize, tile_h, tile_w,
+            );
+            for p in &proofs {
+                zk_pow::api::verify::verify_plain_proof(&header, p)
+                    .unwrap_or_else(|e| panic!("attempt {attempt}: proof must verify: {e}"));
+                verified += 1;
+            }
+        }
+        assert!(verified >= 3, "expected >=3 verified proofs, got {verified}");
+    }
+
     /// THE étape-3 deliverable: a proof produced by OUR **GPU** grind must pass the
     /// official node-side verifiers, exactly like the CPU path. This closes the
     /// VERROU (GPU tile ↔ MiningConfiguration): we mine with `canonical_gpu_config`
