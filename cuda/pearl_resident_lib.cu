@@ -6,6 +6,9 @@
 // Build : nvcc -arch=sm_120a -O3 -std=c++17 -I cuda/shim -I<csrc> -I<cutlass>/include
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
+#include <sys/time.h>
+#include <unistd.h>
 #include <cute/tensor.hpp>
 #include "blake3/blake3.cuh"
 #include "tensor_hash/tensor_hash_host.hpp"
@@ -13,7 +16,9 @@
 #include "pearl_gpu_kernel_2x64.cuh"   // gemm_device_2x64 (grind 2×64, v1.1 AlphaPool)
 #include "pearl_gpu_kernel_tma.cuh"    // gemm_device_tma_ms (grind multistage TMA 128×256, v0.6.0-ws)
 #include "pearl_gpu_kernel_cpasync_ms.cuh" // gemm_device_cpasync_ms (jumeau PORTABLE Ampere/Ada, v0.6.3-beta)
-#include "merkle_roots_cpasync.cuh"        // MerkleTreeRootsKernelCpAsync (commit PORTABLE — l'officiel est TMA/SM90-only)
+#include "pearl_gpu_kernel_sm75.cuh"   // gemm_device_sm75 (grind 8×16 contigu TURING T4, sm_75)
+#include "merkle_roots_cpasync.cuh"
+#include "merkle_simple.cuh"          // commit PORTABLE (roots identiques sur tout GPU)        // MerkleTreeRootsKernelCpAsync (commit PORTABLE — l'officiel est TMA/SM90-only)
 using namespace cute;
 
 // v0.6.3 : faut-il le path PORTABLE cp.async (au lieu du TMA Blackwell) ?
@@ -21,7 +26,7 @@ using namespace cute;
 // par ARIA_FORCE_CPASYNC=1 (validation byte-exact du path cp.async sur 5080).
 static bool aria_use_cpasync(int major) {
   if (getenv("ARIA_FORCE_CPASYNC")) return true;
-  return major < 9;   // TMA dispo seulement sm_90 (Hopper) + sm_100/120 (Blackwell)
+  return major >= 8 && major < 9;   // cp.async dispo seulement SM80+ (Ampere/Ada major 8). SM75 (T4) -> simple commit.
 }
 
 // Major du device courant, caché (pour les helpers sans accès au Ctx, ex commit_nokey).
@@ -60,6 +65,25 @@ static int aria_overlap() {
   if (v < 0) { const char* e = getenv("ARIA_OVERLAP"); v = e ? atoi(e) : 0; }
   return v;
 }
+
+static bool aria_trace() {
+  static int v = -1;
+  if (v < 0) { const char* e = getenv("ARIA_TRACE"); v = e ? atoi(e) : 0; }
+  return v != 0;
+}
+
+#define ARIA_NEXT(...) do{ if (aria_trace()) { \
+    struct timeval _tv; gettimeofday(&_tv, NULL); \
+    struct tm _tm; gmtime_r(&_tv.tv_sec, &_tm); \
+    fprintf(stderr, "NEXT: [%02d:%02d:%02d.%03d] ", _tm.tm_hour, _tm.tm_min, _tm.tm_sec, (int)(_tv.tv_usec/1000)); \
+    fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fflush(stderr); \
+    static int _step = 0; \
+    static int _pause_ms = -2; \
+    if (_pause_ms == -2) { const char* s = getenv("ARIA_TRACE_PAUSE_MS"); _pause_ms = s ? atoi(s) : 0; } \
+    if (_pause_ms > 0) { \
+      fprintf(stderr, "[STEP %03d] pause %dms (cuda-host)\n", ++_step, _pause_ms); fflush(stderr); \
+      usleep((useconds_t)_pause_ms * 1000); \
+    } } }while(0)
 
 // --- helpers noise (miroir de pearl_noise_lib.cu, inline) ---
 __device__ __forceinline__ void rh_(uint32_t index, const uint32_t* seed,
@@ -223,7 +247,12 @@ int pearl_gpu_commit_seeds(uint64_t setup_seed, int m, int n, int k,
 template <int kNumConsumerThreads, int kNumStages, int kLeavesPerMTBlock, int kThreadLoadSize = 128>
 static void commit_nokey(const uint8_t* data, uint32_t data_size, uint8_t* out,
                          uint32_t num_blocks, uint8_t* roots, cudaStream_t stream) {
-  if (aria_use_cpasync(aria_device_major())) {
+  int maj = aria_device_major();
+  if (maj < 8) {
+    pearl_simple::commit_simple(data, data_size, out, c_key, (uint32_t*)roots, stream);
+    return;
+  }
+  if (aria_use_cpasync(maj)) {
     // Jumeau portable : même mapping/réduction, staging cp.async (l'officiel crée un
     // descripteur TMA côté hôte → erreur 801 sur Ampere/Ada avant même le launch).
     using KCpa = pearl::MerkleTreeRootsKernelCpAsync<kNumConsumerThreads, kNumStages, kThreadLoadSize>;
@@ -234,6 +263,12 @@ static void commit_nokey(const uint8_t* data, uint32_t data_size, uint8_t* out,
     dim3 grid = KCpa::get_grid_shape(kp), block = KCpa::get_block_shape();
     if (smem_cpa >= 48*1024) cudaFuncSetAttribute(reinterpret_cast<const void*>(rk), cudaFuncAttributeMaxDynamicSharedMemorySize, smem_cpa);
     rk<<<grid, block, smem_cpa, stream>>>(kp);
+    { cudaError_t e = cudaGetLastError();
+      if (e != cudaSuccess)
+        fprintf(stderr, "[commit] cpasync roots launch FAILED: %s (grid=%u,%u,%u blk=%u smem=%d)\n",
+                cudaGetErrorString(e), grid.x, grid.y, grid.z, block.x, smem_cpa);
+      else ARIA_NEXT("commit roots cpasync grid=(%u,%u,%u) blk=%u smem=%d size=%u",
+                     grid.x, grid.y, grid.z, block.x, smem_cpa, data_size); }
   } else {
   using MerkleTreeRootsKernel = pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages, kThreadLoadSize>;
   constexpr static int merkle_roots_smem_size = MerkleTreeRootsKernel::SharedStorageSize;
@@ -252,6 +287,8 @@ static void commit_nokey(const uint8_t* data, uint32_t data_size, uint8_t* out,
     auto bk = cutlass::device_kernel<K>; constexpr static int sm = K::SharedStorageSize;
     if (sm >= 48*1024) cudaFuncSetAttribute(reinterpret_cast<const void*>(bk), cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
     bk<<<K::get_grid_shape(p2), K::get_block_shape(), sm, stream>>>(p2);
+    { cudaError_t e = cudaGetLastError();
+      if (e != cudaSuccess) fprintf(stderr, "[commit] MT(single) launch FAILED: %s smem=%d\n", cudaGetErrorString(e), sm); }
   } else {
     using K = pearl::ComputeBlakeMTKernel<kLeavesPerMTBlock, false>;
     typename K::Arguments a2{ reinterpret_cast<uint32_t*>(roots), num_blocks };
@@ -259,6 +296,8 @@ static void commit_nokey(const uint8_t* data, uint32_t data_size, uint8_t* out,
     auto bk = cutlass::device_kernel<K>; constexpr static int sm = K::SharedStorageSize;
     if (sm >= 48*1024) cudaFuncSetAttribute(reinterpret_cast<const void*>(bk), cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
     bk<<<K::get_grid_shape(p2), K::get_block_shape(), sm, stream>>>(p2);
+    { cudaError_t e = cudaGetLastError();
+      if (e != cudaSuccess) fprintf(stderr, "[commit] MT(multi) launch FAILED: %s smem=%d nbmt=%d\n", cudaGetErrorString(e), sm, nbmt); }
   }
   if (nbmt > 1) {
     using R = pearl::ReduceRootsKernel<kNumConsumerThreads>;
@@ -267,6 +306,8 @@ static void commit_nokey(const uint8_t* data, uint32_t data_size, uint8_t* out,
     auto rr = cutlass::device_kernel<R>; constexpr static int sm = R::SharedStorageSize;
     if (sm >= 48*1024) cudaFuncSetAttribute(reinterpret_cast<const void*>(rr), cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
     rr<<<R::get_grid_shape(p3), R::get_block_shape(), sm, stream>>>(p3);
+    { cudaError_t e = cudaGetLastError();
+      if (e != cudaSuccess) fprintf(stderr, "[commit] reduce launch FAILED: %s smem=%d nbmt=%d\n", cudaGetErrorString(e), sm, nbmt); }
   }
   cudaMemcpyAsync(out, roots, blake3::CHAINING_VALUE_SIZE, cudaMemcpyDeviceToDevice, stream);
 }
@@ -281,6 +322,7 @@ struct Ctx {
   void* prop;                       // cudaDeviceProp*
   int8_t *d_A, *d_B; int32_t* d_C;
   uint32_t *d_jk,*d_bnd,*d_ha,*d_hb,*d_as,*d_bs,*d_sla,*d_slb;
+  uint32_t *d_mtA, *d_mtB;          // scratch arbre Merkle simple (A / B)
   uint8_t *d_ra,*d_rb,*d_faA,*d_saA,*d_faB,*d_saB;
   int *d_found,*d_hr,*d_hc;
   cudaStream_t sA, sB; cudaEvent_t eA, eB, eStir;
@@ -318,11 +360,11 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   if (c->do_timing) cudaEventRecord(c->tStart, c->sA);
   // Phase 1 : A‖B (gen + commit), indépendants
   gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,c->sA>>>(c->d_A, setup_seed, 0, m, k);
-  commit_nokey<256,2,256>((const uint8_t*)c->d_A,(uint32_t)((size_t)m*k),(uint8_t*)c->d_ha,c->nbA,c->d_ra,c->sA);
+  pearl_simple::commit_simple((const uint8_t*)c->d_A,(size_t)m*k,(uint8_t*)c->d_ha,c->d_jk,c->d_mtA,c->sA);
   cudaEventRecord(c->eA, c->sA);
   if (!(fixb && s_bfilled)) {   // fix-B : gen+commit B faits 1× seulement
     gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256,0,c->sB>>>(c->d_B, setup_seed, 1, n, k);
-    commit_nokey<256,2,256>((const uint8_t*)c->d_B,(uint32_t)((size_t)n*k),(uint8_t*)c->d_hb,c->nbB,c->d_rb,c->sB);
+    pearl_simple::commit_simple((const uint8_t*)c->d_B,(size_t)n*k,(uint8_t*)c->d_hb,c->d_jk,c->d_mtB,c->sB);
   }
   cudaEventRecord(c->eB, c->sB);
   // Phase 2 : stir sur sA (attend hash_b côté sB)
@@ -365,6 +407,51 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   // rank/32. ⚠️ ÉTAIT hardcodé 128/32=4 (rank 128) → FAUX à rank 256 (doit être 8).
   int reduce_every_k = c->rank / 32;
   dim3 grd(size(ceil_div(m,bM)), size(ceil_div(n,bN))), blk(size(mma));
+  int dev_major = ((cudaDeviceProp*)c->prop)->major;
+  if (dev_major == 7 || getenv("ARIA_FORCE_SM75")) {
+    auto bM75=Int<128>{}; auto bN75=Int<128>{}; auto bK75=Int<64>{};
+    auto cta75 = make_shape(bM75,bN75,bK75);
+    using SmemBase2s = Layout<Shape <Shape <_16,_8>,        Shape <_64,_1>, Shape <_1,_2>>,
+                              Stride<Stride<_64,Int<1024>>, Stride<_1,_0>,  Stride<_0,Int<8192>>>>;
+    auto sA75 = composition(Swizzle<2,4,3>{}, SmemBase2s{});
+    auto sB75 = composition(Swizzle<2,4,3>{}, SmemBase2s{});
+    auto sC75 = make_layout(make_shape(bM75,bN75));
+    using AtomG75 = Copy_Atom<UniversalCopy<uint128_t>, int8_t>;
+    using TVcopy = Layout<Shape<Shape<_8,_32>,_16>, Stride<Stride<_512,_1>,_32>>;
+    using TilerC = Shape<_32,_128>;
+    TiledCopy<AtomG75, TVcopy, TilerC> copyA75, copyB75;
+    TiledMMA mma75 = make_tiled_mma(SM75_8x8x16_S32S8S8S32_TN{},
+        Layout<Shape<_2,_2,_1>, Stride<_1,_2,_0>>{}, Tile<_32,_32,_32>{});
+    Copy_Atom<SM75_U32x4_LDSM_N, int8_t> s2rA75, s2rB75;
+    int reduce_every_k75 = c->rank / 32;
+    int nbx75 = size(ceil_div(m,bM75)), nby75 = size(ceil_div(n,bN75));
+    int smem75 = int(sizeof(SharedStorageSm75<int8_t,int8_t,decltype(sA75),decltype(sB75)>));
+    dim3 grd75(nbx75, nby75), blk75(size(mma75));
+    auto kfn75 = gemm_device_sm75<decltype(prob),decltype(cta75),
+        int8_t,decltype(dA),decltype(sA75),decltype(copyA75),decltype(s2rA75),
+        int8_t,decltype(dB),decltype(sB75),decltype(copyB75),decltype(s2rB75),
+        int32_t,decltype(dC),decltype(sC75),decltype(mma75)>;
+    cudaFuncSetAttribute(kfn75, cudaFuncAttributeMaxDynamicSharedMemorySize, smem75);
+    ARIA_NEXT("gemm launch sm75 seed=%016llx m=%d n=%d k=%d grid=(%d,%d) blk=%u smem=%d rank=%d reduce_every_k=%d",
+              (unsigned long long)setup_seed, m, n, k, nbx75, nby75, blk75.x, smem75, c->rank, reduce_every_k75);
+    kfn75<<<grd75,blk75,smem75,c->sA>>>(prob,cta75, c->d_A,dA,sA75,copyA75,s2rA75, c->d_B,dB,sB75,copyB75,s2rB75,
+        c->d_C,dC,sC75,mma75, reduce_every_k75, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits, nbx75, nby75);
+    ARIA_NEXT("timing-record tEnd (sm75)");
+    if (c->do_timing) cudaEventRecord(c->tEnd, c->sA);
+    CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
+    if (c->do_timing) {
+      cudaEventElapsedTime(&c->last_pro_ms,   c->tStart, c->tPro);
+      cudaEventElapsedTime(&c->last_grind_ms, c->tPro,   c->tEnd);
+      cudaEventElapsedTime(&c->last_genc_ms,  c->tStart, c->tMid);
+      cudaEventElapsedTime(&c->last_noise_ms, c->tMid,   c->tPro);
+    }
+    ARIA_NEXT("memcpy back found/hits (sm75)");
+    int found=0; CKR(cudaMemcpy(&found,c->d_found,4,cudaMemcpyDeviceToHost));
+    int nret = found<max_hits?found:max_hits;
+    if(nret>0 && hit_rows) CKR(cudaMemcpy(hit_rows,c->d_hr,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+    if(nret>0 && hit_cols) CKR(cudaMemcpy(hit_cols,c->d_hc,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+    return found;
+  }
   if (getenv("ARIA_TMA_MS")) {
     // étape 1 (v0.6.0-ws) : grind MULTISTAGE TMA 128×256 (8 warps, A cp.async + B TMA ring).
     // DumpC=false. ⚠️ PERF ONLY : coords 2×4 PAS encore consensus-validées (bound=0 → 0 hit).
@@ -517,7 +604,7 @@ static void prologue_A_slot(Ctx* c, uint64_t seed, int8_t* dA, uint32_t* dha, ui
   int m=c->m, k=c->k;
   cudaEventRecord(c->p0, s);
   gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,s>>>(dA, seed, 0, m, k);
-  commit_nokey<256,2,256>((const uint8_t*)dA,(uint32_t)((size_t)m*k),(uint8_t*)dha,c->nbA,c->d_ra,s);
+  pearl_simple::commit_simple((const uint8_t*)dA,(size_t)m*k,(uint8_t*)dha,c->d_jk,c->d_mtA,s);
   stir_kernel<<<1,1,0,s>>>(dha,c->d_hb,c->d_jk,das,c->d_bs);
   cudaEventRecord(c->pMid, s);
   perm_k_<<<(k+255)/256,256,0,s>>>(c->d_sla, das, k, c->d_faA, c->d_saA, c->rank);
@@ -558,10 +645,10 @@ static int resident_run2(Ctx* c, uint64_t seed, uint64_t next_seed, int has_next
     slot = 0; cold = true;
     if (c->do_timing) cudaEventRecord(c->tStart, c->sA);
     gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,c->sA>>>(dA_[0], seed, 0, m, k);
-    commit_nokey<256,2,256>((const uint8_t*)dA_[0],(uint32_t)((size_t)m*k),(uint8_t*)dha_[0],c->nbA,c->d_ra,c->sA);
+    pearl_simple::commit_simple((const uint8_t*)dA_[0],(size_t)m*k,(uint8_t*)dha_[0],c->d_jk,c->d_mtA,c->sA);
     if (!c->bfilled) {
       gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256,0,c->sB>>>(c->d_B, seed, 1, n, k);
-      commit_nokey<256,2,256>((const uint8_t*)c->d_B,(uint32_t)((size_t)n*k),(uint8_t*)c->d_hb,c->nbB,c->d_rb,c->sB);
+      pearl_simple::commit_simple((const uint8_t*)c->d_B,(size_t)n*k,(uint8_t*)c->d_hb,c->d_jk,c->d_mtB,c->sB);
     }
     cudaEventRecord(c->eB, c->sB);
     cudaStreamWaitEvent(c->sA, c->eB, 0);
@@ -680,7 +767,9 @@ void* pearl_resident_create(int m, int n, int k, int max_hits) {
     && ok(cudaMalloc(&c->d_faB,k)) && ok(cudaMalloc(&c->d_saB,k))
     && ok(cudaMalloc(&c->d_found,4)) && ok(cudaMalloc(&c->d_hr,(size_t)max_hits*128*4))
     && ok(cudaMalloc(&c->d_hc,(size_t)max_hits*128*4))
-    && ok(cudaMalloc(&c->d_ra,(size_t)(c->nbA+64)*32)) && ok(cudaMalloc(&c->d_rb,(size_t)(c->nbB+64)*32));
+    && ok(cudaMalloc(&c->d_ra,(size_t)(c->nbA+64)*32)) && ok(cudaMalloc(&c->d_rb,(size_t)(c->nbB+64)*32))
+    && ok(cudaMalloc(&c->d_mtA, pearl_simple::msimple_layers_words((size_t)m*k)*4))
+    && ok(cudaMalloc(&c->d_mtB, pearl_simple::msimple_layers_words((size_t)n*k)*4));
   if(!good){ delete (cudaDeviceProp*)c->prop; delete c; return nullptr; }
   // constantes : seed labels A/B
   uint8_t sla[32]={0}, slb[32]={0}; const char* la="A_tensor"; const char* lb="B_tensor";
@@ -769,7 +858,7 @@ void pearl_resident_destroy(void* ctx) {
   Ctx* c = (Ctx*)ctx; if(!c) return;
   cudaEventDestroy(c->tStart); cudaEventDestroy(c->tMid); cudaEventDestroy(c->tPro); cudaEventDestroy(c->tEnd);
   cudaFree(c->d_A);cudaFree(c->d_B);cudaFree(c->d_C);cudaFree(c->d_jk);cudaFree(c->d_bnd);
-  cudaFree(c->d_ha);cudaFree(c->d_hb);cudaFree(c->d_as);cudaFree(c->d_bs);cudaFree(c->d_sla);cudaFree(c->d_slb);
+  cudaFree(c->d_mtA);cudaFree(c->d_mtB);cudaFree(c->d_ha);cudaFree(c->d_hb);cudaFree(c->d_as);cudaFree(c->d_bs);cudaFree(c->d_sla);cudaFree(c->d_slb);
   cudaFree(c->d_faA);cudaFree(c->d_saA);cudaFree(c->d_faB);cudaFree(c->d_saB);
   cudaFree(c->d_found);cudaFree(c->d_hr);cudaFree(c->d_hc);cudaFree(c->d_ra);cudaFree(c->d_rb);
   cudaStreamDestroy(c->sA); cudaStreamDestroy(c->sB);
@@ -811,6 +900,7 @@ struct Ctx2 {
   uint32_t *d_ha[2], *d_hb[2], *d_as[2], *d_bs[2], *d_bnd[2];
   uint8_t *d_ra[2], *d_rb[2], *d_faA[2], *d_saA[2], *d_faB[2], *d_saB[2];
   int *d_found[2], *d_hr[2], *d_hc[2];
+  uint32_t *d_mt[2];                 // scratch arbre Merkle simple (par slot)
 };
 
 
@@ -822,8 +912,8 @@ static void launch_chain2(Ctx2* c, int slot, uint64_t seed, const uint8_t job_ke
   gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,s>>>(c->d_A[slot], seed, 0, m, k);
   gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256,0,s>>>(c->d_B[slot], seed, 1, n, k);
   // commit SANS set_key (clé posée 1× par batch) → overlap réel des streams
-  commit_nokey<256,2,256>((const uint8_t*)c->d_A[slot],(uint32_t)((size_t)m*k),(uint8_t*)c->d_ha[slot],c->nbA,c->d_ra[slot],s);
-  commit_nokey<256,2,256>((const uint8_t*)c->d_B[slot],(uint32_t)((size_t)n*k),(uint8_t*)c->d_hb[slot],c->nbB,c->d_rb[slot],s);
+  pearl_simple::commit_simple((const uint8_t*)c->d_A[slot],(size_t)m*k,(uint8_t*)c->d_ha[slot],c->d_jk,c->d_mt[slot],s);
+  pearl_simple::commit_simple((const uint8_t*)c->d_B[slot],(size_t)n*k,(uint8_t*)c->d_hb[slot],c->d_jk,c->d_mt[slot],s);
   stir_kernel<<<1,1,0,s>>>(c->d_ha[slot],c->d_hb[slot],c->d_jk,c->d_as[slot],c->d_bs[slot]);
   // noise_rank : même env ARIA_RANK que le chemin résident (lu 1×, défaut 128).
   static const int rank = [](){ const char* r = getenv("ARIA_RANK"); int v = r ? atoi(r) : 128;
@@ -897,6 +987,7 @@ void* pearl_resident2_create(int m,int n,int k){
     MK(c->d_ha[s],32);MK(c->d_hb[s],32);MK(c->d_as[s],32);MK(c->d_bs[s],32);MK(c->d_bnd[s],32);
     MK(c->d_faA[s],k);MK(c->d_saA[s],k);MK(c->d_faB[s],k);MK(c->d_saB[s],k);
     MK(c->d_found[s],4);MK(c->d_hr[s],(size_t)64*128*4);MK(c->d_hc[s],(size_t)64*128*4);
+    MK(c->d_mt[s], pearl_simple::msimple_layers_words((size_t)((m>n?m:n))*k)*4);
     MK(c->d_ra[s],(size_t)(c->nbA+64)*32);MK(c->d_rb[s],(size_t)(c->nbB+64)*32); }
   uint8_t sla[32]={0},slb[32]={0}; const char* la="A_tensor";const char* lb="B_tensor";
   for(int i=0;i<8;i++){sla[i]=la[i];slb[i]=lb[i];}
@@ -943,7 +1034,7 @@ void pearl_resident2_destroy(void* ctx){
     cudaFree(c->d_A[s]);cudaFree(c->d_B[s]);cudaFree(c->d_ha[s]);cudaFree(c->d_hb[s]);
     cudaFree(c->d_as[s]);cudaFree(c->d_bs[s]);cudaFree(c->d_bnd[s]);
     cudaFree(c->d_faA[s]);cudaFree(c->d_saA[s]);cudaFree(c->d_faB[s]);cudaFree(c->d_saB[s]);
-    cudaFree(c->d_found[s]);cudaFree(c->d_hr[s]);cudaFree(c->d_hc[s]);cudaFree(c->d_ra[s]);cudaFree(c->d_rb[s]); }
+    cudaFree(c->d_found[s]);cudaFree(c->d_hr[s]);cudaFree(c->d_hc[s]);cudaFree(c->d_ra[s]);cudaFree(c->d_rb[s]);cudaFree(c->d_mt[s]); }
   delete (cudaDeviceProp*)c->prop; delete c;
 }
 }  // extern "C"

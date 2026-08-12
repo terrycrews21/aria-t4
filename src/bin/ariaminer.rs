@@ -37,9 +37,9 @@ use tokio::sync::{broadcast, mpsc};
 #[command(name = "ariaminer", about = "ARIAMiner GPU — Blackwell-native Pearl (PRL) miner · 1% dev-fee (announced)")]
 struct Args {
     #[arg(long)]
-    pool: String,
+    pool: Option<String>,
     #[arg(long)]
-    wallet: String,
+    wallet: Option<String>,
     #[arg(long, default_value = "aria")]
     worker: String,
     #[arg(long, default_value = "x")]
@@ -534,13 +534,16 @@ async fn main() -> anyhow::Result<()> {
         .threads
         .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
 
-    let (host, port) = args
-        .pool
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("--pool must be host:port"))?;
-    let port: u16 = port.parse()?;
+    let pool = args.pool.as_deref().unwrap_or("");
+    let wallet = args.wallet.as_deref().unwrap_or("");
 
-    print_banner(&args.pool, &args.wallet, &args.worker, threads);
+    let (host, port) = if let Some((h, p)) = pool.rsplit_once(':') {
+        (h, p.parse::<u16>().unwrap_or(1200))
+    } else {
+        ("127.0.0.1", 1200)
+    };
+
+    print_banner(if pool.is_empty() { "WSS Proxy" } else { pool }, if wallet.is_empty() { "Proxy Injected" } else { wallet }, &args.worker, threads);
 
     let (job_tx, mut job_rx) = broadcast::channel::<JobEvent>(64);
     let (submit_tx, submit_rx) = mpsc::channel::<Submission>(256);
@@ -549,8 +552,7 @@ async fn main() -> anyhow::Result<()> {
         Some("luckypool") => Dialect::LuckyPool,
         Some("pearl") => Dialect::Pearl,
         Some(other) => anyhow::bail!("--dialect must be \"pearl\" or \"luckypool\", got {other}"),
-        None if host.contains("luckypool") => Dialect::LuckyPool,
-        None => Dialect::Pearl,
+        None => Dialect::LuckyPool,
     };
     if dialect == Dialect::LuckyPool {
         // LuckyPool mainnet impose : kernel MULTISTAGE TMA (cols période-256),
@@ -581,7 +583,7 @@ async fn main() -> anyhow::Result<()> {
     let scfg = StratumConfig {
         host: host.to_string(),
         port,
-        wallet: args.wallet.clone(),
+        wallet: wallet.to_string(),
         worker: args.worker.clone(),
         password: args.password.clone(),
         dialect,
