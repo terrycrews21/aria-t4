@@ -566,7 +566,6 @@ async fn main() -> anyhow::Result<()> {
         // rank 128 depuis le softfork rank-penalty (v1.3.0, mainnet h=96251) :
         // bound × 128/rank ⇒ 128 = le point neutre, tout rank >128 est pénalisé.
         unsafe {
-            if std::env::var("ARIA_TMA_MS").is_err() { std::env::set_var("ARIA_TMA_MS", "1"); }
             if std::env::var("ARIA_RANK").is_err() { std::env::set_var("ARIA_RANK", "128"); }
             // Forme mainnet figée (la pool valide m=n=131072 dans le proof soumis).
             if std::env::var("ARIA_BATCH_M").is_err() { std::env::set_var("ARIA_BATCH_M", "131072"); }
