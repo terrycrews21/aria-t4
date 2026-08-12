@@ -244,12 +244,17 @@ async fn run_session(
     let login = format!("{}.{}", wallet, worker);
     let mut current_job_id: Option<String> = None;
     let mut dropped_stale: u64 = 0;
+    // Correlates in-flight request ids -> what they were, so a bare {"result":true}
+    // response (identical shape for authorize AND submit) can be logged/counted
+    // against the RIGHT thing instead of being ambiguous "RPC result" noise.
+    let mut pending: HashMap<u64, &'static str> = HashMap::new();
 
     while submit_rx.try_recv().is_ok() {}
 
     match cfg.dialect {
         Dialect::Pearl => {
             send(&mut wr, next_id, "mining.subscribe", json!([])).await?;
+            pending.insert(next_id, "mining.subscribe");
             next_id += 1;
 
             send(
@@ -259,6 +264,7 @@ async fn run_session(
                 json!([login, cfg.password]),
             )
             .await?;
+            pending.insert(next_id, "mining.authorize");
             next_id += 1;
         }
         Dialect::LuckyPool => {
@@ -269,6 +275,7 @@ async fn run_session(
                 json!({"wallet": login, "worker": worker, "agent": concat!("ariaminer/", env!("CARGO_PKG_VERSION"))}),
             )
             .await?;
+            pending.insert(next_id, "mining.authorize");
             next_id += 1;
         }
     }
@@ -293,7 +300,7 @@ async fn run_session(
                         Err(e) => tracing::warn!(method, error = %e, "notification parse failed (ignored)"),
                     }
                 } else {
-                    handle_response(&v);
+                    handle_response(&v, &mut pending);
                 }
             }
             sub = submit_rx.recv() => {
@@ -310,6 +317,7 @@ async fn run_session(
                     Dialect::LuckyPool => json!({"job_id": sub.job_id, "plain_proof": sub.proof_base64}),
                 };
                 send(&mut wr, next_id, "mining.submit", params).await?;
+                pending.insert(next_id, "mining.submit");
                 next_id += 1;
             }
             _ = wait_deadline(deadline) => {
@@ -367,11 +375,24 @@ fn handle_notification(
     }
 }
 
-fn handle_response(v: &Value) {
+fn handle_response(v: &Value, pending: &mut HashMap<u64, &'static str>) {
+    let method = v
+        .get("id")
+        .and_then(Value::as_u64)
+        .and_then(|id| pending.remove(&id))
+        .unwrap_or("unknown");
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
-        tracing::warn!(error = %err, "RPC error response");
+        if method == "mining.submit" {
+            tracing::warn!(error = %err, "SHARE REJECTED by pool");
+        } else {
+            tracing::warn!(method, error = %err, "RPC error response");
+        }
     } else if let Some(res) = v.get("result") {
-        tracing::info!(result = %res, "RPC result");
+        if method == "mining.submit" {
+            tracing::info!(result = %res, "SHARE ACCEPTED by pool");
+        } else {
+            tracing::info!(method, result = %res, "RPC result");
+        }
     }
 }
 
