@@ -247,12 +247,16 @@ fn spawn_grind(
                     // que le kernel préfetche son prologue pendant le grind courant.
                     let mut next_seed: u64 = rng.next_u64();
                     let mut gpu_ctx: Option<ariaminer::gpu_ffi::ResidentCtx> = None;
-                    // (job_ptr, job_key, gm, gn, k, rank, tile_h, tile_w, bound_le)
-                    let mut cache: Option<(usize, [u8; 32], usize, usize, usize, usize, usize, usize, [u8; 32])> = None;
+                    // (job_id, job_key, gm, gn, k, rank, tile_h, tile_w, bound_le)
+                    let mut cache: Option<(String, [u8; 32], usize, usize, usize, usize, usize, usize, [u8; 32])> = None;
                     while !stop.load(Ordering::Relaxed) {
                         let job = job_slot.lock().clone();
-                        let job_ptr = Arc::as_ptr(&job) as usize;
-                        if cache.as_ref().map(|c| c.0) != Some(job_ptr) {
+                        // Identify the job by its ID, NEVER by `Arc::as_ptr`: the previous
+                        // Arc is dropped each iteration and the allocator hands the same
+                        // address to the next job (ABA), so a pointer compare silently kept
+                        // a STALE job_key/bound while the packaged proof and the pool used
+                        // the new header -> every share recomputed to a random jackpot.
+                        if cache.as_ref().map(|c| c.0.as_str()) != Some(job.job_id.as_str()) {
                             let oj = &job.official;
                             let gconf = canonical_gpu_config(oj.k as u32);
                             let gm = oj.m.div_ceil(128) * 128;
@@ -272,7 +276,7 @@ fn spawn_grind(
                             // changement de vardiff (job_ptr change mais job_key identique) — sinon désync
                             // avec le kernel C++ ARIA_FIXB (qui garde B tant que le job_key ne change pas).
                             let job_key_changed = cache.as_ref().map(|c| c.1) != Some(job_key);
-                            cache = Some((job_ptr, job_key, gm, gn, oj.k, rank, tile_h, tile_w, oj.bound_le));
+                            cache = Some((job.job_id.clone(), job_key, gm, gn, oj.k, rank, tile_h, tile_w, oj.bound_le));
                             if job_key_changed { b_seed_job = None; }
                         }
                         let (_, job_key, gm, gn, k, rank, tile_h, tile_w, bound_le) =
