@@ -409,10 +409,12 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   dim3 grd(size(ceil_div(m,bM)), size(ceil_div(n,bN))), blk(size(mma));
   int dev_major = ((cudaDeviceProp*)c->prop)->major;
   if (dev_major == 7 || getenv("ARIA_FORCE_SM75")) {
+    // sm_75 : pipeline DÉGÉNÉRÉE (pas de cp.async sur Turing) → 1 STAGE suffit ;
+    // smem 33→16.5 Kio ⇒ 2 CTA/SM (Turing 64 Kio/SM) ≈ 2× occupancy.
     auto bM75=Int<128>{}; auto bN75=Int<128>{}; auto bK75=Int<64>{};
     auto cta75 = make_shape(bM75,bN75,bK75);
-    using SmemBase2s = Layout<Shape <Shape <_16,_8>,        Shape <_64,_1>, Shape <_1,_2>>,
-                              Stride<Stride<_64,Int<1024>>, Stride<_1,_0>,  Stride<_0,Int<8192>>>>;
+    using SmemBase2s = Layout<Shape <Shape <_16,_8>,        Shape <_64,_1>, Shape <_1,_1>>,
+                              Stride<Stride<_64,Int<1024>>, Stride<_1,_0>,  Stride<_0,_0>>>;
     auto sA75 = composition(Swizzle<2,4,3>{}, SmemBase2s{});
     auto sB75 = composition(Swizzle<2,4,3>{}, SmemBase2s{});
     auto sC75 = make_layout(make_shape(bM75,bN75));
@@ -423,7 +425,11 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
     TiledMMA mma75 = make_tiled_mma(SM75_8x8x16_S32S8S8S32_TN{},
         Layout<Shape<_2,_2,_1>, Stride<_1,_2,_0>>{}, Tile<_32,_32,_32>{});
     Copy_Atom<SM75_U32x4_LDSM_N, int8_t> s2rA75, s2rB75;
-    int reduce_every_k75 = c->rank / 32;
+    // Fold : même SÉQUENCE rotl_xor que v1.0/2×64, cadence en MMA-tiles. L'atom SM75
+    // a K=16 → le tiled-MMA avance de 16 colonnes par appel gemm (K_BLOCK_MAX = bK/16
+    // = 4, ≠ SM80 K=32) → reduce_every_k = rank/16 (PAS rank/32). VALIDÉ empiriquement
+    // par probe_consensus.cu : 128/128 à rank/16, 0/128 à rank/32.
+    int reduce_every_k75 = c->rank / 16;
     int nbx75 = size(ceil_div(m,bM75)), nby75 = size(ceil_div(n,bN75));
     int smem75 = int(sizeof(SharedStorageSm75<int8_t,int8_t,decltype(sA75),decltype(sB75)>));
     dim3 grd75(nbx75, nby75), blk75(size(mma75));
@@ -435,7 +441,8 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
     ARIA_NEXT("gemm launch sm75 seed=%016llx m=%d n=%d k=%d grid=(%d,%d) blk=%u smem=%d rank=%d reduce_every_k=%d",
               (unsigned long long)setup_seed, m, n, k, nbx75, nby75, blk75.x, smem75, c->rank, reduce_every_k75);
     kfn75<<<grd75,blk75,smem75,c->sA>>>(prob,cta75, c->d_A,dA,sA75,copyA75,s2rA75, c->d_B,dB,sB75,copyB75,s2rB75,
-        c->d_C,dC,sC75,mma75, reduce_every_k75, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits, nbx75, nby75);
+        c->d_C,dC,sC75,mma75, reduce_every_k75, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits, nbx75, nby75,
+        /*dump debug*/ nullptr, nullptr, nullptr, nullptr);
     ARIA_NEXT("timing-record tEnd (sm75)");
     if (c->do_timing) cudaEventRecord(c->tEnd, c->sA);
     CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
