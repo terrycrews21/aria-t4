@@ -17,14 +17,14 @@ using namespace cute;
 
 static constexpr int kBlockM = 128;
 static constexpr int kBlockN = 512;
-static constexpr int kChunkK = 32;
+static constexpr int kChunkK = 64;
 static constexpr int kMmaK = 16;
 static constexpr int kWarpRows = 8;
 static constexpr int kWarpCols = 4;
 static constexpr int kTilesPerWarp = 8;
 static constexpr int kWarps = kWarpRows * kWarpCols;
 static constexpr int kThreads = kWarps * 32;
-static constexpr int kTranscript = 16;
+static constexpr int kTranscript = 4;
 static constexpr int kRotate = 13;
 static constexpr int kWordsA = (kBlockM * kChunkK) / 4;
 static constexpr int kWordsB = (kBlockN * kChunkK) / 4;
@@ -90,20 +90,22 @@ void grind(const int8_t* __restrict__ a,
   for (int chunk = 0; chunk < chunks; ++chunk) {
     const int k_offset = chunk * kChunkK;
 
-    if (tid < 256) {
-      int row = tid / 2;
-      int col_vec = tid % 2;
+    if (tid < 512) {
+      int row = tid / 4;
+      int col_vec = tid % 4;
       const uint4* ptr_a = reinterpret_cast<const uint4*>(
           a + static_cast<size_t>(row_base + row) * k + k_offset + col_vec * 16);
       reinterpret_cast<uint4*>(stages)[tid] = __ldg(ptr_a);
     }
 
-    {
-      int cidx = tid / 2;
-      int col_vec = tid % 2;
+    #pragma unroll
+    for (int q = 0; q < 2; ++q) {
+      int vec_idx = tid + q * 1024;
+      int cidx = vec_idx / 4;
+      int col_vec = vec_idx % 4;
       const uint4* ptr_bt = reinterpret_cast<const uint4*>(
           bt + static_cast<size_t>(col_base + cidx) * k + k_offset + col_vec * 16);
-      reinterpret_cast<uint4*>(stages + kWordsA)[tid] = __ldg(ptr_bt);
+      reinterpret_cast<uint4*>(stages + kWordsA)[vec_idx] = __ldg(ptr_bt);
     }
 
     __syncthreads();
@@ -157,7 +159,9 @@ void grind(const int8_t* __restrict__ a,
       auto message = make_tensor<uint32_t>(Int<16>{});
       auto cv = make_tensor<uint32_t>(Int<8>{});
       #pragma unroll
-      for (int i = 0; i < 16; ++i) message(i) = transcripts[warp][tile][i];
+      for (int i = 0; i < 16; ++i) {
+        message(i) = (i < kTranscript) ? transcripts[warp][tile][i] : 0;
+      }
       #pragma unroll
       for (int i = 0; i < 8; ++i) cv(i) = pow_key[i];
       blake3::compress_msg_block_u32(message, cv, blake3::COMPRESS_PARAMS_SINGLE_BLOCK_KEYED);
