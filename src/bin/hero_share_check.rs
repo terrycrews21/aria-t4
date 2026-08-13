@@ -20,13 +20,18 @@ use ariaminer::stratum_to_official::{config_from_params, share_bound_le};
 use primitive_types::U256;
 
 fn herominers_default_params() -> MiningParams {
+    let cols_pattern = if std::env::var("ARIA_TMA_MS").is_ok() {
+        vec![0, 1, 32, 33, 64, 65, 96, 97, 128, 129, 160, 161, 192, 193, 224, 225]
+    } else {
+        vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113]
+    };
     MiningParams {
-        m: 131_072,
-        n: 131_072,
+        m: 16_384,
+        n: 65_536,
         k: 8192,
         rank: 128,
         rows_pattern: vec![0, 8, 32, 40, 64, 72, 96, 104],
-        cols_pattern: vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
+        cols_pattern,
         mma_type: "Int7xInt7ToInt32".into(),
     }
 }
