@@ -102,15 +102,24 @@ impl Job {
                 .and_then(Value::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("notify: missing u64 param {i}"))
         };
+        let target_nbits = s(5)?;
+        let clean_target = target_nbits.trim_start_matches("0x");
+        let full_target = if clean_target.len() == 64 {
+            hex::decode(clean_target).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        } else if clean_target.len() == 8 {
+            decode_nbits(clean_target).ok()
+        } else {
+            None
+        };
         Ok(Job {
             job_id: s(0)?,
             prev_block_id: s(1)?,
             header_template: s(2)?,
             ntime: u(3)? as u32,
             aux: s(4)?,
-            target_nbits: s(5)?,
+            target_nbits,
             clean_jobs: arr.get(6).and_then(Value::as_bool).unwrap_or(true),
-            full_target: None,
+            full_target,
         })
     }
 

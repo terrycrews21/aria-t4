@@ -112,6 +112,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "pearl-blake3",
+ "primitive-types 0.12.2",
  "rand 0.8.6",
  "rayon",
  "serde",

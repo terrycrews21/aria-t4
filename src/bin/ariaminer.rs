@@ -773,12 +773,17 @@ async fn main() -> anyhow::Result<()> {
                     Ok(mut g) => {
                         if dialect == Dialect::LuckyPool {
                             if let Some(t) = job.full_target {
-                                // LuckyPool's notify target is ALREADY scaled by factor (tile_size * dpl).
-                                // Convert big-endian target directly to little-endian bound.
                                 let mut bound = t;
                                 bound.reverse();
                                 g.official.bound_le = bound;
                                 g.official.target_be = Some(t);
+                                tracing::info!(
+                                    target_hex = %hex::encode(&t[..8]),
+                                    bound_le_hi = %hex::encode(&bound[24..]),
+                                    "LuckyPool target bound applied"
+                                );
+                            } else {
+                                tracing::warn!("LuckyPool job missing full_target! Using share_bound_le fallback");
                             }
                         }
                         Arc::new(g)
