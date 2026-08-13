@@ -79,13 +79,25 @@ fn luckypool_default_params() -> MiningParams {
 /// indices); m/n are the miner's own batch (advisory). Canonical GPU MMA
 /// fragment 8×16, rank 128, k=8192 (post-fork mainnet shape).
 fn herominers_default_params() -> MiningParams {
+    // The multistage 128×256 kernel maps each winning thread fragment to the
+    // period-256 column pattern measured by `tma_coords_dump`. The baseline
+    // 128×128 kernel maps to period 128. The config is part of job_key, so this
+    // MUST track the selected kernel or every otherwise-good hit fails the
+    // verifier's Merkle/job-key reconstruction before submission.
+    let cols_pattern = if std::env::var("ARIA_TMA_MS").is_ok() {
+        vec![0, 1, 32, 33, 64, 65, 96, 97, 128, 129, 160, 161, 192, 193, 224, 225]
+    } else {
+        vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113]
+    };
     MiningParams {
-        m: 131_072,
-        n: 131_072,
+        // PeakMiner's accepted proofs use these dimensions on both Ampere and
+        // B200. Modal A10 sweeps also beat 131072² (48.4 vs 46.4 TH/s) here.
+        m: 16_384,
+        n: 65_536,
         k: 8192,
         rank: 128,
         rows_pattern: vec![0, 8, 32, 40, 64, 72, 96, 104],
-        cols_pattern: vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
+        cols_pattern,
         mma_type: "Int7xInt7ToInt32".into(),
     }
 }
@@ -647,7 +659,7 @@ async fn main() -> anyhow::Result<()> {
             if std::env::var("ARIA_BATCH_N").is_err() { std::env::set_var("ARIA_BATCH_N", "131072"); }
             // fix-B : B (b_eff) calculé 1× par job et gardé résident, seul A est
             // streamé → économise gen+commit+noise de B (~2.7ms) par setup.
-            if std::env::var("ARIA_FIXB").is_err() { std::env::set_var("ARIA_FIXB", "0"); }
+            if std::env::var("ARIA_FIXB").is_err() { std::env::set_var("ARIA_FIXB", "1"); }
         }
         // Bound = règle CONSENSUS post-softfork (jackpot LE ≤ target × h·w ×
         // (dpl/rank) × 128, dpl = k − k%rank) : à rank 128 c'est l'ancien ×h·w·k.
@@ -655,6 +667,33 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             "dialecte LuckyPool : multistage TMA + rank {} + 131072² + bound rank-penalty ×h·w·(dpl/rank)·128",
             ariaminer::official_grind::rank_from_env()
+        );
+    }
+
+    // HeroMiners sends no `pearl.set_mining_params`; the proof config is miner-
+    // chosen and consensus validates the declared dimensions. The former generic
+    // fallback in build_official_job was 1024×1024, which made the 0.2 ms
+    // gen+commit+noise prologue roughly half of every 0.4 ms setup and measured
+    // only ~24 TH/s on an RTX 3080 Ti. PeakMiner and the official/open miners
+    // amortize setup across large grids and keep B resident. Match that proven
+    // strategy by default: PeakMiner’s accepted 16384×65536 grid, fix-B,
+    // and the consensus-mapped multistage kernel (B is a valid miner choice and can
+    // remain fixed for the job; only A varies per attempt).
+    #[cfg(feature = "gpu")]
+    if dialect == Dialect::HeroMiners {
+        unsafe {
+            if std::env::var("ARIA_RANK").is_err() { std::env::set_var("ARIA_RANK", "128"); }
+            if std::env::var("ARIA_BATCH_M").is_err() { std::env::set_var("ARIA_BATCH_M", "16384"); }
+            if std::env::var("ARIA_BATCH_N").is_err() { std::env::set_var("ARIA_BATCH_N", "65536"); }
+            if std::env::var("ARIA_FIXB").is_err() { std::env::set_var("ARIA_FIXB", "1"); }
+            if std::env::var("ARIA_TMA_MS").is_err() { std::env::set_var("ARIA_TMA_MS", "1"); }
+        }
+        tracing::info!(
+            batch_m = %std::env::var("ARIA_BATCH_M").unwrap_or_default(),
+            batch_n = %std::env::var("ARIA_BATCH_N").unwrap_or_default(),
+            fix_b = %std::env::var("ARIA_FIXB").unwrap_or_default(),
+            multistage = %std::env::var("ARIA_TMA_MS").unwrap_or_default(),
+            "HeroMiners GPU amortization defaults"
         );
     }
 
