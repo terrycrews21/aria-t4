@@ -30,8 +30,9 @@ static constexpr int kWarps = kWarpRows * kWarpCols;
 static constexpr int kThreads = kWarps * 32;
 static constexpr int kTranscript = 16;
 static constexpr int kRotate = 13;
-static constexpr int kWordsA = (kBlockM * kKWindow) / 4;
-static constexpr int kWordsB = (kBlockN * kKWindow) / 4;
+static constexpr int kRankBlock = 128;
+static constexpr int kWordsA = (kBlockM * kRankBlock) / 4;
+static constexpr int kWordsB = (kBlockN * kRankBlock) / 4;
 static constexpr int kWordsStage = kWordsA + kWordsB;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
@@ -74,118 +75,91 @@ void grind(const int8_t* __restrict__ a,
   const int warp_col0 = col_base + warp_n * 16;
   const int warp_col1 = warp_col0 + 128;
 
-  __shared__ __align__(16) uint32_t stage_words[2][kWordsStage];
+  __shared__ __align__(16) uint32_t stage_words[kWordsStage];
   __shared__ __align__(16) uint32_t transcripts[kWarps][2][kTranscript];
 
+  if (rank != kRankBlock) return;
   if (lane < kTranscript) {
     transcripts[warp][0][lane] = 0;
     transcripts[warp][1][lane] = 0;
   }
 
-  // Each of 1024 threads owns one flat word, while threads 0..255 also own a
-  // second word. Global loads land in registers one window early; the barrier
-  // publishes them only after the previous stage has finished reading.
-  uint32_t next0 = 0, next1 = 0;
-  bool valid0 = false, valid1 = false;
-  auto prefetch = [&](int k_offset) {
-    int flat = tid;
-    valid0 = flat < kWordsStage;
-    if (valid0) {
+  int32_t acc0[8] = {0,0,0,0,0,0,0,0};
+  int32_t acc1[8] = {0,0,0,0,0,0,0,0};
+  const int rank_blocks = k / kRankBlock;
+
+  // Stage one complete rank window. The old implementation staged 16 K bytes
+  // and synchronized after every MMA window (512 barriers at k=8192). Rank-128
+  // staging uses two barriers per rank block (128 total), without reducing
+  // occupancy: this 1024-thread CTA already limits Turing to one CTA/SM and the
+  // 44 KiB shared footprint stays under T4's 64 KiB/SM.
+  for (int rank_block = 0; rank_block < rank_blocks; ++rank_block) {
+    const int k_offset = rank_block * kRankBlock;
+    for (int flat = tid; flat < kWordsStage; flat += kThreads) {
       if (flat < kWordsA) {
         int byte = flat * 4;
-        int r = byte / kKWindow;
-        int c = byte % kKWindow;
-        next0 = __ldg(reinterpret_cast<const uint32_t*>(
+        int r = byte / kRankBlock;
+        int c = byte % kRankBlock;
+        stage_words[flat] = __ldg(reinterpret_cast<const uint32_t*>(
             a + static_cast<size_t>(row_base + r) * k + k_offset + c));
       } else {
         int byte = (flat - kWordsA) * 4;
-        int cidx = byte / kKWindow;
-        int c = byte % kKWindow;
-        next0 = __ldg(reinterpret_cast<const uint32_t*>(
+        int cidx = byte / kRankBlock;
+        int c = byte % kRankBlock;
+        stage_words[flat] = __ldg(reinterpret_cast<const uint32_t*>(
             bt + static_cast<size_t>(col_base + cidx) * k + k_offset + c));
       }
     }
-    flat += kThreads;
-    valid1 = flat < kWordsStage;
-    if (valid1) {
-      int byte = (flat - kWordsA) * 4;  // second word is always in B region
-      int cidx = byte / kKWindow;
-      int c = byte % kKWindow;
-      next1 = __ldg(reinterpret_cast<const uint32_t*>(
-          bt + static_cast<size_t>(col_base + cidx) * k + k_offset + c));
-    }
-  };
-  auto publish = [&](int stage) {
-    int flat = tid;
-    if (valid0) stage_words[stage][flat] = next0;
-    flat += kThreads;
-    if (valid1) stage_words[stage][flat] = next1;
-  };
+    __syncthreads();
 
-  int32_t acc0[8] = {0,0,0,0,0,0,0,0};
-  int32_t acc1[8] = {0,0,0,0,0,0,0,0};
-  const int windows = k / kKWindow;
-  const int windows_per_rank = rank / kKWindow;
-
-  prefetch(0);
-  publish(0);
-  __syncthreads();
-
-  for (int window = 0; window < windows; ++window) {
-    const int current = window & 1;
-    const bool have_next = window + 1 < windows;
-    if (have_next) prefetch((window + 1) * kKWindow);
-
-    const uint32_t* sa = stage_words[current];
-    const uint32_t* sb = stage_words[current] + kWordsA;
+    const uint32_t* sa = stage_words;
+    const uint32_t* sb = stage_words + kWordsA;
     const int a_row0 = warp_m * 16 + lane_group;
     const int a_row1 = a_row0 + 8;
-    const uint32_t a0 = sa[a_row0 * 4 + lane_quad];
-    const uint32_t a1 = sa[a_row1 * 4 + lane_quad];
-
     const int b00 = warp_n * 16 + lane_group;
     const int b01 = b00 + 8;
     const int b10 = b00 + 128;
     const int b11 = b10 + 8;
-    const uint32_t b00v = sb[b00 * 4 + lane_quad];
-    const uint32_t b01v = sb[b01 * 4 + lane_quad];
-    const uint32_t b10v = sb[b10 * 4 + lane_quad];
-    const uint32_t b11v = sb[b11 * 4 + lane_quad];
 
-    mma_8x8x16(acc0[0], acc0[1], a0, b00v);
-    mma_8x8x16(acc0[2], acc0[3], a1, b00v);
-    mma_8x8x16(acc0[4], acc0[5], a0, b01v);
-    mma_8x8x16(acc0[6], acc0[7], a1, b01v);
-    mma_8x8x16(acc1[0], acc1[1], a0, b10v);
-    mma_8x8x16(acc1[2], acc1[3], a1, b10v);
-    mma_8x8x16(acc1[4], acc1[5], a0, b11v);
-    mma_8x8x16(acc1[6], acc1[7], a1, b11v);
+    #pragma unroll
+    for (int sub = 0; sub < kRankBlock / kKWindow; ++sub) {
+      const int sub_offset = sub * kKWindow + lane_quad * 4;
+      const uint32_t a0 = sa[a_row0 * (kRankBlock / 4) + sub_offset / 4];
+      const uint32_t a1 = sa[a_row1 * (kRankBlock / 4) + sub_offset / 4];
+      const uint32_t b00v = sb[b00 * (kRankBlock / 4) + sub_offset / 4];
+      const uint32_t b01v = sb[b01 * (kRankBlock / 4) + sub_offset / 4];
+      const uint32_t b10v = sb[b10 * (kRankBlock / 4) + sub_offset / 4];
+      const uint32_t b11v = sb[b11 * (kRankBlock / 4) + sub_offset / 4];
 
-    if (have_next) {
-      publish(1 - current);
-      __syncthreads();
+      mma_8x8x16(acc0[0], acc0[1], a0, b00v);
+      mma_8x8x16(acc0[2], acc0[3], a1, b00v);
+      mma_8x8x16(acc0[4], acc0[5], a0, b01v);
+      mma_8x8x16(acc0[6], acc0[7], a1, b01v);
+      mma_8x8x16(acc1[0], acc1[1], a0, b10v);
+      mma_8x8x16(acc1[2], acc1[3], a1, b10v);
+      mma_8x8x16(acc1[4], acc1[5], a0, b11v);
+      mma_8x8x16(acc1[6], acc1[7], a1, b11v);
     }
 
-    if (((window + 1) % windows_per_rank) == 0) {
-      uint32_t x0 = 0, x1 = 0;
-      #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        x0 ^= static_cast<uint32_t>(acc0[i]);
-        x1 ^= static_cast<uint32_t>(acc1[i]);
-      }
-      #pragma unroll
-      for (int mask = 16; mask > 0; mask >>= 1) {
-        x0 ^= __shfl_xor_sync(0xffffffffu, x0, mask);
-        x1 ^= __shfl_xor_sync(0xffffffffu, x1, mask);
-      }
-      if (lane == 0) {
-        int transcript_index = ((window + 1) / windows_per_rank - 1) % kTranscript;
-        transcripts[warp][0][transcript_index] =
-            rotl13_xor(transcripts[warp][0][transcript_index], x0);
-        transcripts[warp][1][transcript_index] =
-            rotl13_xor(transcripts[warp][1][transcript_index], x1);
-      }
+    uint32_t x0 = 0, x1 = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      x0 ^= static_cast<uint32_t>(acc0[i]);
+      x1 ^= static_cast<uint32_t>(acc1[i]);
     }
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      x0 ^= __shfl_xor_sync(0xffffffffu, x0, mask);
+      x1 ^= __shfl_xor_sync(0xffffffffu, x1, mask);
+    }
+    if (lane == 0) {
+      int transcript_index = rank_block % kTranscript;
+      transcripts[warp][0][transcript_index] =
+          rotl13_xor(transcripts[warp][0][transcript_index], x0);
+      transcripts[warp][1][transcript_index] =
+          rotl13_xor(transcripts[warp][1][transcript_index], x1);
+    }
+    __syncthreads();
   }
 
   if (lane == 0) {
