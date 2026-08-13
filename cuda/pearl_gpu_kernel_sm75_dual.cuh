@@ -85,35 +85,32 @@ void grind(const int8_t* __restrict__ a,
     #pragma unroll
     for (int i = 0; i < 8; ++i) acc[tile][i] = 0;
 
-  uint32_t prefetched[kPrefetchWords];
-  bool valid[kPrefetchWords];
+  uint4 prefetched_a;
+  uint4 prefetched_b;
+  const bool has_a = tid < (kWordsA / 4);
+
   auto prefetch = [&](int k_offset) {
-    #pragma unroll
-    for (int q = 0; q < kPrefetchWords; ++q) {
-      int flat = tid + q * kThreads;
-      valid[q] = flat < kWordsStage;
-      if (!valid[q]) continue;
-      if (flat < kWordsA) {
-        int byte = flat * 4;
-        int r = byte / kChunkK;
-        int c = byte % kChunkK;
-        prefetched[q] = __ldg(reinterpret_cast<const uint32_t*>(
-            a + static_cast<size_t>(row_base + r) * k + k_offset + c));
-      } else {
-        int byte = (flat - kWordsA) * 4;
-        int cidx = byte / kChunkK;
-        int c = byte % kChunkK;
-        prefetched[q] = __ldg(reinterpret_cast<const uint32_t*>(
-            bt + static_cast<size_t>(col_base + cidx) * k + k_offset + c));
-      }
+    if (has_a) {
+      int row = tid / 2;
+      int col_vec = tid % 2;
+      const uint4* ptr_a = reinterpret_cast<const uint4*>(
+          a + static_cast<size_t>(row_base + row) * k + k_offset + col_vec * 16);
+      prefetched_a = __ldg(ptr_a);
+    }
+    {
+      int cidx = tid / 2;
+      int col_vec = tid % 2;
+      const uint4* ptr_bt = reinterpret_cast<const uint4*>(
+          bt + static_cast<size_t>(col_base + cidx) * k + k_offset + col_vec * 16);
+      prefetched_b = __ldg(ptr_bt);
     }
   };
+
   auto publish = [&](int stage) {
-    #pragma unroll
-    for (int q = 0; q < kPrefetchWords; ++q) {
-      int flat = tid + q * kThreads;
-      if (valid[q]) stages[stage][flat] = prefetched[q];
+    if (has_a) {
+      reinterpret_cast<uint4*>(stages[stage])[tid] = prefetched_a;
     }
+    reinterpret_cast<uint4*>(stages[stage] + kWordsA)[tid] = prefetched_b;
   };
 
   const int chunks = k / kChunkK;
