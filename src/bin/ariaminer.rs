@@ -276,6 +276,11 @@ fn spawn_grind(
                             // changement de vardiff (job_ptr change mais job_key identique) — sinon désync
                             // avec le kernel C++ ARIA_FIXB (qui garde B tant que le job_key ne change pas).
                             let job_key_changed = cache.as_ref().map(|c| c.1) != Some(job_key);
+                            tracing::info!(
+                                job_id = %job.job_id,
+                                bound_le = %hex::encode(&oj.bound_le),
+                                "Updated GPU job cache"
+                            );
                             cache = Some((job.job_id.clone(), job_key, gm, gn, oj.k, rank, tile_h, tile_w, oj.bound_le));
                             if job_key_changed { b_seed_job = None; }
                         }
@@ -341,7 +346,7 @@ fn spawn_grind(
                                                 });
                                             }
                                         } else {
-                                            tracing::warn!("GPU false hit filtered out by Rust pre-submission check! hash_u256={:x}", hash_u256);
+                                            tracing::warn!("GPU false hit filtered out by Rust pre-submission check! hash_u256={:x} bound_u256={:x}", hash_u256, bound_u256);
                                         }
                                     }
                                 }
