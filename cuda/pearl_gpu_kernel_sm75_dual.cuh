@@ -15,11 +15,11 @@
 namespace aria_sm75_dual {
 using namespace cute;
 
-static constexpr int kBlockM = 64;
+static constexpr int kBlockM = 128;
 static constexpr int kBlockN = 512;
-static constexpr int kChunkK = 64;
+static constexpr int kChunkK = 32;
 static constexpr int kMmaK = 16;
-static constexpr int kWarpRows = 4;
+static constexpr int kWarpRows = 8;
 static constexpr int kWarpCols = 4;
 static constexpr int kTilesPerWarp = 8;
 static constexpr int kWarps = kWarpRows * kWarpCols;
@@ -45,7 +45,7 @@ __device__ __forceinline__ uint32_t rotl13_xor(uint32_t previous, uint32_t value
 #endif
 
 template <bool BigEndian = false>
-__global__ __launch_bounds__(kThreads, 2)
+__global__ __launch_bounds__(kThreads, 1)
 void grind(const int8_t* __restrict__ a,
            const int8_t* __restrict__ bt,
            int m, int n, int k, int rank,
@@ -91,21 +91,19 @@ void grind(const int8_t* __restrict__ a,
     const int k_offset = chunk * kChunkK;
 
     if (tid < 256) {
-      int row = tid / 4;
-      int col_vec = tid % 4;
+      int row = tid / 2;
+      int col_vec = tid % 2;
       const uint4* ptr_a = reinterpret_cast<const uint4*>(
           a + static_cast<size_t>(row_base + row) * k + k_offset + col_vec * 16);
       reinterpret_cast<uint4*>(stages)[tid] = __ldg(ptr_a);
     }
 
-    #pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      int vec_idx = tid + q * 512;
-      int cidx = vec_idx / 4;
-      int col_vec = vec_idx % 4;
+    {
+      int cidx = tid / 2;
+      int col_vec = tid % 2;
       const uint4* ptr_bt = reinterpret_cast<const uint4*>(
           bt + static_cast<size_t>(col_base + cidx) * k + k_offset + col_vec * 16);
-      reinterpret_cast<uint4*>(stages + kWordsA)[vec_idx] = __ldg(ptr_bt);
+      reinterpret_cast<uint4*>(stages + kWordsA)[tid] = __ldg(ptr_bt);
     }
 
     __syncthreads();
