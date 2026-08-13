@@ -17,7 +17,7 @@ using namespace cute;
 
 static constexpr int kBlockM = 128;
 static constexpr int kBlockN = 512;
-static constexpr int kChunkK = 32;
+static constexpr int kChunkK = 256;
 static constexpr int kMmaK = 16;
 static constexpr int kWarpRows = 8;
 static constexpr int kWarpCols = 4;
@@ -27,8 +27,6 @@ static constexpr int kThreads = kWarps * 32;
 static constexpr int kTranscript = 4;
 static constexpr int kRotate = 13;
 static constexpr int kWordsA = (kBlockM * kChunkK) / 4;
-static constexpr int kWordsB = (kBlockN * kChunkK) / 4;
-static constexpr int kWordsStage = kWordsA + kWordsB;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
 __device__ __forceinline__ void mma_8x8x16(
@@ -67,12 +65,11 @@ void grind(const int8_t* __restrict__ a,
   const int grid_m = m / kBlockM;
   const int grid_n = n / kBlockN;
 
-  __shared__ __align__(16) uint32_t stages[2][kWordsStage];
+  __shared__ __align__(16) uint32_t stages_a[kWordsA];
   __shared__ __align__(16) uint32_t transcripts[kWarps][kTilesPerWarp][kTranscript];
 
   const int chunks = k / kChunkK;
   const int chunks_per_rank = rank / kChunkK;
-  const bool has_a = tid < 256;
 
   for (int cta_m = blockIdx.x; cta_m < grid_m; cta_m += gridDim.x) {
     const int row_base = cta_m * kBlockM;
@@ -94,44 +91,25 @@ void grind(const int8_t* __restrict__ a,
         #pragma unroll
         for (int i = 0; i < 8; ++i) acc[tile][i] = 0;
 
-      uint4 prefetched_a;
-      uint4 prefetched_b;
-
-      auto prefetch = [&](int k_offset) {
-        if (has_a) {
-          int row = tid / 2;
-          int col_vec = tid % 2;
-          const uint4* ptr_a = reinterpret_cast<const uint4*>(
-              a + static_cast<size_t>(row_base + row) * k + k_offset + col_vec * 16);
-          prefetched_a = __ldg(ptr_a);
-        }
-        {
-          int cidx = tid / 2;
-          int col_vec = tid % 2;
-          const uint4* ptr_bt = reinterpret_cast<const uint4*>(
-              bt + static_cast<size_t>(col_base + cidx) * k + k_offset + col_vec * 16);
-          prefetched_b = __ldg(ptr_bt);
-        }
-      };
-
-      auto publish = [&](int stage) {
-        if (has_a) {
-          reinterpret_cast<uint4*>(stages[stage])[tid] = prefetched_a;
-        }
-        reinterpret_cast<uint4*>(stages[stage] + kWordsA)[tid] = prefetched_b;
-      };
-
-      prefetch(0);
-      publish(0);
-      __syncthreads();
-
       for (int chunk = 0; chunk < chunks; ++chunk) {
-        const int current = chunk & 1;
-        const bool have_next = chunk + 1 < chunks;
-        if (have_next) prefetch((chunk + 1) * kChunkK);
+        const int k_offset = chunk * kChunkK;
 
-        const uint32_t* sa = stages[current];
-        const uint32_t* sb = stages[current] + kWordsA;
+        // Stage Matrix A (32 KB) into shared memory using uint4 vector loads
+        #pragma unroll
+        for (int q = 0; q < 2; ++q) {
+          int vec_idx = tid + q * 1024;
+          if (vec_idx < kWordsA / 4) {
+            int row = vec_idx / (kChunkK / 16);
+            int col_vec = vec_idx % (kChunkK / 16);
+            const uint4* ptr_a = reinterpret_cast<const uint4*>(
+                a + static_cast<size_t>(row_base + row) * k + k_offset + col_vec * 16);
+            reinterpret_cast<uint4*>(stages_a)[vec_idx] = __ldg(ptr_a);
+          }
+        }
+
+        __syncthreads();
+
+        const uint32_t* sa = stages_a;
         const int a_row0 = warp_m * 16 + lane_group;
         const int a_row1 = a_row0 + 8;
 
@@ -140,12 +118,20 @@ void grind(const int8_t* __restrict__ a,
           const int word_offset = sub * (kMmaK / 4) + lane_quad;
           const uint32_t a0 = sa[a_row0 * (kChunkK / 4) + word_offset];
           const uint32_t a1 = sa[a_row1 * (kChunkK / 4) + word_offset];
+
           #pragma unroll
           for (int tile = 0; tile < kTilesPerWarp; ++tile) {
             const int b0 = warp_n * 128 + tile * 16 + lane_group;
             const int b1 = b0 + 8;
-            const uint32_t bv0 = sb[b0 * (kChunkK / 4) + word_offset];
-            const uint32_t bv1 = sb[b1 * (kChunkK / 4) + word_offset];
+
+            const uint32_t* ptr_b0 = reinterpret_cast<const uint32_t*>(
+                bt + static_cast<size_t>(col_base + b0) * k + k_offset + sub * kMmaK + lane_quad * 4);
+            const uint32_t* ptr_b1 = reinterpret_cast<const uint32_t*>(
+                bt + static_cast<size_t>(col_base + b1) * k + k_offset + sub * kMmaK + lane_quad * 4);
+
+            const uint32_t bv0 = __ldg(ptr_b0);
+            const uint32_t bv1 = __ldg(ptr_b1);
+
             mma_8x8x16(acc[tile][0], acc[tile][1], a0, bv0);
             mma_8x8x16(acc[tile][2], acc[tile][3], a1, bv0);
             mma_8x8x16(acc[tile][4], acc[tile][5], a0, bv1);
@@ -170,10 +156,7 @@ void grind(const int8_t* __restrict__ a,
           }
         }
 
-        if (have_next) {
-          publish(1 - current);
-          __syncthreads();
-        }
+        __syncthreads();
       }
 
       if (lane == 0) {
