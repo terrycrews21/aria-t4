@@ -328,7 +328,7 @@ fn spawn_grind(
                                         let noise = zk_pow::circuit::pearl_noise::compute_noise(&compiled);
                                         let jackpot = zk_pow::circuit::chip::compute_jackpot(&compiled, &private_params.s_a, &private_params.s_b, &noise);
                                         let hash_jackpot = zk_pow::api::proof_utils::compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
-                                        let hash_u256 = primitive_types::U256::from_big_endian(&hash_jackpot);
+                                        let hash_u256 = primitive_types::U256::from_little_endian(&hash_jackpot);
                                         let bound_u256 = primitive_types::U256::from_little_endian(&job.official.bound_le);
                                         let is_valid = hash_u256 <= bound_u256;
                                         if let Some(target_be) = &job.official.target_be {
