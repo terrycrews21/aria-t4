@@ -772,18 +772,12 @@ async fn main() -> anyhow::Result<()> {
                 let gj = match build_grind_job(&params, &job, cur_difficulty) {
                     Ok(mut g) => {
                         if dialect == Dialect::LuckyPool {
-                            if let Some(t) = job.full_target {
-                                let bound = ariaminer::stratum_to_official::difficulty_bound_from_target_be(&t, &g.official.config);
-                                g.official.bound_le = bound;
-                                g.official.target_be = Some(t);
-                                tracing::info!(
-                                    target_hex = %hex::encode(&t[..8]),
-                                    bound_le_hi = %hex::encode(&bound[24..]),
-                                    "LuckyPool target bound applied with official scaling factor"
-                                );
-                            } else {
-                                tracing::warn!("LuckyPool job missing full_target! Using share_bound_le fallback");
-                            }
+                            g.official.target_be = job.full_target;
+                            tracing::info!(
+                                difficulty = cur_difficulty,
+                                bound_le_hi = %hex::encode(&g.official.bound_le[24..]),
+                                "LuckyPool share target bound set from difficulty"
+                            );
                         }
                         Arc::new(g)
                     }
