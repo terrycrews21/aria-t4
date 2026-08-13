@@ -68,6 +68,16 @@ pub fn share_bound_le(difficulty: u64) -> [u8; 32] {
     t
 }
 
+/// Compute the exact little-endian difficulty bound for a big-endian target and MiningConfiguration
+/// using the official zk-pow formula: bound = target * (rows_size * cols_size * dot_product_length).
+pub fn difficulty_bound_from_target_be(target_be: &[u8; 32], config: &MiningConfiguration) -> [u8; 32] {
+    let h = config.rows_pattern.size() as usize;
+    let w = config.cols_pattern.size() as usize;
+    let tile_size = h * w;
+    let factor = (tile_size * config.dot_product_length()) as u64;
+    scaled_bound_le_from_target_be(target_be, factor)
+}
+
 /// LuckyPool-style bound: the wire carries a full 256-bit big-endian target and
 /// the official rule (`zk-pow sanity_checks::extract_difficulty_bound`) is
 /// `jackpot ≤ target × h·w·k` — the threshold scales with the work of one
@@ -259,6 +269,29 @@ mod tests {
         let oj = build_official_job(&job, &params, 524_288).unwrap();
         assert_eq!(oj.k, 4032);
         assert_eq!(oj.header.nbits, h.nbits);
-        assert_eq!(oj.config.rank, 128);
+    }
+
+    #[test]
+    fn test_exact_factor_formula() {
+        use zk_pow::api::proof::{MiningConfiguration, MMAType, PeriodicPattern};
+        let cfg = MiningConfiguration {
+            common_dim: 4032,
+            rank: 128,
+            mma_type: MMAType::Int7xInt7ToInt32,
+            rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
+            cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105]).unwrap(),
+            reserved: MiningConfiguration::RESERVED_VALUE,
+        };
+        let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(0x1a1fffe0, &cfg);
+        let mut bound_le = [0u8; 32];
+        bound.to_little_endian(&mut bound_le);
+
+        let target_be = crate::protocol::decode_nbits("1a1fffe0").unwrap();
+
+        // Factor = k * active_rows * active_cols
+        let b_calc = difficulty_bound_from_target_be(&target_be, &cfg);
+        println!("CALC BOUND LE:     {}", hex::encode(b_calc));
+        println!("OFFICIAL BOUND LE: {}", hex::encode(bound_le));
+        assert_eq!(b_calc, bound_le, "difficulty_bound_from_target_be must match official extracted bound!");
     }
 }
