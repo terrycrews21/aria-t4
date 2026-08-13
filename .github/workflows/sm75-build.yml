@@ -1,0 +1,29 @@
+name: SM75 compile and consensus checks
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "cuda/**"
+      - ".github/workflows/sm75-build.yml"
+
+jobs:
+  sm75-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build SM75 binary in CUDA devel container
+        run: |
+          set -euxo pipefail
+          docker run --rm             -v "$GITHUB_WORKSPACE:/src"             -w /src             nvidia/cuda:12.9.1-devel-ubuntu22.04             bash -lc '              set -euxo pipefail;               export DEBIAN_FRONTEND=noninteractive;               apt-get update;               apt-get install -y git curl build-essential file pkg-config libssl-dev clang lld ca-certificates;               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y;               export PATH=/root/.cargo/bin:$PATH;               git clone --depth 1 https://github.com/NVIDIA/cutlass.git /tmp/cutlass;               git clone --depth 1 https://github.com/pearl-research-labs/pearl.git /tmp/pearl;               echo "=== ENVIRONMENT ===";               nvcc --version; rustc --version; cargo --version;               echo "ARIA_CUDA_ARCHES=75";               export CUDA_HOME=/usr/local/cuda;               export CUTLASS_INCLUDE=/tmp/cutlass/include;               export PEARL_CSRC=/tmp/pearl/miner/pearl-gemm/csrc;               export ARIA_CUDA_ARCHES=75;               export CARGO_TARGET_DIR=/tmp/target-sm75;               cargo build --release --features gpu --bin ariaminer;               file /tmp/target-sm75/release/ariaminer;               ls -lh /tmp/target-sm75/release/ariaminer;               cargo test --release --lib'
+
+      - name: CPU proof config checks
+        run: |
+          set -euxo pipefail
+          cargo test --release --lib

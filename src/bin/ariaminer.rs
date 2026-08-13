@@ -84,10 +84,20 @@ fn herominers_default_params() -> MiningParams {
     // 128×128 kernel maps to period 128. The config is part of job_key, so this
     // MUST track the selected kernel or every otherwise-good hit fails the
     // verifier's Merkle/job-key reconstruction before submission.
-    let cols_pattern = if std::env::var("ARIA_TMA_MS").is_ok() {
-        vec![0, 1, 32, 33, 64, 65, 96, 97, 128, 129, 160, 161, 192, 193, 224, 225]
+    let (rows_pattern, cols_pattern) = if std::env::var("ARIA_T4_DUAL").is_ok() {
+        // Warp-owned Turing path: two complete contiguous 16×16 proof tiles
+        // per warp, so there is no shared-atomic fold reconstruction.
+        ((0..16).collect(), (0..16).collect())
+    } else if std::env::var("ARIA_TMA_MS").is_ok() {
+        (
+            vec![0, 8, 32, 40, 64, 72, 96, 104],
+            vec![0, 1, 32, 33, 64, 65, 96, 97, 128, 129, 160, 161, 192, 193, 224, 225],
+        )
     } else {
-        vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113]
+        (
+            vec![0, 8, 32, 40, 64, 72, 96, 104],
+            vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
+        )
     };
     MiningParams {
         // PeakMiner's accepted proofs use these dimensions on both Ampere and
@@ -96,7 +106,7 @@ fn herominers_default_params() -> MiningParams {
         n: 65_536,
         k: 8192,
         rank: 128,
-        rows_pattern: vec![0, 8, 32, 40, 64, 72, 96, 104],
+        rows_pattern,
         cols_pattern,
         mma_type: "Int7xInt7ToInt32".into(),
     }
@@ -686,13 +696,22 @@ async fn main() -> anyhow::Result<()> {
             if std::env::var("ARIA_BATCH_M").is_err() { std::env::set_var("ARIA_BATCH_M", "16384"); }
             if std::env::var("ARIA_BATCH_N").is_err() { std::env::set_var("ARIA_BATCH_N", "65536"); }
             if std::env::var("ARIA_FIXB").is_err() { std::env::set_var("ARIA_FIXB", "1"); }
-            if std::env::var("ARIA_TMA_MS").is_err() { std::env::set_var("ARIA_TMA_MS", "1"); }
+            let device_major = ariaminer::gpu_ffi::device_major();
+            if device_major == 7 {
+                if std::env::var("ARIA_T4_DUAL").is_err() { std::env::set_var("ARIA_T4_DUAL", "1"); }
+                // TMA does not exist on Turing and its period-256 config is not
+                // the warp-owned 16×16 proof geometry.
+                std::env::remove_var("ARIA_TMA_MS");
+            } else if std::env::var("ARIA_TMA_MS").is_err() {
+                std::env::set_var("ARIA_TMA_MS", "1");
+            }
         }
         tracing::info!(
             batch_m = %std::env::var("ARIA_BATCH_M").unwrap_or_default(),
             batch_n = %std::env::var("ARIA_BATCH_N").unwrap_or_default(),
             fix_b = %std::env::var("ARIA_FIXB").unwrap_or_default(),
             multistage = %std::env::var("ARIA_TMA_MS").unwrap_or_default(),
+            t4_dual = %std::env::var("ARIA_T4_DUAL").unwrap_or_default(),
             "HeroMiners GPU amortization defaults"
         );
     }

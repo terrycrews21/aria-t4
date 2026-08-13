@@ -17,6 +17,7 @@
 #include "pearl_gpu_kernel_tma.cuh"    // gemm_device_tma_ms (grind multistage TMA 128×256, v0.6.0-ws)
 #include "pearl_gpu_kernel_cpasync_ms.cuh" // gemm_device_cpasync_ms (jumeau PORTABLE Ampere/Ada, v0.6.3-beta)
 #include "pearl_gpu_kernel_sm75.cuh"   // gemm_device_sm75 (grind 8×16 contigu TURING T4, sm_75)
+#include "pearl_gpu_kernel_sm75_dual.cuh" // warp-owned dual 16×16 T4 path (no fold atomics)
 #include "merkle_roots_cpasync.cuh"
 #include "merkle_simple.cuh"          // commit PORTABLE (roots identiques sur tout GPU)        // MerkleTreeRootsKernelCpAsync (commit PORTABLE — l'officiel est TMA/SM90-only)
 using namespace cute;
@@ -446,42 +447,30 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   dim3 grd(size(ceil_div(m,bM)), size(ceil_div(n,bN))), blk(size(mma));
   int dev_major = ((cudaDeviceProp*)c->prop)->major;
   if (dev_major == 7 || getenv("ARIA_FORCE_SM75")) {
-    // sm_75 : pipeline 2 STAGES — requis pour que le prefetch registre (double-
-    // buffering) recouvre effectivement la latence DRAM d'une tuile avec les MMA
-    // de la précédente. smem 33280 o (1 CTA/SM sur Turing, 48 Ko/CTA), validé.
-    auto bM75=Int<128>{}; auto bN75=Int<128>{}; auto bK75=Int<64>{};
-    auto cta75 = make_shape(bM75,bN75,bK75);
-    using SmemBase2s = Layout<Shape <Shape <_16,_8>,        Shape <_64,_1>, Shape <_1,_2>>,
-                              Stride<Stride<_64,Int<1024>>, Stride<_1,_0>,  Stride<_0,Int<8192>>>>;
-    auto sA75 = composition(Swizzle<2,4,3>{}, SmemBase2s{});
-    auto sB75 = composition(Swizzle<2,4,3>{}, SmemBase2s{});
-    auto sC75 = make_layout(make_shape(bM75,bN75));
-    using AtomG75 = Copy_Atom<UniversalCopy<uint128_t>, int8_t>;
-    using TVcopy = Layout<Shape<Shape<_8,_32>,_16>, Stride<Stride<_512,_1>,_32>>;
-    using TilerC = Shape<_32,_128>;
-    TiledCopy<AtomG75, TVcopy, TilerC> copyA75, copyB75;
-    TiledMMA mma75 = make_tiled_mma(SM75_8x8x16_S32S8S8S32_TN{},
-        Layout<Shape<_2,_2,_1>, Stride<_1,_2,_0>>{}, Tile<_32,_32,_32>{});
-    Copy_Atom<SM75_U32x4_LDSM_N, int8_t> s2rA75, s2rB75;
-    // Fold : même SÉQUENCE rotl_xor que v1.0/2×64, cadence en MMA-tiles. L'atom SM75
-    // a K=16 → le tiled-MMA avance de 16 colonnes par appel gemm (K_BLOCK_MAX = bK/16
-    // = 4, ≠ SM80 K=32) → reduce_every_k = rank/16 (PAS rank/32). VALIDÉ empiriquement
-    // par probe_consensus.cu : 128/128 à rank/16, 0/128 à rank/32.
-    int reduce_every_k75 = c->rank / 16;
-    int nbx75 = size(ceil_div(m,bM75)), nby75 = size(ceil_div(n,bN75));
-    int smem75 = int(sizeof(SharedStorageSm75<int8_t,int8_t,decltype(sA75),decltype(sB75)>));
-    dim3 grd75(nbx75, nby75), blk75(size(mma75));
-    auto kfn75 = gemm_device_sm75<decltype(prob),decltype(cta75),
-        int8_t,decltype(dA),decltype(sA75),decltype(copyA75),decltype(s2rA75),
-        int8_t,decltype(dB),decltype(sB75),decltype(copyB75),decltype(s2rB75),
-        int32_t,decltype(dC),decltype(sC75),decltype(mma75)>;
-    cudaFuncSetAttribute(kfn75, cudaFuncAttributeMaxDynamicSharedMemorySize, smem75);
-    ARIA_NEXT("gemm launch sm75 seed=%016llx m=%d n=%d k=%d grid=(%d,%d) blk=%u smem=%d rank=%d reduce_every_k=%d",
-              (unsigned long long)setup_seed, m, n, k, nbx75, nby75, blk75.x, smem75, c->rank, reduce_every_k75);
-    kfn75<<<grd75,blk75,smem75,c->sA>>>(prob,cta75, c->d_A,dA,sA75,copyA75,s2rA75, c->d_B,dB,sB75,copyB75,s2rB75,
-        c->d_C,dC,sC75,mma75, reduce_every_k75, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits, nbx75, nby75,
-        /*dump debug*/ nullptr, nullptr, nullptr, nullptr);
-    ARIA_NEXT("timing-record tEnd (sm75)");
+    // Turing fast path: one warp owns two complete 16x16 proof tiles. The
+    // older CuTe path reconstructed 8x16 folds with 8192 shared atomicXors per
+    // rank boundary; real-T4 profiling put 79% of setup time there. This path
+    // performs each fold in registers + warp shuffles and reuses A across a
+    // 64x256 CTA. Peak/default dimensions are exact multiples of both axes.
+    if ((m % aria_sm75_dual::kBlockM) != 0 || (n % aria_sm75_dual::kBlockN) != 0) {
+      fprintf(stderr, "sm75 dual kernel requires m%%64==0 and n%%256==0 (m=%d n=%d)\n", m, n);
+      return -1;
+    }
+    dim3 grid75((unsigned)(m / aria_sm75_dual::kBlockM),
+                (unsigned)(n / aria_sm75_dual::kBlockN));
+    dim3 block75(aria_sm75_dual::kThreads);
+    ARIA_NEXT("gemm launch sm75-dual seed=%016llx m=%d n=%d k=%d grid=(%u,%u) blk=%u rank=%d",
+              (unsigned long long)setup_seed, m, n, k, grid75.x, grid75.y,
+              block75.x, c->rank);
+    if (c->big_endian) {
+      aria_sm75_dual::grind<true><<<grid75, block75, 0, c->sA>>>(
+          c->d_A, c->d_B, m, n, k, c->rank, c->d_as, c->d_bnd,
+          c->d_found, c->d_hr, c->d_hc, max_hits);
+    } else {
+      aria_sm75_dual::grind<false><<<grid75, block75, 0, c->sA>>>(
+          c->d_A, c->d_B, m, n, k, c->rank, c->d_as, c->d_bnd,
+          c->d_found, c->d_hr, c->d_hc, max_hits);
+    }
     if (c->do_timing) cudaEventRecord(c->tEnd, c->sA);
     CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
     if (c->do_timing) {
@@ -490,7 +479,6 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
       cudaEventElapsedTime(&c->last_genc_ms,  c->tStart, c->tMid);
       cudaEventElapsedTime(&c->last_noise_ms, c->tMid,   c->tPro);
     }
-    ARIA_NEXT("memcpy back found/hits (sm75)");
     int found=0; CKR(cudaMemcpy(&found,c->d_found,4,cudaMemcpyDeviceToHost));
     int nret = found<max_hits?found:max_hits;
     if(nret>0 && hit_rows) CKR(cudaMemcpy(hit_rows,c->d_hr,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
@@ -781,6 +769,8 @@ static int resident_run2(Ctx* c, uint64_t seed, uint64_t next_seed, int has_next
 }
 
 extern "C" {
+int pearl_gpu_device_major() { return aria_device_major(); }
+
 // ---- contexte persistant : alloc 1× (create), réutilise (grind), free (destroy) ----
 void* pearl_resident_create(int m, int n, int k, int max_hits) {
   Ctx* c = new Ctx(); c->m=m; c->n=n; c->k=k; c->max_hits=max_hits;

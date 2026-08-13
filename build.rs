@@ -65,6 +65,8 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_2x64.cuh");
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_tma.cuh");
     println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_cpasync_ms.cuh");
+    println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_sm75.cuh");
+    println!("cargo:rerun-if-changed=cuda/pearl_gpu_kernel_sm75_dual.cuh");
     println!("cargo:rerun-if-env-changed=ARIA_CUDA_ARCHES");
     println!("cargo:rerun-if-changed=cuda/pearl_fold.cuh");
     println!("cargo:rerun-if-changed=cuda/pearl_commit_lib.cu");

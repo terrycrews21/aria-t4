@@ -4,6 +4,8 @@
 use std::os::raw::c_int;
 
 unsafe extern "C" {
+    fn pearl_gpu_device_major() -> c_int;
+
     fn pearl_gpu_grind(
         a_eff: *const i8, b_eff: *const i8, m: c_int, n: c_int, k: c_int,
         pow_key: *const u32, pow_bound: *const u32,
@@ -78,6 +80,10 @@ unsafe extern "C" {
     fn pearl_resident2_set_grind_blocks(ctx: *mut core::ffi::c_void, g: c_int);
     fn pearl_gpu_sm_count() -> c_int;
 }
+
+/// CUDA compute-capability major of the active device (7=Turing, 8=Ampere/Ada,
+/// 9=Hopper, 10=Blackwell datacenter, 12=Blackwell consumer).
+pub fn device_major() -> i32 { unsafe { pearl_gpu_device_major() as i32 } }
 
 /// Nombre de SM du GPU 0 (pour calibrer le headroom du grind persistant).
 pub fn gpu_sm_count() -> usize { (unsafe { pearl_gpu_sm_count() }).max(0) as usize }
