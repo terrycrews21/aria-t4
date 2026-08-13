@@ -73,7 +73,8 @@ pub fn difficulty_bound_from_target_be(target_be: &[u8; 32], config: &MiningConf
     let h = config.rows_pattern.size() as usize;
     let w = config.cols_pattern.size() as usize;
     let tile_size = h * w;
-    let factor = (tile_size * config.dot_product_length()) as u64;
+    let rank = config.rank.max(1) as u64;
+    let factor = (tile_size as u64 * config.dot_product_length() as u64) / rank;
     scaled_bound_le_from_target_be(target_be, factor)
 }
 
