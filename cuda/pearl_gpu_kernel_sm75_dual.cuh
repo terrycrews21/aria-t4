@@ -15,11 +15,11 @@
 namespace aria_sm75_dual {
 using namespace cute;
 
-static constexpr int kBlockM = 128;
+static constexpr int kBlockM = 64;
 static constexpr int kBlockN = 512;
-static constexpr int kChunkK = 32;
+static constexpr int kChunkK = 64;
 static constexpr int kMmaK = 16;
-static constexpr int kWarpRows = 8;
+static constexpr int kWarpRows = 4;
 static constexpr int kWarpCols = 4;
 static constexpr int kTilesPerWarp = 8;
 static constexpr int kWarps = kWarpRows * kWarpCols;
@@ -45,7 +45,7 @@ __device__ __forceinline__ uint32_t rotl13_xor(uint32_t previous, uint32_t value
 #endif
 
 template <bool BigEndian = false>
-__global__ __launch_bounds__(kThreads, 1)
+__global__ __launch_bounds__(kThreads, 2)
 void grind(const int8_t* __restrict__ a,
            const int8_t* __restrict__ bt,
            int m, int n, int k, int rank,
@@ -69,14 +69,14 @@ void grind(const int8_t* __restrict__ a,
   const int warp_row = row_base + warp_m * 16;
   const int warp_col = col_base + warp_n * 128;
 
-  __shared__ __align__(16) uint32_t stages[2][kWordsStage];
+  __shared__ __align__(16) uint32_t stages[kWordsStage];
+  __shared__ __align__(16) uint32_t transcripts[kWarps][kTilesPerWarp][kTranscript];
 
-  uint32_t my_transcripts[kTilesPerWarp][kTranscript];
-  #pragma unroll
-  for (int tile = 0; tile < kTilesPerWarp; ++tile)
+  if (lane < kTranscript) {
     #pragma unroll
-    for (int i = 0; i < kTranscript; ++i)
-      my_transcripts[tile][i] = 0;
+    for (int tile = 0; tile < kTilesPerWarp; ++tile)
+      transcripts[warp][tile][lane] = 0;
+  }
 
   int32_t acc[kTilesPerWarp][8];
   #pragma unroll
@@ -84,47 +84,34 @@ void grind(const int8_t* __restrict__ a,
     #pragma unroll
     for (int i = 0; i < 8; ++i) acc[tile][i] = 0;
 
-  uint4 prefetched_a;
-  uint4 prefetched_b;
-  const bool has_a = tid < 256;
-
-  auto prefetch = [&](int k_offset) {
-    if (has_a) {
-      int row = tid / 2;
-      int col_vec = tid % 2;
-      const uint4* ptr_a = reinterpret_cast<const uint4*>(
-          a + static_cast<size_t>(row_base + row) * k + k_offset + col_vec * 16);
-      prefetched_a = __ldg(ptr_a);
-    }
-    {
-      int cidx = tid / 2;
-      int col_vec = tid % 2;
-      const uint4* ptr_bt = reinterpret_cast<const uint4*>(
-          bt + static_cast<size_t>(col_base + cidx) * k + k_offset + col_vec * 16);
-      prefetched_b = __ldg(ptr_bt);
-    }
-  };
-
-  auto publish = [&](int stage) {
-    if (has_a) {
-      reinterpret_cast<uint4*>(stages[stage])[tid] = prefetched_a;
-    }
-    reinterpret_cast<uint4*>(stages[stage] + kWordsA)[tid] = prefetched_b;
-  };
-
   const int chunks = k / kChunkK;
   const int chunks_per_rank = rank / kChunkK;
-  prefetch(0);
-  publish(0);
-  __syncthreads();
 
   for (int chunk = 0; chunk < chunks; ++chunk) {
-    const int current = chunk & 1;
-    const bool have_next = chunk + 1 < chunks;
-    if (have_next) prefetch((chunk + 1) * kChunkK);
+    const int k_offset = chunk * kChunkK;
 
-    const uint32_t* sa = stages[current];
-    const uint32_t* sb = stages[current] + kWordsA;
+    if (tid < 256) {
+      int row = tid / 4;
+      int col_vec = tid % 4;
+      const uint4* ptr_a = reinterpret_cast<const uint4*>(
+          a + static_cast<size_t>(row_base + row) * k + k_offset + col_vec * 16);
+      reinterpret_cast<uint4*>(stages)[tid] = __ldg(ptr_a);
+    }
+
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      int vec_idx = tid + q * 512;
+      int cidx = vec_idx / 4;
+      int col_vec = vec_idx % 4;
+      const uint4* ptr_bt = reinterpret_cast<const uint4*>(
+          bt + static_cast<size_t>(col_base + cidx) * k + k_offset + col_vec * 16);
+      reinterpret_cast<uint4*>(stages + kWordsA)[vec_idx] = __ldg(ptr_bt);
+    }
+
+    __syncthreads();
+
+    const uint32_t* sa = stages;
+    const uint32_t* sb = stages + kWordsA;
     const int a_row0 = warp_m * 16 + lane_group;
     const int a_row1 = a_row0 + 8;
 
@@ -157,16 +144,13 @@ void grind(const int8_t* __restrict__ a,
           folded ^= __shfl_xor_sync(0xffffffffu, folded, mask);
         if (lane == 0) {
           int transcript_index = ((chunk + 1) / chunks_per_rank - 1) % kTranscript;
-          my_transcripts[tile][transcript_index] =
-              rotl13_xor(my_transcripts[tile][transcript_index], folded);
+          transcripts[warp][tile][transcript_index] =
+              rotl13_xor(transcripts[warp][tile][transcript_index], folded);
         }
       }
     }
 
-    if (have_next) {
-      publish(1 - current);
-      __syncthreads();
-    }
+    __syncthreads();
   }
 
   if (lane == 0) {
@@ -175,7 +159,7 @@ void grind(const int8_t* __restrict__ a,
       auto message = make_tensor<uint32_t>(Int<16>{});
       auto cv = make_tensor<uint32_t>(Int<8>{});
       #pragma unroll
-      for (int i = 0; i < 16; ++i) message(i) = my_transcripts[tile][i];
+      for (int i = 0; i < 16; ++i) message(i) = transcripts[warp][tile][i];
       #pragma unroll
       for (int i = 0; i < 8; ++i) cv(i) = pow_key[i];
       blake3::compress_msg_block_u32(message, cv, blake3::COMPRESS_PARAMS_SINGLE_BLOCK_KEYED);
