@@ -70,13 +70,13 @@ void grind(const int8_t* __restrict__ a,
   const int warp_col = col_base + warp_n * 128;
 
   __shared__ __align__(16) uint32_t stages[2][kWordsStage];
-  __shared__ __align__(16) uint32_t transcripts[kWarps][kTilesPerWarp][kTranscript];
 
-  if (lane < kTranscript) {
+  uint32_t my_transcripts[kTilesPerWarp][kTranscript];
+  #pragma unroll
+  for (int tile = 0; tile < kTilesPerWarp; ++tile)
     #pragma unroll
-    for (int tile = 0; tile < kTilesPerWarp; ++tile)
-      transcripts[warp][tile][lane] = 0;
-  }
+    for (int i = 0; i < kTranscript; ++i)
+      my_transcripts[tile][i] = 0;
 
   int32_t acc[kTilesPerWarp][8];
   #pragma unroll
@@ -157,8 +157,8 @@ void grind(const int8_t* __restrict__ a,
           folded ^= __shfl_xor_sync(0xffffffffu, folded, mask);
         if (lane == 0) {
           int transcript_index = ((chunk + 1) / chunks_per_rank - 1) % kTranscript;
-          transcripts[warp][tile][transcript_index] =
-              rotl13_xor(transcripts[warp][tile][transcript_index], folded);
+          my_transcripts[tile][transcript_index] =
+              rotl13_xor(my_transcripts[tile][transcript_index], folded);
         }
       }
     }
@@ -175,7 +175,7 @@ void grind(const int8_t* __restrict__ a,
       auto message = make_tensor<uint32_t>(Int<16>{});
       auto cv = make_tensor<uint32_t>(Int<8>{});
       #pragma unroll
-      for (int i = 0; i < 16; ++i) message(i) = transcripts[warp][tile][i];
+      for (int i = 0; i < 16; ++i) message(i) = my_transcripts[tile][i];
       #pragma unroll
       for (int i = 0; i < 8; ++i) cv(i) = pow_key[i];
       blake3::compress_msg_block_u32(message, cv, blake3::COMPRESS_PARAMS_SINGLE_BLOCK_KEYED);
