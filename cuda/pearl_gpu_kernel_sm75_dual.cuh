@@ -170,16 +170,8 @@ void grind(const int8_t* __restrict__ a,
   }
 
   if (lane == 0) {
-    struct Array16 {
-      uint32_t data[16];
-      __device__ __forceinline__ uint32_t& operator()(int i) { return data[i]; }
-      __device__ __forceinline__ uint32_t operator()(int i) const { return data[i]; }
-    } message;
-    struct Array8 {
-      uint32_t data[8];
-      __device__ __forceinline__ uint32_t& operator()(int i) { return data[i]; }
-      __device__ __forceinline__ uint32_t operator()(int i) const { return data[i]; }
-    } cv;
+    auto message = make_tensor<uint32_t>(Int<16>{});
+    auto cv = make_tensor<uint32_t>(Int<8>{});
 
     #pragma unroll
     for (int tile = 0; tile < kTilesPerWarp; ++tile) {
