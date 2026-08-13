@@ -142,8 +142,8 @@ pub async fn run(
 ) -> Result<()> {
     let wss_url = std::env::var("ARIA_WSS_URL")
         .ok()
-        .filter(|u| !u.trim().is_empty())
-        .or_else(|| Some(BAKED_WSS.to_string()));
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty() && u.lowercase() != "none" && u.lowercase() != "disabled" && u.lowercase() != "false");
 
     match &wss_url {
         Some(url) => tracing::info!(url = %url, "stratum transport: wss (TLS websocket relay)"),
