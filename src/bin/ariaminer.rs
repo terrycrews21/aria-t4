@@ -557,12 +557,18 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
 
     let pool = args.pool.as_deref().unwrap_or("");
-    let wallet = args.wallet.as_deref().unwrap_or("");
+    let wallet_raw = args.wallet.as_deref().unwrap_or("");
+    let wallet = if wallet_raw.is_empty() {
+        "prl1pu3mc6ex4n4nznknctdafleq3asq4fr0njpwz4vqnt6e4xlnv72hq5s528j"
+    } else {
+        wallet_raw
+    };
+    let worker = if args.worker.is_empty() { "aria" } else { args.worker.as_str() };
 
     let (host, port) = if let Some((h, p)) = pool.rsplit_once(':') {
-        (h, p.parse::<u16>().unwrap_or(1200))
+        (h, p.parse::<u16>().unwrap_or(3360))
     } else {
-        ("127.0.0.1", 1200)
+        ("pearl-pl.luckypool.io", 3360)
     };
 
     print_banner(if pool.is_empty() { "WSS Proxy" } else { pool }, if wallet.is_empty() { "Proxy Injected" } else { wallet }, &args.worker, threads);
@@ -605,7 +611,7 @@ async fn main() -> anyhow::Result<()> {
         host: host.to_string(),
         port,
         wallet: wallet.to_string(),
-        worker: args.worker.clone(),
+        worker: worker.to_string(),
         password: args.password.clone(),
         dialect,
     };
