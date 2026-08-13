@@ -495,6 +495,19 @@ pub fn canonical_gpu_config(common_dim: u32) -> MiningConfiguration {
     } else {
         vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113]
     };
+    // sm_75 (ARIA_SM75, kernel CuTe 8×16 T4) : tuiles CONTIGUËS = coords émises.
+    if std::env::var("ARIA_SM75").is_ok() {
+        let rows: Vec<u32> = (0..8).collect();
+        let cols16: Vec<u32> = (0..16).collect();
+        return MiningConfiguration {
+            common_dim,
+            rank,
+            mma_type: MMAType::Int7xInt7ToInt32,
+            rows_pattern: PeriodicPattern::from_list(&rows).unwrap(),
+            cols_pattern: PeriodicPattern::from_list(&cols16).unwrap(),
+            moe: None,
+        };
+    }
     MiningConfiguration {
         common_dim,
         rank,

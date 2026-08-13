@@ -94,10 +94,10 @@ fn herominers_default_params() -> MiningParams {
             vec![0, 1, 32, 33, 64, 65, 96, 97, 128, 129, 160, 161, 192, 193, 224, 225],
         )
     } else {
-        (
-            vec![0, 8, 32, 40, 64, 72, 96, 104],
-            vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
-        )
+        // sm_75 canonical 8×16 : le kernel émet des tuiles CONTIGUËS ; les indices
+        // soumis redéfinissent le pattern côté node → job_key doit matcher ce que
+        // le kernel a engagé (sinon Hash A mismatch au parse/verify).
+        ((0..8).collect(), (0..16).collect())
     };
     MiningParams {
         // PeakMiner's accepted proofs use these dimensions on both Ampere and
