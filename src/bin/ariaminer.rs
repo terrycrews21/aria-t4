@@ -105,7 +105,7 @@ fn herominers_default_params() -> MiningParams {
         m: 16_384,
         n: 65_536,
         k: 8192,
-        rank: 128,
+        rank: ariaminer::official_grind::rank_from_env() as u32,
         rows_pattern,
         cols_pattern,
         mma_type: "Int7xInt7ToInt32".into(),
@@ -698,7 +698,8 @@ async fn main() -> anyhow::Result<()> {
             if std::env::var("ARIA_FIXB").is_err() { std::env::set_var("ARIA_FIXB", "1"); }
             let device_major = ariaminer::gpu_ffi::device_major();
             if device_major == 7 {
-                if std::env::var("ARIA_T4_DUAL").is_err() { std::env::set_var("ARIA_T4_DUAL", "1"); }
+                // ARIA_SM75=1 → CuTe canonical 8×16 path (v2 butterfly fold) au lieu du dual 16×16.
+                if std::env::var("ARIA_T4_DUAL").is_err() && std::env::var("ARIA_SM75").is_err() { std::env::set_var("ARIA_T4_DUAL", "1"); }
                 // TMA does not exist on Turing and its period-256 config is not
                 // the warp-owned 16×16 proof geometry.
                 std::env::remove_var("ARIA_TMA_MS");

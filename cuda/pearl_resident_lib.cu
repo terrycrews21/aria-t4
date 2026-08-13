@@ -446,7 +446,7 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   int reduce_every_k = c->rank / 32;
   dim3 grd(size(ceil_div(m,bM)), size(ceil_div(n,bN))), blk(size(mma));
   int dev_major = ((cudaDeviceProp*)c->prop)->major;
-  if (dev_major == 7 || getenv("ARIA_FORCE_SM75")) {
+  if ((dev_major == 7 || getenv("ARIA_FORCE_SM75")) && getenv("ARIA_T4_DUAL")) {
     // Turing fast path: one warp owns two complete 16x16 proof tiles. The
     // older CuTe path reconstructed 8x16 folds with 8192 shared atomicXors per
     // rank boundary; real-T4 profiling put 79% of setup time there. This path
@@ -484,7 +484,52 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
     if(nret>0 && hit_cols) CKR(cudaMemcpy(hit_cols,c->d_hc,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
     return found;
   }
-  if (getenv("ARIA_TMA_MS")) {
+if (dev_major == 7 || getenv("ARIA_FORCE_SM75")) {
+    auto bM75=Int<128>{}; auto bN75=Int<128>{}; auto bK75=Int<64>{};
+    auto cta75 = make_shape(bM75,bN75,bK75);
+    using SmemBase2s = Layout<Shape <Shape <_16,_8>,        Shape <_64,_1>, Shape <_1,_2>>,
+                              Stride<Stride<_64,Int<1024>>, Stride<_1,_0>,  Stride<_0,Int<8192>>>>;
+    auto sA75 = composition(Swizzle<2,4,3>{}, SmemBase2s{});
+    auto sB75 = composition(Swizzle<2,4,3>{}, SmemBase2s{});
+    auto sC75 = make_layout(make_shape(bM75,bN75));
+    using AtomG75 = Copy_Atom<UniversalCopy<uint128_t>, int8_t>;
+    using TVcopy = Layout<Shape<Shape<_8,_32>,_16>, Stride<Stride<_512,_1>,_32>>;
+    using TilerC = Shape<_32,_128>;
+    TiledCopy<AtomG75, TVcopy, TilerC> copyA75, copyB75;
+    TiledMMA mma75 = make_tiled_mma(SM75_8x8x16_S32S8S8S32_TN{},
+        Layout<Shape<_2,_2,_1>, Stride<_1,_2,_0>>{}, Tile<_32,_32,_32>{});
+    Copy_Atom<SM75_U32x4_LDSM_N, int8_t> s2rA75, s2rB75;
+    int reduce_every_k75 = c->rank / 32;
+    int nbx75 = size(ceil_div(m,bM75)), nby75 = size(ceil_div(n,bN75));
+    int smem75 = int(sizeof(SharedStorageSm75<int8_t,int8_t,decltype(sA75),decltype(sB75)>));
+    dim3 grd75(nbx75, nby75), blk75(size(mma75));
+    auto kfn75 = gemm_device_sm75<decltype(prob),decltype(cta75),
+        int8_t,decltype(dA),decltype(sA75),decltype(copyA75),decltype(s2rA75),
+        int8_t,decltype(dB),decltype(sB75),decltype(copyB75),decltype(s2rB75),
+        int32_t,decltype(dC),decltype(sC75),decltype(mma75)>;
+    cudaFuncSetAttribute(kfn75, cudaFuncAttributeMaxDynamicSharedMemorySize, smem75);
+    ARIA_NEXT("gemm launch sm75 seed=%016llx m=%d n=%d k=%d grid=(%d,%d) blk=%u smem=%d rank=%d reduce_every_k=%d",
+              (unsigned long long)setup_seed, m, n, k, nbx75, nby75, blk75.x, smem75, c->rank, reduce_every_k75);
+    kfn75<<<grd75,blk75,smem75,c->sA>>>(prob,cta75, c->d_A,dA,sA75,copyA75,s2rA75, c->d_B,dB,sB75,copyB75,s2rB75,
+        c->d_C,dC,sC75,mma75, reduce_every_k75, c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits, nbx75, nby75,
+        nullptr, nullptr, nullptr, nullptr);
+    ARIA_NEXT("timing-record tEnd (sm75)");
+    if (c->do_timing) cudaEventRecord(c->tEnd, c->sA);
+    CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
+    if (c->do_timing) {
+      cudaEventElapsedTime(&c->last_pro_ms,   c->tStart, c->tPro);
+      cudaEventElapsedTime(&c->last_grind_ms, c->tPro,   c->tEnd);
+      cudaEventElapsedTime(&c->last_genc_ms,  c->tStart, c->tMid);
+      cudaEventElapsedTime(&c->last_noise_ms, c->tMid,   c->tPro);
+    }
+    ARIA_NEXT("memcpy back found/hits (sm75)");
+    int found=0; CKR(cudaMemcpy(&found,c->d_found,4,cudaMemcpyDeviceToHost));
+    int nret = found<max_hits?found:max_hits;
+    if(nret>0 && hit_rows) CKR(cudaMemcpy(hit_rows,c->d_hr,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+    if(nret>0 && hit_cols) CKR(cudaMemcpy(hit_cols,c->d_hc,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+    return found;
+  }
+    if (getenv("ARIA_TMA_MS")) {
     // étape 1 (v0.6.0-ws) : grind MULTISTAGE TMA 128×256 (8 warps, A cp.async + B TMA ring).
     // DumpC=false. ⚠️ PERF ONLY : coords 2×4 PAS encore consensus-validées (bound=0 → 0 hit).
     auto bM2=Int<128>{}; auto bN2=Int<256>{}; auto bK2=Int<128>{};
