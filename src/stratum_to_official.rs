@@ -62,10 +62,9 @@ pub fn config_from_params(params: &MiningParams) -> Result<MiningConfiguration> 
 /// `floor((2^256 - 1) / d)` in the byte order `official_grind` compares against
 /// (`U256::from_little_endian(jackpot) ≤ bound`). `share_target_from_difficulty`
 /// already yields this value big-endian; we just reverse to little-endian.
-pub fn share_bound_le(difficulty: u64) -> [u8; 32] {
-    let mut t = share_target_from_difficulty(difficulty);
-    t.reverse();
-    t
+pub fn share_bound_le(difficulty: u64, config: &MiningConfiguration) -> [u8; 32] {
+    let t = share_target_from_difficulty(difficulty);
+    difficulty_bound_from_target_be(&t, config)
 }
 
 /// Compute the exact little-endian difficulty bound for a big-endian target and MiningConfiguration
@@ -89,14 +88,15 @@ pub fn scaled_bound_le_from_target_be(target_be: &[u8; 32], factor: u64) -> [u8;
     let mut out = [0u8; 32];
     let mut carry: u128 = 0;
     for i in 0..32 {
-        let v = le[i] as u128 * factor as u128 + carry;
-        out[i] = (v & 0xff) as u8;
-        carry = v >> 8;
+        let prod = (le[i] as u128) * (factor as u128) + carry;
+        out[i] = prod as u8;
+        carry = prod >> 8;
     }
-    if carry != 0 {
-        return [0xff; 32];
+    if carry > 0 {
+        [0xff; 32]
+    } else {
+        out
     }
-    out
 }
 
 /// Everything `official_grind::mine_share` needs for one job, derived from the
@@ -150,8 +150,8 @@ pub fn build_official_job(
 
     Ok(OfficialJob {
         header,
+        bound_le: share_bound_le(difficulty, &config),
         config,
-        bound_le: share_bound_le(difficulty),
         target_be: None,
         m,
         n,
@@ -225,19 +225,26 @@ mod tests {
         assert_eq!(cfg.to_bytes().len(), MiningConfiguration::SERIALIZED_SIZE);
     }
 
-    /// `share_bound_le` must be the little-endian image of the big-endian share
-    /// target, and order correctly: bigger difficulty ⇒ smaller bound.
+    fn sample_params() -> MiningParams {
+        MiningParams {
+            m: 256,
+            n: 128,
+            k: 4032,
+            rank: 128,
+            rows_pattern: vec![0, 8, 64, 72],
+            cols_pattern: vec![0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105],
+            mma_type: "Int7xInt7ToInt32".into(),
+        }
+    }
+
     #[test]
     fn share_bound_le_is_le_and_monotonic() {
-        let easy = share_bound_le(1);
-        let hard = share_bound_le(1 << 20);
+        let params = sample_params();
+        let cfg = config_from_params(&params).unwrap();
+        let easy = share_bound_le(1, &cfg);
+        let hard = share_bound_le(1 << 20, &cfg);
         // little-endian: most-significant byte is the last one.
         assert!(easy[31] >= hard[31], "harder difficulty must not raise the high byte");
-        // bit-exact mirror of the BE target.
-        let be = share_target_from_difficulty(42);
-        let mut le = be;
-        le.reverse();
-        assert_eq!(share_bound_le(42), le);
     }
 
     /// End-to-end: a stratum object job + params + difficulty assembles into an
