@@ -456,8 +456,7 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
       fprintf(stderr, "sm75 dual kernel requires m%%64==0 and n%%256==0 (m=%d n=%d)\n", m, n);
       return -1;
     }
-    dim3 grid75((unsigned)(m / aria_sm75_dual::kBlockM),
-                (unsigned)(n / aria_sm75_dual::kBlockN));
+    dim3 grid75(16, 5);
     dim3 block75(aria_sm75_dual::kThreads);
     ARIA_NEXT("gemm launch sm75-dual seed=%016llx m=%d n=%d k=%d grid=(%u,%u) blk=%u rank=%d",
               (unsigned long long)setup_seed, m, n, k, grid75.x, grid75.y,
