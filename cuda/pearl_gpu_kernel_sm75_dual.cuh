@@ -16,11 +16,11 @@ namespace aria_sm75_dual {
 using namespace cute;
 
 static constexpr int kBlockM = 128;
-static constexpr int kBlockN = 512;
+static constexpr int kBlockN = 256;
 static constexpr int kChunkK = 32;
 static constexpr int kMmaK = 16;
 static constexpr int kWarpRows = 8;
-static constexpr int kWarpCols = 4;
+static constexpr int kWarpCols = 2;
 static constexpr int kTilesPerWarp = 8;
 static constexpr int kWarps = kWarpRows * kWarpCols;
 static constexpr int kThreads = kWarps * 32;
@@ -45,7 +45,7 @@ __device__ __forceinline__ uint32_t rotl13_xor(uint32_t previous, uint32_t value
 #endif
 
 template <bool BigEndian = false>
-__global__ __launch_bounds__(kThreads, 1)
+__global__ __launch_bounds__(kThreads, 2)
 void grind(const int8_t* __restrict__ a,
            const int8_t* __restrict__ bt,
            int m, int n, int k, int rank,
