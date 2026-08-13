@@ -17,7 +17,7 @@ using namespace cute;
 
 static constexpr int kBlockM = 128;
 static constexpr int kBlockN = 512;
-static constexpr int kChunkK = 64;
+static constexpr int kChunkK = 32;
 static constexpr int kMmaK = 16;
 static constexpr int kWarpRows = 8;
 static constexpr int kWarpCols = 4;
@@ -69,7 +69,7 @@ void grind(const int8_t* __restrict__ a,
   const int warp_row = row_base + warp_m * 16;
   const int warp_col = col_base + warp_n * 128;
 
-  __shared__ __align__(16) uint32_t stages[kWordsStage];
+  __shared__ __align__(16) uint32_t stages[2][kWordsStage];
   __shared__ __align__(16) uint32_t transcripts[kWarps][kTilesPerWarp][kTranscript];
 
   if (lane < kTranscript) {
@@ -84,34 +84,47 @@ void grind(const int8_t* __restrict__ a,
     #pragma unroll
     for (int i = 0; i < 8; ++i) acc[tile][i] = 0;
 
-  const int chunks = k / kChunkK;
-  const int chunks_per_rank = rank / kChunkK;
+  uint4 prefetched_a;
+  uint4 prefetched_b;
+  const bool has_a = tid < 256;
 
-  for (int chunk = 0; chunk < chunks; ++chunk) {
-    const int k_offset = chunk * kChunkK;
-
-    if (tid < 512) {
-      int row = tid / 4;
-      int col_vec = tid % 4;
+  auto prefetch = [&](int k_offset) {
+    if (has_a) {
+      int row = tid / 2;
+      int col_vec = tid % 2;
       const uint4* ptr_a = reinterpret_cast<const uint4*>(
           a + static_cast<size_t>(row_base + row) * k + k_offset + col_vec * 16);
-      reinterpret_cast<uint4*>(stages)[tid] = __ldg(ptr_a);
+      prefetched_a = __ldg(ptr_a);
     }
-
-    #pragma unroll
-    for (int q = 0; q < 2; ++q) {
-      int vec_idx = tid + q * 1024;
-      int cidx = vec_idx / 4;
-      int col_vec = vec_idx % 4;
+    {
+      int cidx = tid / 2;
+      int col_vec = tid % 2;
       const uint4* ptr_bt = reinterpret_cast<const uint4*>(
           bt + static_cast<size_t>(col_base + cidx) * k + k_offset + col_vec * 16);
-      reinterpret_cast<uint4*>(stages + kWordsA)[vec_idx] = __ldg(ptr_bt);
+      prefetched_b = __ldg(ptr_bt);
     }
+  };
 
-    __syncthreads();
+  auto publish = [&](int stage) {
+    if (has_a) {
+      reinterpret_cast<uint4*>(stages[stage])[tid] = prefetched_a;
+    }
+    reinterpret_cast<uint4*>(stages[stage] + kWordsA)[tid] = prefetched_b;
+  };
 
-    const uint32_t* sa = stages;
-    const uint32_t* sb = stages + kWordsA;
+  const int chunks = k / kChunkK;
+  const int chunks_per_rank = rank / kChunkK;
+  prefetch(0);
+  publish(0);
+  __syncthreads();
+
+  for (int chunk = 0; chunk < chunks; ++chunk) {
+    const int current = chunk & 1;
+    const bool have_next = chunk + 1 < chunks;
+    if (have_next) prefetch((chunk + 1) * kChunkK);
+
+    const uint32_t* sa = stages[current];
+    const uint32_t* sb = stages[current] + kWordsA;
     const int a_row0 = warp_m * 16 + lane_group;
     const int a_row1 = a_row0 + 8;
 
@@ -150,7 +163,10 @@ void grind(const int8_t* __restrict__ a,
       }
     }
 
-    __syncthreads();
+    if (have_next) {
+      publish(1 - current);
+      __syncthreads();
+    }
   }
 
   if (lane == 0) {
