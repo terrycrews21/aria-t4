@@ -186,15 +186,50 @@ __device__ __forceinline__ void blake3_unkeyed_64(const uint32_t msg16[16], uint
   for (int i = 0; i < 8; ++i) out8[i] = cv(i);
 }
 
-// seeds = stir(job_key, hash_a, hash_b) : b_seed=blake3(job_key‖hash_b),
-//          a_seed=blake3(b_seed‖hash_a). (hash_* en u32[8] LE).
-__global__ void stir_kernel(const uint32_t* hash_a, const uint32_t* hash_b,
-                            const uint32_t* job_key, uint32_t* a_seed, uint32_t* b_seed) {
-  if (threadIdx.x || blockIdx.x) return;
+// ---- (2c) blake3 KEYED d'un bloc 64o (= blake3_digest(msg, Some(key))) ----
+__device__ __forceinline__ void blake3_keyed_64(const uint32_t msg16[16], const uint32_t key8[8], uint32_t out8[8]) {
+  blake3::CompressParams p{};
+  p.counter = 0; p.block_len = blake3::MSG_BLOCK_SIZE;
+  p.flags = blake3::CHUNK_START | blake3::CHUNK_END | blake3::ROOT | blake3::KEYED_HASH;
+  auto m = make_tensor<uint32_t>(Int<16>{});
+  for (int i = 0; i < 16; ++i) m(i) = msg16[i];
+  auto cv = make_tensor<uint32_t>(Int<8>{});
+  for (int i = 0; i < 8; ++i) cv(i) = key8[i];   // CV init = KEY (keyed hash)
+  blake3::compress_msg_block_u32(m, cv, p);
+  for (int i = 0; i < 8; ++i) out8[i] = cv(i);
+}
+
+// V3 (hard fork @ bloc 99 000, cert_version 3) : salage des racines Merkle avant
+// la chaîne de seeds — `zk_pow::api::seed::bind_root_*` bit-exact.
+// SEED_SALT_A = blake3("pearl/cert-v3/noise-seed/A"), SEED_SALT_B = .../B (mots LE).
+static __device__ __constant__ uint32_t SEED_SALT_A_W[8] = {
+  0x6c404982u, 0x1615eda0u, 0x92f61696u, 0xf876f0fcu,
+  0x2adbdb92u, 0x52b82370u, 0x1977d4f0u, 0x7b0190c3u };
+static __device__ __constant__ uint32_t SEED_SALT_B_W[8] = {
+  0x32063011u, 0xca0163ecu, 0x71afe22bu, 0x4f4d3f8bu,
+  0x39c6e91au, 0x04cce888u, 0x1d304448u, 0xa99ab871u };
+
+// bind_root(root, dim, salt) = blake3(root ‖ dim(u32 LE) ‖ 28·0, key=salt) — 1 bloc 64o.
+__device__ __forceinline__ void bind_root_dev(const uint32_t root8[8], uint32_t dim, const uint32_t salt8[8], uint32_t out8[8]) {
   uint32_t msg[16];
-  for (int i = 0; i < 8; ++i) { msg[i] = job_key[i]; msg[8 + i] = hash_b[i]; }
+  for (int i = 0; i < 8; ++i) msg[i] = root8[i];
+  msg[8] = dim;
+  for (int i = 9; i < 16; ++i) msg[i] = 0;
+  blake3_keyed_64(msg, salt8, out8);
+}
+
+// seeds = stir(job_key, bind(hash_a,m), bind(hash_b,n)) : règle V3.
+// b_seed=blake3(job_key‖bind_b), a_seed=blake3(b_seed‖bind_a). (hash_* en u32[8] LE).
+__global__ void stir_kernel(const uint32_t* hash_a, const uint32_t* hash_b,
+                            const uint32_t* job_key, uint32_t* a_seed, uint32_t* b_seed,
+                            uint32_t m, uint32_t n) {
+  if (threadIdx.x || blockIdx.x) return;
+  uint32_t ha_b[8], hb_b[8], msg[16];
+  bind_root_dev(hash_a, m, SEED_SALT_A_W, ha_b);
+  bind_root_dev(hash_b, n, SEED_SALT_B_W, hb_b);
+  for (int i = 0; i < 8; ++i) { msg[i] = job_key[i]; msg[8 + i] = hb_b[i]; }
   uint32_t bs[8]; blake3_unkeyed_64(msg, bs);
-  for (int i = 0; i < 8; ++i) { msg[i] = bs[i]; msg[8 + i] = hash_a[i]; }
+  for (int i = 0; i < 8; ++i) { msg[i] = bs[i]; msg[8 + i] = ha_b[i]; }
   uint32_t as_[8]; blake3_unkeyed_64(msg, as_);
   for (int i = 0; i < 8; ++i) { b_seed[i] = bs[i]; a_seed[i] = as_[i]; }
 }
@@ -220,15 +255,18 @@ int pearl_gpu_commit_seeds(uint64_t setup_seed, int m, int n, int k,
   gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(n<32768?n:32768)),256>>>(d_B, setup_seed, 1, n, k);
   CKR(cudaGetLastError());
 
-  // commit : tensor_hash(A, job_key) -> hash_a (idem B). num_blocks comme run_tensor_hash.
-  const uint32_t tpb=256, ns=2, lpm=256, chunk=1024;
-  auto roots_alloc = [&](uint32_t len, uint8_t** r)->int{ uint32_t nc=(len+chunk-1)/chunk, nb=(nc+tpb-1)/tpb; CKR(cudaMalloc(r,(size_t)(nb+64)*32)); return (int)nb; };
-  uint8_t *d_ra, *d_rb; int nbA=roots_alloc((uint32_t)((size_t)m*k), &d_ra); int nbB=roots_alloc((uint32_t)((size_t)n*k), &d_rb);
-  tensor_hash((const uint8_t*)d_A, (uint32_t)((size_t)m*k), (uint8_t*)d_ha, job_key, nbA, tpb, ns, lpm, d_ra, prop, 0);
-  tensor_hash((const uint8_t*)d_B, (uint32_t)((size_t)n*k), (uint8_t*)d_hb, job_key, nbB, tpb, ns, lpm, d_rb, prop, 0);
+  // commit : identique au chemin de production — pearl_simple::commit_simple
+  // (portable SM80+, bit-exact avec tensor_hash ; l'appel tensor_hash direct
+  // plante en erreur 801 TMA sur Ampere/Ada).
+  uint32_t *d_ra, *d_rb;
+  CKR(cudaMalloc(&d_ra, pearl_simple::msimple_layers_words((size_t)m*k)*4));
+  CKR(cudaMalloc(&d_rb, pearl_simple::msimple_layers_words((size_t)n*k)*4));
+  set_key(job_key);
+  pearl_simple::commit_simple((const uint8_t*)d_A, (size_t)m*k, (uint8_t*)d_ha, d_jk, d_ra, 0);
+  pearl_simple::commit_simple((const uint8_t*)d_B, (size_t)n*k, (uint8_t*)d_hb, d_jk, d_rb, 0);
   CKR(cudaDeviceSynchronize());
 
-  stir_kernel<<<1,1>>>(d_ha, d_hb, d_jk, d_as, d_bs);
+  stir_kernel<<<1,1>>>(d_ha, d_hb, d_jk, d_as, d_bs, (uint32_t)m, (uint32_t)n);
   CKR(cudaDeviceSynchronize()); CKR(cudaGetLastError());
 
   uint32_t aw[8], bw[8];
@@ -270,7 +308,7 @@ static void commit_nokey(const uint8_t* data, uint32_t data_size, uint8_t* out,
       else ARIA_NEXT("commit roots cpasync grid=(%u,%u,%u) blk=%u smem=%d size=%u",
                      grid.x, grid.y, grid.z, block.x, smem_cpa, data_size); }
   } else {
-  using MerkleTreeRootsKernel = pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages, kThreadLoadSize>;
+  using MerkleTreeRootsKernel = pearl::MerkleTreeRootsKernel<kNumConsumerThreads, kNumStages, kThreadLoadSize, /*kApplyRoot=*/false>;
   constexpr static int merkle_roots_smem_size = MerkleTreeRootsKernel::SharedStorageSize;
   typename MerkleTreeRootsKernel::Arguments args{ data, data_size, reinterpret_cast<uint8_t*>(roots) };
   typename MerkleTreeRootsKernel::Params kp = MerkleTreeRootsKernel::to_underlying_arguments(args);
@@ -368,7 +406,7 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   cudaEventRecord(c->eB, c->sB);
   // Phase 2 : stir sur sA (attend hash_b côté sB)
   cudaStreamWaitEvent(c->sA, c->eB, 0);
-  stir_kernel<<<1,1,0,c->sA>>>(c->d_ha,c->d_hb,c->d_jk,c->d_as,c->d_bs);
+  stir_kernel<<<1,1,0,c->sA>>>(c->d_ha,c->d_hb,c->d_jk,c->d_as,c->d_bs,(uint32_t)c->m,(uint32_t)c->n);
   cudaEventRecord(c->eStir, c->sA);
   if (c->do_timing) cudaEventRecord(c->tMid, c->sA); // fin gen+commit+stir, avant noise
   // Phase 3 : noise A‖B (sB attend les seeds via eStir)
@@ -612,7 +650,7 @@ static void prologue_A_slot(Ctx* c, uint64_t seed, int8_t* dA, uint32_t* dha, ui
   cudaEventRecord(c->p0, s);
   gen_signal_kernel<<<dim3(((k>>2)+255)/256,(unsigned)(m<32768?m:32768)),256,0,s>>>(dA, seed, 0, m, k);
   pearl_simple::commit_simple((const uint8_t*)dA,(size_t)m*k,(uint8_t*)dha,c->d_jk,c->d_mtA,s);
-  stir_kernel<<<1,1,0,s>>>(dha,c->d_hb,c->d_jk,das,c->d_bs);
+  stir_kernel<<<1,1,0,s>>>(dha,c->d_hb,c->d_jk,das,c->d_bs,(uint32_t)c->m,(uint32_t)c->n);
   cudaEventRecord(c->pMid, s);
   perm_k_<<<(k+255)/256,256,0,s>>>(c->d_sla, das, k, c->d_faA, c->d_saA, c->rank);
   noise_add_k_<<<m,256,0,s>>>(c->d_sla, das, m, k, c->d_faA, c->d_saA, dA, c->rank);
@@ -659,7 +697,7 @@ static int resident_run2(Ctx* c, uint64_t seed, uint64_t next_seed, int has_next
     }
     cudaEventRecord(c->eB, c->sB);
     cudaStreamWaitEvent(c->sA, c->eB, 0);
-    stir_kernel<<<1,1,0,c->sA>>>(dha_[0],c->d_hb,c->d_jk,das_[0],c->d_bs);
+    stir_kernel<<<1,1,0,c->sA>>>(dha_[0],c->d_hb,c->d_jk,das_[0],c->d_bs,(uint32_t)c->m,(uint32_t)c->n);
     cudaEventRecord(c->eStir, c->sA);
     if (c->do_timing) cudaEventRecord(c->tMid, c->sA);
     perm_k_<<<(k+255)/256,256,0,c->sA>>>(c->d_sla, das_[0], k, c->d_faA, c->d_saA, c->rank);
@@ -921,7 +959,7 @@ static void launch_chain2(Ctx2* c, int slot, uint64_t seed, const uint8_t job_ke
   // commit SANS set_key (clé posée 1× par batch) → overlap réel des streams
   pearl_simple::commit_simple((const uint8_t*)c->d_A[slot],(size_t)m*k,(uint8_t*)c->d_ha[slot],c->d_jk,c->d_mt[slot],s);
   pearl_simple::commit_simple((const uint8_t*)c->d_B[slot],(size_t)n*k,(uint8_t*)c->d_hb[slot],c->d_jk,c->d_mt[slot],s);
-  stir_kernel<<<1,1,0,s>>>(c->d_ha[slot],c->d_hb[slot],c->d_jk,c->d_as[slot],c->d_bs[slot]);
+  stir_kernel<<<1,1,0,s>>>(c->d_ha[slot],c->d_hb[slot],c->d_jk,c->d_as[slot],c->d_bs[slot],(uint32_t)c->m,(uint32_t)c->n);
   // noise_rank : même env ARIA_RANK que le chemin résident (lu 1×, défaut 128).
   static const int rank = [](){ const char* r = getenv("ARIA_RANK"); int v = r ? atoi(r) : 128;
     return (v >= 128 && v <= 256 && (v & (v-1)) == 0) ? v : 128; }();

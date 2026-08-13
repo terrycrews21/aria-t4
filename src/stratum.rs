@@ -32,6 +32,9 @@ pub enum JobEvent {
 pub struct Submission {
     pub job_id: String,
     pub proof_base64: String,
+    /// Instantaneous miner-reported hashrate (MAC/s convention) — HeroMiners
+    /// echoes it on the dashboard; informational only, the pool re-verifies.
+    pub hs: f64,
 }
 
 /// Wire dialect spoken by the pool.
@@ -41,6 +44,11 @@ pub enum Dialect {
     Pearl,
     /// LuckyPool Pearl GPU
     LuckyPool,
+    /// HeroMiners/gfwroute stratum "v2" — object-param JSON-RPC, notify carries
+    /// {job_id, header, target, height, cert_version}, submit carries
+    /// {hs, job_id, plain_proof} with plain_proof = base64(gzip(bincode)).
+    /// Wire shape captured from PeakMiner 2.9.0 accepted sessions.
+    HeroMiners,
 }
 
 pub struct StratumConfig {
@@ -278,6 +286,35 @@ async fn run_session(
             pending.insert(next_id, "mining.authorize");
             next_id += 1;
         }
+        Dialect::HeroMiners => {
+            // PeakMiner-captured order: subscribe first, then a v2 authorize
+            // whose wallet field carries the whole wallet.worker, worker empty.
+            send(
+                &mut wr,
+                next_id,
+                "mining.subscribe",
+                json!([concat!("ariaminer/", env!("CARGO_PKG_VERSION")), login]),
+            )
+            .await?;
+            pending.insert(next_id, "mining.subscribe");
+            next_id += 1;
+
+            send(
+                &mut wr,
+                next_id,
+                "mining.authorize",
+                json!({
+                    "agent": concat!("ariaminer/", env!("CARGO_PKG_VERSION")),
+                    "password": cfg.password,
+                    "type": "v2",
+                    "wallet": login,
+                    "worker": "",
+                }),
+            )
+            .await?;
+            pending.insert(next_id, "mining.authorize");
+            next_id += 1;
+        }
     }
 
     loop {
@@ -315,6 +352,7 @@ async fn run_session(
                 let params = match cfg.dialect {
                     Dialect::Pearl => json!([login, sub.job_id, sub.proof_base64]),
                     Dialect::LuckyPool => json!({"job_id": sub.job_id, "plain_proof": sub.proof_base64}),
+                    Dialect::HeroMiners => json!({"hs": sub.hs, "job_id": sub.job_id, "plain_proof": sub.proof_base64}),
                 };
                 send(&mut wr, next_id, "mining.submit", params).await?;
                 pending.insert(next_id, "mining.submit");

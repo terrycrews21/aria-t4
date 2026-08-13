@@ -34,13 +34,13 @@ fn main() {
     };
     println!("  preuve 2×64 obtenue, vérification officielle …");
 
-    if let Err(e) = zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof) {
+    if let Err(e) = ariaminer::official_proof::parse_plain_proof(header, &proof) {
         println!("  ❌ parse_plain_proof ÉCHOUE : {e:?}");
         std::process::exit(1);
     }
     println!("  ✅ parse_plain_proof OK (roots == hash_a/hash_b)");
 
-    match zk_pow::api::verify::verify_plain_proof(&header, &proof) {
+    match zk_pow::api::verify::verify_plain_proof(&header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted) {
         Ok(_) => println!("\n🎉 ÉTAPE 2 RÉUSSIE — jackpot GPU 2×64 BIT-EXACT (verify_plain_proof OK)"),
         Err(e) => {
             println!("\n❌ verify_plain_proof ÉCHOUE : {e:?}");

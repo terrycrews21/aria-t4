@@ -117,7 +117,7 @@ fn main() -> std::io::Result<()> {
                 let Some(j) = j else { std::thread::sleep(Duration::from_millis(50)); continue };
                 seed = seed.wrapping_add(0x9E3779B97F4A7C15);
                 let job_key = compute_job_key_pub(&j.header, &j.config);
-                let bound = share_bound_le(difficulty.load(Ordering::Relaxed));
+                let bound = share_bound_le(difficulty.load(Ordering::Relaxed), &j.config);
                 let (_found, hits) = ctx.grind(seed, &job_key, &bound);
                 setups += 1;
                 let valid: Vec<Hit> = hits.into_iter().filter(|h| h.rows.len() == 2 && h.cols.len() == 64).collect();

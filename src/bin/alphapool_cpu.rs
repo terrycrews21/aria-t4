@@ -31,7 +31,7 @@ fn alphapool_config() -> MiningConfiguration {
         mma_type: MMAType::Int7xInt7ToInt32,
         rows_pattern: PeriodicPattern::from_list(&[0, 32]).unwrap(),
         cols_pattern: PeriodicPattern::from_list(&cols).unwrap(),
-        reserved: MiningConfiguration::RESERVED_VALUE,
+        moe: None,
     }
 }
 
@@ -97,7 +97,7 @@ fn main() -> std::io::Result<()> {
             loop {
                 let j = { job.lock().unwrap().clone() };
                 let Some(j) = j else { std::thread::sleep(Duration::from_millis(50)); continue };
-                let bound = share_bound_le(difficulty.load(Ordering::Relaxed));
+                let bound = share_bound_le(difficulty.load(Ordering::Relaxed), &config);
                 if let Some(proof) = try_mine_one_bounded(&mut ws, &mut rng, M, N, K, &j.header, &config, &bound) {
                     if let Ok(b64) = encode_base64(&proof) {
                         send(&writer, &format!(

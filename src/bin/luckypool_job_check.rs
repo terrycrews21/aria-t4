@@ -78,7 +78,7 @@ fn main() {
     let mut ws = Workspace::new();
     let proof = build_proof_from_hit_fixb(s1, s0, &hit, &jk, m, n, k, rank, &mut ws);
 
-    match zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof) {
+    match ariaminer::official_proof::parse_plain_proof(header, &proof) {
         Err(e) => println!("❌ parse_plain_proof ÉCHOUE : {e:?} → header/pipeline KO"),
         Ok((privp, public)) => {
             // Recompute OFFICIEL du jackpot — même chaîne que verify_plain_proof

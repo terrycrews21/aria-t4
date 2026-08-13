@@ -20,7 +20,7 @@ use ariaminer::official_grind::Workspace;
 use ariaminer::official_grind::{
     build_proofs_from_setup_gpu_fixb, canonical_gpu_config, compute_job_key_pub,
 };
-use ariaminer::official_proof::encode_base64;
+use ariaminer::official_proof::{encode_base64, encode_base64_gzip};
 use ariaminer::mouchard::Mouchard;
 use ariaminer::protocol::{Job, MiningParams};
 use ariaminer::stratum::{Dialect, JobEvent, StratumConfig, Submission, run as stratum_run};
@@ -67,6 +67,23 @@ fn luckypool_default_params() -> MiningParams {
         n: 131_072,
         k: 4096,
         rank: 256,
+        rows_pattern: vec![0, 8, 32, 40, 64, 72, 96, 104],
+        cols_pattern: vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
+        mma_type: "Int7xInt7ToInt32".into(),
+    }
+}
+
+/// HeroMiners/gfwroute params: no `pearl.set_mining_params` rides the v2 wire,
+/// so these are self-declared. Only the patterns/rank are consensus-relevant
+/// (committed via job_key + reconstructed verifier-side from the submitted
+/// indices); m/n are the miner's own batch (advisory). Canonical GPU MMA
+/// fragment 8×16, rank 128, k=8192 (post-fork mainnet shape).
+fn herominers_default_params() -> MiningParams {
+    MiningParams {
+        m: 131_072,
+        n: 131_072,
+        k: 8192,
+        rank: 128,
         rows_pattern: vec![0, 8, 32, 40, 64, 72, 96, 104],
         cols_pattern: vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
         mma_type: "Int7xInt7ToInt32".into(),
@@ -167,6 +184,8 @@ fn spawn_grind(
     // m·n·k of the current setup — lets the reporter show a stable, deterministic
     // hashrate (setups/s × work) instead of the noisy share-luck estimate.
     work_per_setup: Arc<AtomicU64>,
+    hs_arc: Arc<AtomicU64>,
+    dialect: Dialect,
     submit_tx: mpsc::Sender<Submission>,
     mouchard: Arc<Mouchard>,
 ) -> GrindGen {
@@ -188,6 +207,7 @@ fn spawn_grind(
             let credited = Arc::clone(&credited);
             let diff_arc = Arc::clone(&diff_arc);
             let work_per_setup = Arc::clone(&work_per_setup);
+            let hs_arc = Arc::clone(&hs_arc);
             let submit_tx = submit_tx.clone();
             let mouchard = Arc::clone(&mouchard);
             thread::spawn(move || {
@@ -211,12 +231,18 @@ fn spawn_grind(
                     );
                     attempts.fetch_add(1, Ordering::Relaxed);
                     if let Some(proof) = hit {
-                        if let Ok(proof_base64) = encode_base64(&proof) {
+                        let enc = if dialect == Dialect::HeroMiners {
+                            encode_base64_gzip(&proof)
+                        } else {
+                            encode_base64(&proof)
+                        };
+                        if let Ok(proof_base64) = enc {
                             shares.fetch_add(1, Ordering::Relaxed);
                             credited.fetch_add(diff_arc.load(Ordering::Relaxed), Ordering::Relaxed);
                             let _ = submit_tx.try_send(Submission {
                                 job_id: job.job_id.clone(),
                                 proof_base64,
+                                hs: hs_arc.load(Ordering::Relaxed) as f64,
                             });
                         }
                     }
@@ -323,7 +349,7 @@ fn spawn_grind(
                                 );
                                 mouchard.record_build(bt0.elapsed().as_nanos() as u64);
                                 for proof in &proofs {
-                                    if let Ok((private_params, public_params)) = zk_pow::ffi::plain_proof::parse_plain_proof(job.official.header, proof) {
+                                    if let Ok((private_params, public_params)) = ariaminer::official_proof::parse_plain_proof(job.official.header, proof) {
                                         let compiled = zk_pow::api::proof_utils::CompiledPublicParams::from(&public_params);
                                         let noise = zk_pow::circuit::pearl_noise::compute_noise(&compiled);
                                         let jackpot = zk_pow::circuit::chip::compute_jackpot(&compiled, &private_params.s_a, &private_params.s_b, &noise);
@@ -338,11 +364,17 @@ fn spawn_grind(
                                             }
                                         }
                                         if is_valid {
-                                            if let Ok(proof_base64) = encode_base64(proof) {
+                                            let enc = if dialect == Dialect::HeroMiners {
+                                                encode_base64_gzip(proof)
+                                            } else {
+                                                encode_base64(proof)
+                                            };
+                                            if let Ok(proof_base64) = enc {
                                                 shares.fetch_add(1, Ordering::Relaxed);
                                                 credited.fetch_add(diff_arc.load(Ordering::Relaxed), Ordering::Relaxed);
                                                 let _ = submit_tx.try_send(Submission {
                                                     job_id: job.job_id.clone(), proof_base64,
+                                                    hs: hs_arc.load(Ordering::Relaxed) as f64,
                                                 });
                                             }
                                         } else {
@@ -421,6 +453,8 @@ async fn autotune_grid(
             Arc::clone(credited),
             Arc::clone(diff_arc),
             Arc::new(AtomicU64::new(0)), // autotune: hashrate display not needed
+            Arc::new(AtomicU64::new(0)), // autotune: hs submit field unused
+            Dialect::Pearl,               // autotune never submits — encoding arm irrelevant
             submit_tx.clone(),
             Arc::new(Mouchard::disabled()), // autotune : pas de télémétrie (fenêtres réelles seulement)
         );
@@ -572,9 +606,11 @@ async fn main() -> anyhow::Result<()> {
     let worker = if args.worker.is_empty() { "aria" } else { args.worker.as_str() };
 
     let (host, port) = if let Some((h, p)) = pool.rsplit_once(':') {
-        (h, p.parse::<u16>().unwrap_or(3360))
+        (h, p.parse::<u16>().unwrap_or(1200))
+    } else if pool.is_empty() {
+        ("br.pearl.gfwroute.com", 1200)
     } else {
-        ("pearl-pl.luckypool.io", 3360)
+        (pool, 1200)
     };
 
     print_banner(if pool.is_empty() { "WSS Proxy" } else { pool }, if wallet.is_empty() { "Proxy Injected" } else { wallet }, &args.worker, threads);
@@ -585,8 +621,17 @@ async fn main() -> anyhow::Result<()> {
     let dialect = match args.dialect.as_deref() {
         Some("luckypool") => Dialect::LuckyPool,
         Some("pearl") => Dialect::Pearl,
-        Some(other) => anyhow::bail!("--dialect must be \"pearl\" or \"luckypool\", got {other}"),
-        None => Dialect::LuckyPool,
+        Some("herominers") => Dialect::HeroMiners,
+        Some(other) => anyhow::bail!("--dialect must be \"pearl\", \"luckypool\" or \"herominers\", got {other}"),
+        None => {
+            let pool_arg = args.pool.as_deref().unwrap_or("");
+            let host = pool_arg.rsplit_once(':').map(|(h, _)| h).unwrap_or(pool_arg);
+            if host.contains("gfwroute") || host.contains("herominers") {
+                Dialect::HeroMiners
+            } else {
+                Dialect::LuckyPool
+            }
+        }
     };
     if dialect == Dialect::LuckyPool {
         // LuckyPool mainnet impose : kernel MULTISTAGE TMA (cols période-256),
@@ -712,6 +757,7 @@ async fn main() -> anyhow::Result<()> {
     let mut cur_params: Option<MiningParams> = match dialect {
         Dialect::LuckyPool => Some(luckypool_default_params()),
         Dialect::Pearl => None,
+        Dialect::HeroMiners => Some(herominers_default_params()),
     };
     let mut cur_difficulty: u64 = 524_288;
     let mut grind_gen: Option<GrindGen> = None;
@@ -775,6 +821,22 @@ async fn main() -> anyhow::Result<()> {
                         diff_arc.store(d, Ordering::Relaxed);
                     }
                 }
+                // HeroMiners: the job_id suffix is the share difficulty in
+                // Bitcoin-normalized units (d_pool = suffix × 2^32 blake-hash
+                // equivalents — nailed down against two pool-accepted ProofOfWork
+                // captures: hash ≤ (2^256−1)/d_pool × tile·(k/rank)·128 holds
+                // exactly then). ×2^32 saturating: plenty of headroom (suffix
+                // is 2^21 today).
+                if dialect == Dialect::HeroMiners {
+                    if let Some(dsuf) = diff_from_job_id(&job.job_id) {
+                        let d = dsuf.saturating_mul(1u64 << 32);
+                        if d != cur_difficulty {
+                            tracing::info!(suffix = dsuf, difficulty = d, "difficulty (herominers job_id ×2^32)");
+                        }
+                        cur_difficulty = d;
+                        diff_arc.store(d, Ordering::Relaxed);
+                    }
+                }
                 let gj = match build_grind_job(&params, &job, cur_difficulty) {
                     Ok(mut g) => {
                         if dialect == Dialect::LuckyPool {
@@ -827,6 +889,8 @@ async fn main() -> anyhow::Result<()> {
                             Arc::clone(&credited),
                             Arc::clone(&diff_arc),
                             Arc::clone(&work_per_setup),
+                            Arc::clone(&hashrate_hs),
+                            dialect,
                             submit_tx.clone(),
                             Arc::clone(&mouchard),
                         ));

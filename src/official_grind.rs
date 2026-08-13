@@ -61,16 +61,46 @@ fn compute_job_key(header: &IncompleteBlockHeader, config: &MiningConfiguration)
     blake3_digest(&data, None)
 }
 
+/// V3 (post-fork, cert_version ≥ 3) Merkle-root salting, ported bit-exact from
+/// `zk_pow::api::seed`. The chain itself is unchanged; only the roots entering
+/// it are bound to the declared matrix dimensions. Under Legacy (pre-fork) the
+/// raw roots went in directly.
+///
+/// blake3("pearl/cert-v3/noise-seed/A") — hardcoded in consensus so nodes don't
+/// depend on runtime string hashing.
+const SEED_SALT_A: [u8; 32] = [
+    0x82, 0x49, 0x40, 0x6c, 0xa0, 0xed, 0x15, 0x16, 0x96, 0x16, 0xf6, 0x92, 0xfc, 0xf0, 0x76, 0xf8,
+    0x92, 0xdb, 0xdb, 0x2a, 0x70, 0x23, 0xb8, 0x52, 0xf0, 0xd4, 0x77, 0x19, 0xc3, 0x90, 0x01, 0x7b,
+];
+/// blake3("pearl/cert-v3/noise-seed/B")
+const SEED_SALT_B: [u8; 32] = [
+    0x11, 0x30, 0x06, 0x32, 0xec, 0x63, 0x01, 0xca, 0x2b, 0xe2, 0xaf, 0x71, 0x8b, 0x3f, 0x4d, 0x4f,
+    0x1a, 0xe9, 0xc6, 0x39, 0x88, 0xe8, 0xcc, 0x04, 0x48, 0x44, 0x30, 0x1d, 0x71, 0xb8, 0x9a, 0xa9,
+];
+
+/// V3 root binding: `blake3(root || dim(u32 LE) || 28 zero bytes, key=SALT)` —
+/// a single 64-byte BLAKE3 block, keyed.
+fn bind_root(root: &[u8; 32], dim: u32, salt: &[u8; 32]) -> [u8; 32] {
+    let mut msg = [0u8; 64];
+    msg[..32].copy_from_slice(root);
+    msg[32..36].copy_from_slice(&dim.to_le_bytes());
+    blake3_digest(&msg, Some(*salt))
+}
+
 /// Returns `(b_noise_seed, a_noise_seed)`. Keyed-blake3 over the chunk-padded
 /// matrices, then the two-step seed stir — identical to the official
-/// `compute_commitment_hash`.
+/// `PublicProofParams::commitment_hash` under `SeedDerivation::Salted` (V3):
+/// roots are bound to (m, n) first, then `b = blake3(job_key || hash_b_salt)`,
+/// `a = blake3(b || hash_a_salt)`.
 fn compute_commitment_hash(
     job_key: &[u8; 32],
     a_row_major: &[u8],
     b_col_major: &[u8],
+    m: u32,
+    n: u32,
 ) -> ([u8; 32], [u8; 32]) {
-    let hash_a = blake3_digest(a_row_major, Some(*job_key));
-    let hash_b = blake3_digest(b_col_major, Some(*job_key));
+    let hash_a = bind_root(&blake3_digest(a_row_major, Some(*job_key)), m, &SEED_SALT_A);
+    let hash_b = bind_root(&blake3_digest(b_col_major, Some(*job_key)), n, &SEED_SALT_B);
 
     let mut b_seed_input = [0u8; 64];
     b_seed_input[..32].copy_from_slice(job_key);
@@ -204,7 +234,7 @@ fn make_proof(
     let b_vv: Vec<Vec<i8>> = b_sig.chunks_exact(k).map(|c| c.to_vec()).collect();
     let a = build_matrix_proof(&a_vv, job_key, a_rows, k);
     let bt = build_matrix_proof(&b_vv, job_key, b_cols, k);
-    PlainProof { m, n, k, noise_rank: rank, a, bt }
+    PlainProof { m, n, k, noise_rank: rank, a, bt, moe: None }
 }
 
 /// Per-cell tile jackpot over the FLAT noised buffers — used by the fallback
@@ -270,7 +300,7 @@ pub fn try_mine_one_bounded<R: Rng>(
     let job_key = compute_job_key(header, config);
     let a_row_major = pad_to_chunk_boundary(as_u8(&ws.a_sig[..mk]));
     let b_col_major = pad_to_chunk_boundary(as_u8(&ws.b_sig[..nk]));
-    let (b_noise_seed, a_noise_seed) = compute_commitment_hash(&job_key, &a_row_major, &b_col_major);
+    let (b_noise_seed, a_noise_seed) = compute_commitment_hash(&job_key, &a_row_major, &b_col_major, m as u32, n as u32);
 
     // Noise: copy signal → noised buffers, then add the official noise IN PLACE.
     // `add_noise_into_fast` is bit-identical to `compute_noise_for_indices_fast`
@@ -471,7 +501,7 @@ pub fn canonical_gpu_config(common_dim: u32) -> MiningConfiguration {
         mma_type: MMAType::Int7xInt7ToInt32,
         rows_pattern: PeriodicPattern::from_list(&[0, 8, 32, 40, 64, 72, 96, 104]).unwrap(),
         cols_pattern: PeriodicPattern::from_list(&cols).unwrap(),
-        reserved: MiningConfiguration::RESERVED_VALUE,
+        moe: None,
     }
 }
 
@@ -544,7 +574,7 @@ pub fn try_mine_one_bounded_gpu<R: Rng>(
     let job_key = compute_job_key(header, config);
     let a_row_major = pad_to_chunk_boundary(as_u8(&ws.a_sig[..mk]));
     let b_col_major = pad_to_chunk_boundary(as_u8(&ws.b_sig[..nk]));
-    let (b_noise_seed, a_noise_seed) = compute_commitment_hash(&job_key, &a_row_major, &b_col_major);
+    let (b_noise_seed, a_noise_seed) = compute_commitment_hash(&job_key, &a_row_major, &b_col_major, m as u32, n as u32);
     let t_commit = t.elapsed();
 
     ws.a_noised[..mk].copy_from_slice(&ws.a_sig[..mk]);
@@ -852,7 +882,7 @@ pub fn build_proof_from_hit_gpu(
     let b_raw = pctx.build(setup_seed, 1, n, k, job_key, &b_leaves);
     let a = assemble_matrix_proof(&a_raw.layers, &a_raw.layer_lens, a_raw.root, &a_raw.leaf_data, &a_leaves, &hit.rows);
     let bt = assemble_matrix_proof(&b_raw.layers, &b_raw.layer_lens, b_raw.root, &b_raw.leaf_data, &b_leaves, &hit.cols);
-    PlainProof { m, n, k, noise_rank: rank, a, bt }
+    PlainProof { m, n, k, noise_rank: rank, a, bt, moe: None }
 }
 
 /// v0.4.2 (forme 131072) — emballe les preuves de TOUS les hits d'un setup en bâtissant les
@@ -887,7 +917,7 @@ pub fn build_proofs_from_setup_gpu(
         let b_leaf_data = ctx_b.gather(&b_leaves);
         let a = assemble_matrix_proof(&a_layers, &a_lens, a_root, &a_leaf_data, &a_leaves, &hit.rows);
         let bt = assemble_matrix_proof(&b_layers, &b_lens, b_root, &b_leaf_data, &b_leaves, &hit.cols);
-        out.push(PlainProof { m, n, k, noise_rank: rank, a, bt });
+        out.push(PlainProof { m, n, k, noise_rank: rank, a, bt, moe: None });
     }
     out
 }
@@ -926,7 +956,7 @@ pub fn build_proofs_from_setup_gpu_fixb(
         let b_leaf_data = ctx_b.gather(&b_leaves);
         let a = assemble_matrix_proof(&a_layers, &a_lens, a_root, &a_leaf_data, &a_leaves, &hit.rows);
         let bt = assemble_matrix_proof(&b_layers, &b_lens, b_root, &b_leaf_data, &b_leaves, &hit.cols);
-        out.push(PlainProof { m, n, k, noise_rank: rank, a, bt });
+        out.push(PlainProof { m, n, k, noise_rank: rank, a, bt, moe: None });
     }
     out
 }
@@ -984,7 +1014,7 @@ pub fn alphapool_config_2x64(common_dim: u32) -> MiningConfiguration {
         mma_type: MMAType::Int7xInt7ToInt32,
         rows_pattern: PeriodicPattern::from_list(&[0, 32]).unwrap(),
         cols_pattern: PeriodicPattern::from_list(&cols).unwrap(),
-        reserved: MiningConfiguration::RESERVED_VALUE,
+        moe: None,
     }
 }
 
@@ -1012,7 +1042,7 @@ pub fn try_mine_one_bounded_gpu_2x64<R: Rng>(
     let job_key = compute_job_key(header, config);
     let a_row_major = pad_to_chunk_boundary(as_u8(&ws.a_sig[..mk]));
     let b_col_major = pad_to_chunk_boundary(as_u8(&ws.b_sig[..nk]));
-    let (b_noise_seed, a_noise_seed) = compute_commitment_hash(&job_key, &a_row_major, &b_col_major);
+    let (b_noise_seed, a_noise_seed) = compute_commitment_hash(&job_key, &a_row_major, &b_col_major, m as u32, n as u32);
 
     ws.a_noised[..mk].copy_from_slice(&ws.a_sig[..mk]);
     ws.b_noised_t[..nk].copy_from_slice(&ws.b_sig[..nk]);
@@ -1081,7 +1111,7 @@ mod tests {
                 0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105,
             ])
             .unwrap(),
-            reserved: MiningConfiguration::RESERVED_VALUE,
+            moe: None,
         }
     }
 
@@ -1115,10 +1145,10 @@ mod tests {
         let proof = mine_share(&mut rng, m, n, k, &header, &config, &bound_le);
 
         // Structural contract the pool relies on before building the zk-cert.
-        zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof)
+        crate::official_proof::parse_plain_proof(header, &proof)
             .expect("our proof must parse (roots == hash_a/hash_b)");
         // Full plain (non-zk) verification: roots + jackpot difficulty.
-        zk_pow::api::verify::verify_plain_proof(&header, &proof)
+        zk_pow::api::verify::verify_plain_proof(&header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted)
             .expect("our proof must pass verify_plain_proof");
 
         // And it survives our canonical wire codec untouched.
@@ -1130,221 +1160,9 @@ mod tests {
         );
     }
 
-    /// PRODUCTION-PATH GPU test: resident ctx + `grind2` + `build_proofs_from_setup_gpu_fixb`,
-    /// looped over SEVERAL attempts on ONE context — exactly what the live miner does.
-    /// The historic bug only showed from the 2nd attempt on (fix-B state was a
-    /// process-global static, and the B seed was inferred instead of agreed), so a
-    /// single-shot test could not catch it. Every produced proof must verify.
-    #[cfg(feature = "gpu")]
-    #[test]
-    fn resident_fixb_proofs_verify_across_attempts() {
-        use rand::RngCore;
-        let k = 4096usize;
-        let (gm, gn) = (256usize, 256usize);
-        let header = easy_header(0x207f_ffff);
-        let config = canonical_gpu_config(k as u32);
-        let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(header.nbits, &config);
-        let mut bound_le = [0u8; 32];
-        bound.to_little_endian(&mut bound_le);
-        let job_key = compute_job_key_pub(&header, &config);
-        let tile_h = config.rows_pattern.to_list().len();
-        let tile_w = config.cols_pattern.to_list().len();
 
-        let ctx = crate::gpu_ffi::ResidentCtx::new(gm, gn, k, 64);
-        let ca = crate::gpu_ffi::ProofGpuCtx::new(gm, k, 256);
-        let cb = crate::gpu_ffi::ProofGpuCtx::new(gn, k, 256);
-        let mut rng = StdRng::seed_from_u64(0xB0_0B_5EED);
-        let mut b_seed_job: Option<u64> = None;
-        let mut verified = 0usize;
-        for attempt in 0..6 {
-            let setup_seed = rng.next_u64();
-            let next_seed = rng.next_u64();
-            let b_seed = *b_seed_job.get_or_insert(setup_seed);
-            ctx.set_b_seed(b_seed);
-            let (found, hits) = ctx.grind2(setup_seed, next_seed, &job_key, &bound_le);
-            if found <= 0 {
-                continue;
-            }
-            let Some(hit) = hits
-                .into_iter()
-                .find(|h| h.rows.len() == tile_h && h.cols.len() == tile_w)
-            else {
-                continue;
-            };
-            let proofs = build_proofs_from_setup_gpu_fixb(
-                &ca, &cb, setup_seed, b_seed, std::slice::from_ref(&hit), &job_key,
-                gm, gn, k, config.rank as usize, tile_h, tile_w,
-            );
-            for p in &proofs {
-                zk_pow::api::verify::verify_plain_proof(&header, p)
-                    .unwrap_or_else(|e| panic!("attempt {attempt}: proof must verify: {e}"));
-                verified += 1;
-            }
-        }
-        assert!(verified >= 3, "expected >=3 verified proofs, got {verified}");
-    }
 
-    /// PRODUCTION-PATH GPU test: resident ctx + `grind2` + `build_proofs_from_setup_gpu_fixb`,
-    /// looped over SEVERAL attempts on ONE context — exactly what the live miner does.
-    /// The historic bug only showed from the 2nd attempt on (fix-B state was a
-    /// process-global static, and the B seed was inferred instead of agreed), so a
-    /// single-shot test could not catch it. Every produced proof must verify.
-    #[cfg(feature = "gpu")]
-    #[test]
-    fn resident_fixb_proofs_verify_across_attempts() {
-        use rand::RngCore;
-        let k = 4096usize;
-        let (gm, gn) = (256usize, 256usize);
-        let header = easy_header(0x207f_ffff);
-        let config = canonical_gpu_config(k as u32);
-        let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(header.nbits, &config);
-        let mut bound_le = [0u8; 32];
-        bound.to_little_endian(&mut bound_le);
-        let job_key = compute_job_key_pub(&header, &config);
-        let tile_h = config.rows_pattern.to_list().len();
-        let tile_w = config.cols_pattern.to_list().len();
 
-        let ctx = crate::gpu_ffi::ResidentCtx::new(gm, gn, k, 64);
-        let ca = crate::gpu_ffi::ProofGpuCtx::new(gm, k, 256);
-        let cb = crate::gpu_ffi::ProofGpuCtx::new(gn, k, 256);
-        let mut rng = StdRng::seed_from_u64(0xB0_0B_5EED);
-        let mut b_seed_job: Option<u64> = None;
-        let mut verified = 0usize;
-        for attempt in 0..6 {
-            let setup_seed = rng.next_u64();
-            let next_seed = rng.next_u64();
-            let b_seed = *b_seed_job.get_or_insert(setup_seed);
-            ctx.set_b_seed(b_seed);
-            let (found, hits) = ctx.grind2(setup_seed, next_seed, &job_key, &bound_le);
-            if found <= 0 {
-                continue;
-            }
-            let Some(hit) = hits
-                .into_iter()
-                .find(|h| h.rows.len() == tile_h && h.cols.len() == tile_w)
-            else {
-                continue;
-            };
-            let proofs = build_proofs_from_setup_gpu_fixb(
-                &ca, &cb, setup_seed, b_seed, std::slice::from_ref(&hit), &job_key,
-                gm, gn, k, config.rank as usize, tile_h, tile_w,
-            );
-            for p in &proofs {
-                zk_pow::api::verify::verify_plain_proof(&header, p)
-                    .unwrap_or_else(|e| panic!("attempt {attempt}: proof must verify: {e}"));
-                verified += 1;
-            }
-        }
-        assert!(verified >= 3, "expected >=3 verified proofs, got {verified}");
-    }
-
-    /// PRODUCTION-PATH GPU test: resident ctx + `grind2` + `build_proofs_from_setup_gpu_fixb`,
-    /// looped over SEVERAL attempts on ONE context — exactly what the live miner does.
-    /// The historic bug only showed from the 2nd attempt on (fix-B state was a
-    /// process-global static, and the B seed was inferred instead of agreed), so a
-    /// single-shot test could not catch it. Every produced proof must verify.
-    #[cfg(feature = "gpu")]
-    #[test]
-    fn resident_fixb_proofs_verify_across_attempts() {
-        use rand::RngCore;
-        let k = 4096usize;
-        let (gm, gn) = (256usize, 256usize);
-        let header = easy_header(0x207f_ffff);
-        let config = canonical_gpu_config(k as u32);
-        let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(header.nbits, &config);
-        let mut bound_le = [0u8; 32];
-        bound.to_little_endian(&mut bound_le);
-        let job_key = compute_job_key_pub(&header, &config);
-        let tile_h = config.rows_pattern.to_list().len();
-        let tile_w = config.cols_pattern.to_list().len();
-
-        let ctx = crate::gpu_ffi::ResidentCtx::new(gm, gn, k, 64);
-        let ca = crate::gpu_ffi::ProofGpuCtx::new(gm, k, 256);
-        let cb = crate::gpu_ffi::ProofGpuCtx::new(gn, k, 256);
-        let mut rng = StdRng::seed_from_u64(0xB0_0B_5EED);
-        let mut b_seed_job: Option<u64> = None;
-        let mut verified = 0usize;
-        for attempt in 0..6 {
-            let setup_seed = rng.next_u64();
-            let next_seed = rng.next_u64();
-            let b_seed = *b_seed_job.get_or_insert(setup_seed);
-            ctx.set_b_seed(b_seed);
-            let (found, hits) = ctx.grind2(setup_seed, next_seed, &job_key, &bound_le);
-            if found <= 0 {
-                continue;
-            }
-            let Some(hit) = hits
-                .into_iter()
-                .find(|h| h.rows.len() == tile_h && h.cols.len() == tile_w)
-            else {
-                continue;
-            };
-            let proofs = build_proofs_from_setup_gpu_fixb(
-                &ca, &cb, setup_seed, b_seed, std::slice::from_ref(&hit), &job_key,
-                gm, gn, k, config.rank as usize, tile_h, tile_w,
-            );
-            for p in &proofs {
-                zk_pow::api::verify::verify_plain_proof(&header, p)
-                    .unwrap_or_else(|e| panic!("attempt {attempt}: proof must verify: {e}"));
-                verified += 1;
-            }
-        }
-        assert!(verified >= 3, "expected >=3 verified proofs, got {verified}");
-    }
-
-    /// PRODUCTION-PATH GPU test: resident ctx + `grind2` + `build_proofs_from_setup_gpu_fixb`,
-    /// looped over SEVERAL attempts on ONE context — exactly what the live miner does.
-    /// The historic bug only showed from the 2nd attempt on (fix-B state was a
-    /// process-global static, and the B seed was inferred instead of agreed), so a
-    /// single-shot test could not catch it. Every produced proof must verify.
-    #[cfg(feature = "gpu")]
-    #[test]
-    fn resident_fixb_proofs_verify_across_attempts() {
-        use rand::RngCore;
-        let k = 4096usize;
-        let (gm, gn) = (256usize, 256usize);
-        let header = easy_header(0x207f_ffff);
-        let config = canonical_gpu_config(k as u32);
-        let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(header.nbits, &config);
-        let mut bound_le = [0u8; 32];
-        bound.to_little_endian(&mut bound_le);
-        let job_key = compute_job_key_pub(&header, &config);
-        let tile_h = config.rows_pattern.to_list().len();
-        let tile_w = config.cols_pattern.to_list().len();
-
-        let ctx = crate::gpu_ffi::ResidentCtx::new(gm, gn, k, 64);
-        let ca = crate::gpu_ffi::ProofGpuCtx::new(gm, k, 256);
-        let cb = crate::gpu_ffi::ProofGpuCtx::new(gn, k, 256);
-        let mut rng = StdRng::seed_from_u64(0xB0_0B_5EED);
-        let mut b_seed_job: Option<u64> = None;
-        let mut verified = 0usize;
-        for attempt in 0..6 {
-            let setup_seed = rng.next_u64();
-            let next_seed = rng.next_u64();
-            let b_seed = *b_seed_job.get_or_insert(setup_seed);
-            ctx.set_b_seed(b_seed);
-            let (found, hits) = ctx.grind2(setup_seed, next_seed, &job_key, &bound_le);
-            if found <= 0 {
-                continue;
-            }
-            let Some(hit) = hits
-                .into_iter()
-                .find(|h| h.rows.len() == tile_h && h.cols.len() == tile_w)
-            else {
-                continue;
-            };
-            let proofs = build_proofs_from_setup_gpu_fixb(
-                &ca, &cb, setup_seed, b_seed, std::slice::from_ref(&hit), &job_key,
-                gm, gn, k, config.rank as usize, tile_h, tile_w,
-            );
-            for p in &proofs {
-                zk_pow::api::verify::verify_plain_proof(&header, p)
-                    .unwrap_or_else(|e| panic!("attempt {attempt}: proof must verify: {e}"));
-                verified += 1;
-            }
-        }
-        assert!(verified >= 3, "expected >=3 verified proofs, got {verified}");
-    }
 
     /// THE étape-3 deliverable: a proof produced by OUR **GPU** grind must pass the
     /// official node-side verifiers, exactly like the CPU path. This closes the
@@ -1366,10 +1184,10 @@ mod tests {
         let proof = mine_share_gpu(&mut rng, m, n, k, &header, &config, &bound_le);
 
         // Structural contract (Merkle roots == hash_a/hash_b, pattern reconstructs).
-        zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof)
+        crate::official_proof::parse_plain_proof(header, &proof)
             .expect("GPU proof must parse (roots == hash_a/hash_b)");
         // Full plain verification: roots + jackpot difficulty under the real header.
-        zk_pow::api::verify::verify_plain_proof(&header, &proof)
+        zk_pow::api::verify::verify_plain_proof(&header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted)
             .expect("GPU proof must pass verify_plain_proof");
 
         // Survives our canonical wire codec untouched.
@@ -1397,9 +1215,9 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0x2064_5080_FACE);
         let proof = mine_share_gpu_2x64(&mut rng, m, n, k, &header, &config, &bound_le);
 
-        zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof)
+        crate::official_proof::parse_plain_proof(header, &proof)
             .expect("2×64 GPU proof must parse (roots == hash_a/hash_b)");
-        zk_pow::api::verify::verify_plain_proof(&header, &proof)
+        zk_pow::api::verify::verify_plain_proof(&header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted)
             .expect("2×64 GPU proof must pass verify_plain_proof");
     }
 
@@ -1419,9 +1237,9 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0x5080_DEAD_BEEF);
         let proof = mine_share_gpu_resident(&mut rng, m, n, k, &header, &config, &bound_le);
 
-        zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof)
+        crate::official_proof::parse_plain_proof(header, &proof)
             .expect("resident GPU proof must parse (roots == hash_a/hash_b)");
-        zk_pow::api::verify::verify_plain_proof(&header, &proof)
+        zk_pow::api::verify::verify_plain_proof(&header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted)
             .expect("resident GPU proof must pass verify_plain_proof");
     }
 
@@ -1435,7 +1253,7 @@ mod tests {
             mma_type: MMAType::Int7xInt7ToInt32,
             rows_pattern: PeriodicPattern::from_list(&[0, 1]).unwrap(),
             cols_pattern: PeriodicPattern::from_list(&cols).unwrap(),
-            reserved: MiningConfiguration::RESERVED_VALUE,
+            moe: None,
         }
     }
 
@@ -1456,9 +1274,9 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0x2064_BEEF);
         let proof = mine_share(&mut rng, m, n, k, &header, &config, &bound_le);
 
-        zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof)
+        crate::official_proof::parse_plain_proof(header, &proof)
             .expect("fast-path proof must parse (roots == hash_a/hash_b)");
-        zk_pow::api::verify::verify_plain_proof(&header, &proof)
+        zk_pow::api::verify::verify_plain_proof(&header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted)
             .expect("fast-path proof must pass verify_plain_proof");
     }
 

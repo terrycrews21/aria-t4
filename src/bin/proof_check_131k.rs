@@ -54,11 +54,11 @@ fn main() {
 
     let mut ok = 0;
     for (i, p) in proofs.iter().enumerate() {
-        if let Err(e) = zk_pow::ffi::plain_proof::parse_plain_proof(header, p) {
+        if let Err(e) = ariaminer::official_proof::parse_plain_proof(header, p) {
             println!("  ❌ preuve {i} : parse_plain_proof échoue : {e:?}");
             std::process::exit(2);
         }
-        match zk_pow::api::verify::verify_plain_proof(&header, p) {
+        match zk_pow::api::verify::verify_plain_proof(&header, p, None, zk_pow::api::proof::SeedDerivation::Salted) {
             Ok(_) => ok += 1,
             Err(e) => {
                 println!("  ❌ preuve {i} : verify_plain_proof échoue : {e:?}");

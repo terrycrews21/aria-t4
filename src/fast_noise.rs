@@ -223,7 +223,7 @@ pub fn compute_noise_for_indices_fast(
             };
             let a = mk(&e_al, &fa, &sa);
             let b = mk(&e_br_t, &fb, &sb);
-            return MMSlice { a, b };
+            return MMSlice { a, b, routing: vec![] };
         }
     }
     // Fallback: the reference path (any rank / non-VBMI host).

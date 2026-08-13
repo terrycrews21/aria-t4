@@ -20,12 +20,39 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use zk_pow::ffi::plain_proof::PlainProof;
 
+/// Post-fork replacement for the removed v1 free function
+/// `crate::official_proof::parse_plain_proof`: structural parse (Merkle roots
+/// == committed hash_a/hash_b) plus params reconstruction under the cert-V3
+/// `SeedDerivation::Salted` rule — the exact semantics the pool applies to
+/// `mining.submit` payloads today.
+pub fn parse_plain_proof(
+    header: zk_pow::api::proof::IncompleteBlockHeader,
+    proof: &PlainProof,
+) -> Result<(
+    zk_pow::api::proof::PrivateProofParams,
+    zk_pow::api::proof::PublicProofParams,
+)> {
+    proof.parse_proof(header, zk_pow::api::proof::SeedDerivation::Salted)
+}
+
 /// Encode a `PlainProof` to the canonical base64 wire form (bincode + base64).
 ///
 /// Mirror of zk-pow's `PlainProof::to_base64`.
 pub fn encode_base64(proof: &PlainProof) -> Result<String> {
     let bytes = bincode::serialize(proof).context("bincode serialize PlainProof")?;
     Ok(B64.encode(bytes))
+}
+
+/// HeroMiners/gfwroute stratum-v2 wire form: `base64(gzip(bincode(proof)))`.
+/// Captured from PeakMiner 2.9.0's accepted `mining.submit` (plain_proof field),
+/// which decodes to a 336,080-byte bincode `PlainProof` after gunzipping.
+pub fn encode_base64_gzip(proof: &PlainProof) -> Result<String> {
+    use std::io::Write;
+    let bytes = encode_bytes(proof)?;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&bytes).context("gzip proof bytes")?;
+    let gz = enc.finish().context("gzip finish")?;
+    Ok(B64.encode(gz))
 }
 
 /// Encode a `PlainProof` to the canonical bincode bytes (no base64 wrapper).
@@ -59,7 +86,7 @@ mod tests {
                 0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105,
             ])
             .unwrap(),
-            reserved: MiningConfiguration::RESERVED_VALUE,
+            moe: None,
         }
     }
 
@@ -87,12 +114,12 @@ mod tests {
         let header = easy_header(0x207f_ffff);
         let config = test_config(k as u32);
 
-        let proof = zk_pow::ffi::mine::mine(m, n, k, header, config, None, false)
+        let proof = zk_pow::ffi::mine::mine(m, n, k, header, config, None, false, zk_pow::api::proof::SeedDerivation::Salted)
             .expect("mine should produce a PlainProof at the easiest difficulty");
 
         // Sanity: the mined proof itself parses (roots consistent) before we
         // touch serialization — isolates a format bug from a mining bug.
-        zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof)
+        crate::official_proof::parse_plain_proof(header, &proof)
             .expect("freshly mined proof must parse");
 
         // Round-trip through our canonical encoder.
@@ -117,14 +144,14 @@ mod tests {
         let (m, n, k) = (256usize, 128usize, 4032usize);
         let header = easy_header(0x207f_ffff);
         let config = test_config(k as u32);
-        let proof = zk_pow::ffi::mine::mine(m, n, k, header, config, None, false).unwrap();
+        let proof = zk_pow::ffi::mine::mine(m, n, k, header, config, None, false, zk_pow::api::proof::SeedDerivation::Salted).unwrap();
 
         let bytes = bincode::serialize(&proof).unwrap();
         assert_eq!(encode_base64(&proof).unwrap(), B64.encode(&bytes));
     }
 
     fn parse_plain_proof_ok(header: IncompleteBlockHeader, proof: &PlainProof) {
-        zk_pow::ffi::plain_proof::parse_plain_proof(header, proof)
+        crate::official_proof::parse_plain_proof(header, proof)
             .expect("decoded proof must parse (roots == hash_a/hash_b)");
     }
 }

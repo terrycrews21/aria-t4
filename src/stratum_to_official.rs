@@ -54,7 +54,7 @@ pub fn config_from_params(params: &MiningParams) -> Result<MiningConfiguration> 
         mma_type: MMAType::Int7xInt7ToInt32,
         rows_pattern,
         cols_pattern,
-        reserved: MiningConfiguration::RESERVED_VALUE,
+        moe: None,
     })
 }
 
@@ -67,14 +67,28 @@ pub fn share_bound_le(difficulty: u64, config: &MiningConfiguration) -> [u8; 32]
     difficulty_bound_from_target_be(&t, config)
 }
 
-/// Compute the exact little-endian difficulty bound for a big-endian target and MiningConfiguration
-/// using the official zk-pow formula: bound = target * (rows_size * cols_size * dot_product_length).
+/// Compute the exact little-endian difficulty bound the pool enforces post-fork:
+/// `check_rank_penalty` (`zk_pow::api::sanity_checks`, master) —
+///   bound = target × tile × (dot_product_length / rank) × PENALTY_BASE_RANK
+/// saturating at U256::MAX (identical to `scale`), and zero when the factor is
+/// degenerate (which the pool rejects). Jackpot is compared
+/// `U256::from_little_endian(hash) ≤ bound`.
 pub fn difficulty_bound_from_target_be(target_be: &[u8; 32], config: &MiningConfiguration) -> [u8; 32] {
-    let h = config.rows_pattern.size() as usize;
-    let w = config.cols_pattern.size() as usize;
-    let tile_size = h * w;
-    let factor = (tile_size * config.dot_product_length()) as u64;
-    scaled_bound_le_from_target_be(target_be, factor)
+    use zk_pow::api::sanity_checks::PENALTY_BASE_RANK;
+    let rank = (config.rank as usize).max(1);
+    let tile_size = config.rows_pattern.size() as usize * config.cols_pattern.size() as usize;
+    let factor = tile_size * (config.dot_product_length() / rank) * PENALTY_BASE_RANK;
+    let target = primitive_types::U256::from_big_endian(target_be);
+    let bound = if factor == 0 {
+        primitive_types::U256::zero()
+    } else if target > primitive_types::U256::MAX / factor {
+        primitive_types::U256::MAX
+    } else {
+        target * factor
+    };
+    let mut le = [0u8; 32];
+    bound.to_little_endian(&mut le);
+    le
 }
 
 /// LuckyPool-style bound: the wire carries a full 256-bit big-endian target and
@@ -287,7 +301,7 @@ mod tests {
             mma_type: MMAType::Int7xInt7ToInt32,
             rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
             cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41, 64, 65, 72, 73, 96, 97, 104, 105]).unwrap(),
-            reserved: MiningConfiguration::RESERVED_VALUE,
+            moe: None,
         };
         let bound = zk_pow::api::sanity_checks::extract_difficulty_bound(0x1a1fffe0, &cfg);
         let mut bound_le = [0u8; 32];

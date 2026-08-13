@@ -84,6 +84,7 @@ path = "src/bin/alphapool_prod_131k.rs"
 required-features = ["gpu"]
 
 [dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

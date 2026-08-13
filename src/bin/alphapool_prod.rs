@@ -136,7 +136,7 @@ fn main() -> std::io::Result<()> {
                 let j = { job.lock().unwrap().clone() };
                 let Some(j) = j else { std::thread::sleep(Duration::from_millis(50)); continue };
                 setups += 1;
-                let bound = share_bound_le(difficulty.load(Ordering::Relaxed));
+                let bound = share_bound_le(difficulty.load(Ordering::Relaxed), &j.config);
                 if let Some((seed, hit, job_key)) =
                     grind_only_ctx(&ctx, &mut rng, &j.header, &j.config, &bound)
                 {

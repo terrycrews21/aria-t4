@@ -84,7 +84,7 @@ fn main() -> std::io::Result<()> {
                 let Some(j) = j else { std::thread::sleep(Duration::from_millis(50)); continue };
                 attempts += 1;
                 // bound courant (vardiff peut avoir changé)
-                let bound = share_bound_le(difficulty.load(Ordering::Relaxed));
+                let bound = share_bound_le(difficulty.load(Ordering::Relaxed), &j.config);
                 if let Some(proof) = try_mine_one_bounded_gpu_resident_ctx(&ctx, &mut ws, &mut rng, &j.header, &j.config, &bound) {
                     match encode_base64(&proof) {
                         Ok(b64) => {
@@ -135,7 +135,7 @@ fn main() -> std::io::Result<()> {
                     Ok(header) => {
                         let k = params_k.load(Ordering::Relaxed) as u32;
                         let config = canonical_gpu_config(k);
-                        let bound = share_bound_le(difficulty.load(Ordering::Relaxed));
+                        let bound = share_bound_le(difficulty.load(Ordering::Relaxed), &config);
                         *job.lock().unwrap() = Some(JobData { job_id: job_id.clone(), header, config, bound_le: bound });
                         println!("  📋 job {job_id} (header 76o OK, config 8×16, k={k})");
                     }

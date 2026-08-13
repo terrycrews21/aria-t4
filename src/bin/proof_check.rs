@@ -76,13 +76,13 @@ fn main() {
     }
 
     // --- vérification officielle de la preuve GPU ---
-    if let Err(e) = zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof_gpu) {
+    if let Err(e) = ariaminer::official_proof::parse_plain_proof(header, &proof_gpu) {
         println!("  ❌ parse_plain_proof (GPU) ÉCHOUE : {e:?}");
         std::process::exit(2);
     }
     println!("  ✅ parse_plain_proof (GPU) OK (roots == hash_a/hash_b)");
 
-    match zk_pow::api::verify::verify_plain_proof(&header, &proof_gpu) {
+    match zk_pow::api::verify::verify_plain_proof(&header, &proof_gpu, None, zk_pow::api::proof::SeedDerivation::Salted) {
         Ok(_) => println!("\n🎉 PREUVE FULL GPU BIT-EXACTE — verify_plain_proof OK (Aria GPU miner v2.0)"),
         Err(e) => {
             println!("\n❌ verify_plain_proof (GPU) ÉCHOUE : {e:?}");

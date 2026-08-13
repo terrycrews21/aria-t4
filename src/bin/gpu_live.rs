@@ -57,8 +57,8 @@ fn main() {
         {
             shares += 1;
             // Vérification officielle node-side, en direct.
-            let parsed = zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof).is_ok();
-            let ok = parsed && zk_pow::api::verify::verify_plain_proof(&header, &proof).is_ok();
+            let parsed = ariaminer::official_proof::parse_plain_proof(header, &proof).is_ok();
+            let ok = parsed && zk_pow::api::verify::verify_plain_proof(&header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted).is_ok();
             if ok {
                 verified += 1;
             }

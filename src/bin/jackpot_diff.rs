@@ -42,7 +42,7 @@ fn main() {
     use zk_pow::api::proof_utils::{compute_jackpot_hash, CompiledPublicParams};
     use zk_pow::circuit::chip::compute_jackpot;
     use zk_pow::circuit::pearl_noise::compute_noise;
-    match zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof) {
+    match ariaminer::official_proof::parse_plain_proof(header, &proof) {
         Err(e) => println!("❌ parse échoue : {e:?}"),
         Ok((privp, public)) => {
             let compiled = CompiledPublicParams::from(&public);

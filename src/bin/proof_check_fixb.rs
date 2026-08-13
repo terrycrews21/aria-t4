@@ -45,12 +45,12 @@ fn main() {
     let mut ws = Workspace::new();
     let proof = build_proof_from_hit_fixb(s1, s0, &hit1, &jk1, m, n, k, rank, &mut ws);
 
-    if let Err(e) = zk_pow::ffi::plain_proof::parse_plain_proof(header, &proof) {
+    if let Err(e) = ariaminer::official_proof::parse_plain_proof(header, &proof) {
         println!("❌ parse_plain_proof ÉCHOUE : {e:?}");
         std::process::exit(2);
     }
     println!("  ✅ parse_plain_proof OK (roots == hash_a/hash_b croisés)");
-    match zk_pow::api::verify::verify_plain_proof(&header, &proof) {
+    match zk_pow::api::verify::verify_plain_proof(&header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted) {
         Ok(_) => println!("\n🎉 FIX-B CONSENSUS-VALIDE — verify_plain_proof OK sur preuve croisée (A=S1 / B=S0 figé)"),
         Err(e) => {
             println!("\n❌ verify_plain_proof ÉCHOUE : {e:?}  → fix-B PAS valide en l'état");
