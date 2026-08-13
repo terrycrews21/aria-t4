@@ -1,16 +1,10 @@
-// ariaminer — Turing sm_75 warp-owned dual-tile Pearl grind.
+// ariaminer — Turing sm_75 warp-owned four-tile Pearl grind.
 //
-// Motivation: the older 128x128 CuTe kernel maps each thread across 64 proof
-// tiles and reconstructs every fold with thousands of shared-memory atomics.
-// Real-T4 profiling showed the fold dominated ~79% of setup time. This kernel
-// assigns two complete 16x16 proof tiles to each warp, keeps their accumulators
-// in registers, and reduces each tile with warp shuffles — no shared atomics.
-// A 64x256 CTA also reuses each staged A window across twice as many columns.
-//
-// The implementation is independent, using NVIDIA's documented
-// mma.sync.aligned.m8n8k16 row.col s8 fragment mapping. It preserves the
-// consensus recurrence exactly: running int32 accumulators, XOR at each rank
-// boundary, then rotl13/XOR into transcript[t % 16], keyed BLAKE3, LE bound.
+// Each warp owns four complete contiguous 16x16 proof tiles within a 64x512
+// CTA. A is reused across all four tiles. A two-stage 32-K register-prefetched
+// pipeline halves synchronization frequency versus 16-K staging while staying
+// below T4's 64 KiB shared-memory limit. Accumulators and transcript folds stay
+// in registers; there are no shared-memory fold atomics.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -22,18 +16,20 @@ namespace aria_sm75_dual {
 using namespace cute;
 
 static constexpr int kBlockM = 64;
-static constexpr int kBlockN = 256;
-static constexpr int kKWindow = 16;
+static constexpr int kBlockN = 512;
+static constexpr int kChunkK = 32;
+static constexpr int kMmaK = 16;
 static constexpr int kWarpRows = 4;
 static constexpr int kWarpCols = 8;
+static constexpr int kTilesPerWarp = 4;
 static constexpr int kWarps = kWarpRows * kWarpCols;
 static constexpr int kThreads = kWarps * 32;
 static constexpr int kTranscript = 16;
 static constexpr int kRotate = 13;
-static constexpr int kRankBlock = 128;
-static constexpr int kWordsA = (kBlockM * kRankBlock) / 4;
-static constexpr int kWordsB = (kBlockN * kRankBlock) / 4;
+static constexpr int kWordsA = (kBlockM * kChunkK) / 4;
+static constexpr int kWordsB = (kBlockN * kChunkK) / 4;
 static constexpr int kWordsStage = kWordsA + kWordsB;
+static constexpr int kPrefetchWords = (kWordsStage + kThreads - 1) / kThreads;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
 __device__ __forceinline__ void mma_8x8x16(
@@ -72,99 +68,114 @@ void grind(const int8_t* __restrict__ a,
   const int row_base = blockIdx.x * kBlockM;
   const int col_base = blockIdx.y * kBlockN;
   const int warp_row = row_base + warp_m * 16;
-  const int warp_col0 = col_base + warp_n * 16;
-  const int warp_col1 = warp_col0 + 128;
+  const int warp_col = col_base + warp_n * 16;
 
-  __shared__ __align__(16) uint32_t stage_words[kWordsStage];
-  __shared__ __align__(16) uint32_t transcripts[kWarps][2][kTranscript];
+  __shared__ __align__(16) uint32_t stages[2][kWordsStage];
+  __shared__ __align__(16) uint32_t transcripts[kWarps][kTilesPerWarp][kTranscript];
 
-  if (rank != kRankBlock) return;
   if (lane < kTranscript) {
-    transcripts[warp][0][lane] = 0;
-    transcripts[warp][1][lane] = 0;
+    #pragma unroll
+    for (int tile = 0; tile < kTilesPerWarp; ++tile)
+      transcripts[warp][tile][lane] = 0;
   }
 
-  int32_t acc0[8] = {0,0,0,0,0,0,0,0};
-  int32_t acc1[8] = {0,0,0,0,0,0,0,0};
-  const int rank_blocks = k / kRankBlock;
+  int32_t acc[kTilesPerWarp][8];
+  #pragma unroll
+  for (int tile = 0; tile < kTilesPerWarp; ++tile)
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) acc[tile][i] = 0;
 
-  // Stage one complete rank window. The old implementation staged 16 K bytes
-  // and synchronized after every MMA window (512 barriers at k=8192). Rank-128
-  // staging uses two barriers per rank block (128 total), without reducing
-  // occupancy: this 1024-thread CTA already limits Turing to one CTA/SM and the
-  // 44 KiB shared footprint stays under T4's 64 KiB/SM.
-  for (int rank_block = 0; rank_block < rank_blocks; ++rank_block) {
-    const int k_offset = rank_block * kRankBlock;
-    for (int flat = tid; flat < kWordsStage; flat += kThreads) {
+  uint32_t prefetched[kPrefetchWords];
+  bool valid[kPrefetchWords];
+  auto prefetch = [&](int k_offset) {
+    #pragma unroll
+    for (int q = 0; q < kPrefetchWords; ++q) {
+      int flat = tid + q * kThreads;
+      valid[q] = flat < kWordsStage;
+      if (!valid[q]) continue;
       if (flat < kWordsA) {
         int byte = flat * 4;
-        int r = byte / kRankBlock;
-        int c = byte % kRankBlock;
-        stage_words[flat] = __ldg(reinterpret_cast<const uint32_t*>(
+        int r = byte / kChunkK;
+        int c = byte % kChunkK;
+        prefetched[q] = __ldg(reinterpret_cast<const uint32_t*>(
             a + static_cast<size_t>(row_base + r) * k + k_offset + c));
       } else {
         int byte = (flat - kWordsA) * 4;
-        int cidx = byte / kRankBlock;
-        int c = byte % kRankBlock;
-        stage_words[flat] = __ldg(reinterpret_cast<const uint32_t*>(
+        int cidx = byte / kChunkK;
+        int c = byte % kChunkK;
+        prefetched[q] = __ldg(reinterpret_cast<const uint32_t*>(
             bt + static_cast<size_t>(col_base + cidx) * k + k_offset + c));
       }
     }
-    __syncthreads();
+  };
+  auto publish = [&](int stage) {
+    #pragma unroll
+    for (int q = 0; q < kPrefetchWords; ++q) {
+      int flat = tid + q * kThreads;
+      if (valid[q]) stages[stage][flat] = prefetched[q];
+    }
+  };
 
-    const uint32_t* sa = stage_words;
-    const uint32_t* sb = stage_words + kWordsA;
+  const int chunks = k / kChunkK;
+  const int chunks_per_rank = rank / kChunkK;
+  prefetch(0);
+  publish(0);
+  __syncthreads();
+
+  for (int chunk = 0; chunk < chunks; ++chunk) {
+    const int current = chunk & 1;
+    const bool have_next = chunk + 1 < chunks;
+    if (have_next) prefetch((chunk + 1) * kChunkK);
+
+    const uint32_t* sa = stages[current];
+    const uint32_t* sb = stages[current] + kWordsA;
     const int a_row0 = warp_m * 16 + lane_group;
     const int a_row1 = a_row0 + 8;
-    const int b00 = warp_n * 16 + lane_group;
-    const int b01 = b00 + 8;
-    const int b10 = b00 + 128;
-    const int b11 = b10 + 8;
 
     #pragma unroll
-    for (int sub = 0; sub < kRankBlock / kKWindow; ++sub) {
-      const int sub_offset = sub * kKWindow + lane_quad * 4;
-      const uint32_t a0 = sa[a_row0 * (kRankBlock / 4) + sub_offset / 4];
-      const uint32_t a1 = sa[a_row1 * (kRankBlock / 4) + sub_offset / 4];
-      const uint32_t b00v = sb[b00 * (kRankBlock / 4) + sub_offset / 4];
-      const uint32_t b01v = sb[b01 * (kRankBlock / 4) + sub_offset / 4];
-      const uint32_t b10v = sb[b10 * (kRankBlock / 4) + sub_offset / 4];
-      const uint32_t b11v = sb[b11 * (kRankBlock / 4) + sub_offset / 4];
-
-      mma_8x8x16(acc0[0], acc0[1], a0, b00v);
-      mma_8x8x16(acc0[2], acc0[3], a1, b00v);
-      mma_8x8x16(acc0[4], acc0[5], a0, b01v);
-      mma_8x8x16(acc0[6], acc0[7], a1, b01v);
-      mma_8x8x16(acc1[0], acc1[1], a0, b10v);
-      mma_8x8x16(acc1[2], acc1[3], a1, b10v);
-      mma_8x8x16(acc1[4], acc1[5], a0, b11v);
-      mma_8x8x16(acc1[6], acc1[7], a1, b11v);
+    for (int sub = 0; sub < kChunkK / kMmaK; ++sub) {
+      const int word_offset = sub * (kMmaK / 4) + lane_quad;
+      const uint32_t a0 = sa[a_row0 * (kChunkK / 4) + word_offset];
+      const uint32_t a1 = sa[a_row1 * (kChunkK / 4) + word_offset];
+      #pragma unroll
+      for (int tile = 0; tile < kTilesPerWarp; ++tile) {
+        const int b0 = warp_n * 16 + tile * 128 + lane_group;
+        const int b1 = b0 + 8;
+        const uint32_t bv0 = sb[b0 * (kChunkK / 4) + word_offset];
+        const uint32_t bv1 = sb[b1 * (kChunkK / 4) + word_offset];
+        mma_8x8x16(acc[tile][0], acc[tile][1], a0, bv0);
+        mma_8x8x16(acc[tile][2], acc[tile][3], a1, bv0);
+        mma_8x8x16(acc[tile][4], acc[tile][5], a0, bv1);
+        mma_8x8x16(acc[tile][6], acc[tile][7], a1, bv1);
+      }
     }
 
-    uint32_t x0 = 0, x1 = 0;
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      x0 ^= static_cast<uint32_t>(acc0[i]);
-      x1 ^= static_cast<uint32_t>(acc1[i]);
+    if (((chunk + 1) % chunks_per_rank) == 0) {
+      #pragma unroll
+      for (int tile = 0; tile < kTilesPerWarp; ++tile) {
+        uint32_t folded = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) folded ^= static_cast<uint32_t>(acc[tile][i]);
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+          folded ^= __shfl_xor_sync(0xffffffffu, folded, mask);
+        if (lane == 0) {
+          int transcript_index = ((chunk + 1) / chunks_per_rank - 1) % kTranscript;
+          transcripts[warp][tile][transcript_index] =
+              rotl13_xor(transcripts[warp][tile][transcript_index], folded);
+        }
+      }
     }
-    #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) {
-      x0 ^= __shfl_xor_sync(0xffffffffu, x0, mask);
-      x1 ^= __shfl_xor_sync(0xffffffffu, x1, mask);
+
+    if (have_next) {
+      publish(1 - current);
+      __syncthreads();
     }
-    if (lane == 0) {
-      int transcript_index = rank_block % kTranscript;
-      transcripts[warp][0][transcript_index] =
-          rotl13_xor(transcripts[warp][0][transcript_index], x0);
-      transcripts[warp][1][transcript_index] =
-          rotl13_xor(transcripts[warp][1][transcript_index], x1);
-    }
-    __syncthreads();
   }
 
   if (lane == 0) {
     #pragma unroll
-    for (int tile = 0; tile < 2; ++tile) {
+    for (int tile = 0; tile < kTilesPerWarp; ++tile) {
       auto message = make_tensor<uint32_t>(Int<16>{});
       auto cv = make_tensor<uint32_t>(Int<8>{});
       #pragma unroll
@@ -176,10 +187,10 @@ void grind(const int8_t* __restrict__ a,
       if constexpr (BigEndian) {
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
-          uint32_t h = __byte_perm(cv(i), 0, 0x0123);
-          uint32_t b = __byte_perm(pow_bound[i], 0, 0x0123);
-          if (h > b) { found = false; break; }
-          if (h < b) break;
+          uint32_t hash_word = __byte_perm(cv(i), 0, 0x0123);
+          uint32_t bound_word = __byte_perm(pow_bound[i], 0, 0x0123);
+          if (hash_word > bound_word) { found = false; break; }
+          if (hash_word < bound_word) break;
         }
       } else {
         #pragma unroll
@@ -191,7 +202,7 @@ void grind(const int8_t* __restrict__ a,
       if (found) {
         int slot = atomicAdd(found_count, 1);
         if (slot < max_hits) {
-          const int tile_col = tile == 0 ? warp_col0 : warp_col1;
+          const int tile_col = warp_col + tile * 128;
           #pragma unroll
           for (int i = 0; i < 128; ++i) {
             hit_rows[slot * 128 + i] = warp_row + (i & 15);
