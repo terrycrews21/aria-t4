@@ -1,0 +1,18 @@
+cuda/pearl_gpu_lib.cu(27): warning #177-D: variable "bP" was declared but never referenced
+    auto bM = Int<128>{}; auto bN = Int<128>{}; auto bK = Int<64>{}; auto bP = Int<3>{};
+                                                                          ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ar: `u' modifier ignored since `D' is the default (see `U')
+ar: `u' modifier ignored since `D' is the default (see `U')
+ar: `u' modifier ignored since `D' is the default (see `U')
+ar: `u' modifier ignored since `D' is the default (see `U')
+cuda/pearl_gpu_kernel_sm75.cuh(195): warning #177-D: variable "par" was declared but never referenced
+          const int par = w & 1;
+                    ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ar: `u' modifier ignored since `D' is the default (see `U')
+ar: `u' modifier ignored since `D' is the default (see `U')

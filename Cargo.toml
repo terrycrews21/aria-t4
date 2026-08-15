@@ -20,6 +20,10 @@ name = "tworker"
 path = "src/bin/tworker.rs"
 
 [[bin]]
+name = "share_probe"
+path = "src/bin/share_probe.rs"
+
+[[bin]]
 name = "gpu_smoke"
 path = "src/bin/gpu_smoke.rs"
 required-features = ["gpu"]
