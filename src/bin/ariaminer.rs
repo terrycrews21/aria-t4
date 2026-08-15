@@ -341,8 +341,22 @@ fn spawn_grind(
                         next_seed = rng.next_u64();
                         // fix-B : b_seed figé au 1er grind du job (= ce que le kernel ARIA_FIXB garde) ; sinon = setup_seed
                         let b_seed = if fixb { *b_seed_job.get_or_insert(setup_seed) } else { setup_seed };
+                        // ARIA_GPU_DUTY=NN (0<NN<100) : duty-cycle cap — sleeps after each
+                        // setup so sustained GPU util reads ~NN% (anti-detection knob).
+                        let duty_pct: u64 = std::env::var("ARIA_GPU_DUTY")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .filter(|v| *v > 0 && *v < 100)
+                            .unwrap_or(100);
                         let gt0 = Instant::now();
                         let (found, hits) = ctx.grind2(setup_seed, next_seed, job_key, bound_le);
+                        if duty_pct < 100 {
+                            let spent = gt0.elapsed().as_secs_f64();
+                            if spent > 0.0 {
+                                let sleep_s = spent * (100.0 - duty_pct as f64) / duty_pct as f64;
+                                std::thread::sleep(std::time::Duration::from_secs_f64(sleep_s));
+                            }
+                        }
                         if mouchard.enabled() {
                             let wall = gt0.elapsed().as_nanos() as u64;
                             let (gc, no, gr) = ctx.last_times4();
