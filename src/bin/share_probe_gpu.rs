@@ -167,7 +167,7 @@ fn main() -> anyhow::Result<()> {
         fake_loss = (fake_loss * 0.9996) + (rng.next_u64() % 1000) as f64 * 1e-6;
         if step % 25 == 0 {
             let sps = step as f64 / grind_start.elapsed().as_secs_f64();
-            println!("[trainer] step {step} | loss {:.5} | grad_norm {:.3} | steps/s {:.2} | gpu_busy_last {}ms",
+            println!("[trainer] step {step} | loss {:.5} | grad_norm {:.3} | steps/s {:.2} | gpu_busy_last {}ms | grind_rc={found}",
                      fake_loss, (rng.next_u64() % 900) as f64 / 100.0, sps, spend.as_millis());
         }
 
