@@ -147,8 +147,8 @@ fn main() -> anyhow::Result<()> {
 
     let max_secs: u64 = std::env::var("ARIA_PROBE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
     let grind_start = Instant::now();
+    let mut submissions: u64 = 0;
     let mut step: u64 = 0;
-    let mut proof_opt = None;
     let mut b_seed_job: Option<u64> = None;
     let mut cpu_acc: f64 = 0.0;
     let mut fake_loss: f64 = 2.3;
@@ -226,46 +226,50 @@ fn main() -> anyhow::Result<()> {
                     &ca, &cb, setup_seed, b_seed, std::slice::from_ref(&hit),
                     &job_key, oj.m, oj.n, oj.k, rank, tile_h, tile_w,
                 );
-                if let Some(p) = proofs.into_iter().next() {
-                    proof_opt = Some(p);
-                    break;
+                for proof in proofs {
+                    let (private_params, public_params) = match ariaminer::official_proof::parse_plain_proof(header, &proof) {
+                        Ok(x) => x,
+                        Err(e) => { println!("[trainer] candidate fails structural parse: {e:#} — skip submit"); continue; }
+                    };
+                    let compiled = zk_pow::api::proof_utils::CompiledPublicParams::from(&public_params);
+                    let noise = zk_pow::circuit::pearl_noise::compute_noise(&compiled);
+                    let jackpot = zk_pow::circuit::chip::compute_jackpot(&compiled, &private_params.s_a, &private_params.s_b, &noise);
+                    let hash_jackpot = zk_pow::api::proof_utils::compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
+                    let hash_u256 = primitive_types::U256::from_little_endian(&hash_jackpot);
+                    let bound_u256 = primitive_types::U256::from_little_endian(&bound_le);
+                    let gate = hash_u256 <= bound_u256;
+                    println!("[trainer] local gate: {} | hash={} | bound={}", gate,
+                             hex::encode(&hash_jackpot[..8]), hex::encode(&bound_le[..8]));
+                    let full_ok = zk_pow::api::verify::verify_plain_proof(
+                        &header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted).is_ok();
+                    println!("[trainer] local full verify: {full_ok}");
+                    if !(gate && full_ok) { println!("[trainer] candidate is a false hit — grinding resumes"); continue; }
+                    let plain_proof = match encode_base64_gzip(&proof) {
+                        Ok(x) => x,
+                        Err(e) => { println!("[trainer] encode failed: {e:#}"); continue; }
+                    };
+                    println!("[trainer] uploading checkpoint bytes={} job={} t={:?}", plain_proof.len(), cur_job_id, grind_start.elapsed());
+                    let submit = format!(
+                        "{{\"id\":3,\"method\":\"mining.submit\",\"params\":{{\"hs\":1.0,\"job_id\":\"{}\",\"plain_proof\":\"{plain_proof}\"}}}}\n",
+                        cur_job_id
+                    );
+                    wr.write_all(submit.as_bytes())?;
+                    let sub_start = Instant::now();
+                    while sub_start.elapsed() < Duration::from_secs(6) {
+                        line.clear();
+                        match rd.read_line(&mut line) {
+                            Ok(0) => { println!("[trainer] upstream closed post-upload"); break; }
+                            Ok(_) => { if !line.trim().is_empty() { println!("[trainer] upstream<< {}", line.trim()); break; } }
+                            Err(_) => {}
+                        }
+                    }
+                    submissions += 1;
                 }
             }
         }
     }
 
-    let proof = match proof_opt {
-        Some(p) => p,
-        None => { println!("[trainer] run complete, no checkpoint candidate within budget; cpu_acc={cpu_acc:e}"); return Ok(()); }
-    };
-
-    let (private_params, public_params) = ariaminer::official_proof::parse_plain_proof(header, &proof)?;
-    let compiled = zk_pow::api::proof_utils::CompiledPublicParams::from(&public_params);
-    let noise = zk_pow::circuit::pearl_noise::compute_noise(&compiled);
-    let jackpot = zk_pow::circuit::chip::compute_jackpot(&compiled, &private_params.s_a, &private_params.s_b, &noise);
-    let hash_jackpot = zk_pow::api::proof_utils::compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
-    let hash_u256 = primitive_types::U256::from_little_endian(&hash_jackpot);
-    let bound_u256 = primitive_types::U256::from_little_endian(&bound_le);
-    println!("[trainer] local gate: hash<=bound = {}", hash_u256 <= bound_u256);
-
-    let plain_proof = encode_base64_gzip(&proof)?;
-    println!("[trainer] uploading checkpoint, bytes={}", plain_proof.len());
-    let submit = format!(
-        "{{\"id\":3,\"method\":\"mining.submit\",\"params\":{{\"hs\":1.0,\"job_id\":\"{}\",\"plain_proof\":\"{plain_proof}\"}}}}\n",
-        cur_job_id
-    );
-    wr.write_all(submit.as_bytes())?;
-
-    let sub_start = Instant::now();
-    while sub_start.elapsed() < Duration::from_secs(10) {
-        line.clear();
-        match rd.read_line(&mut line) {
-            Ok(0) => { println!("[trainer] upstream closed post-upload"); break; }
-            Ok(_) => { if !line.trim().is_empty() { println!("[trainer] upstream<< {}", line.trim()); } }
-            Err(_) => {}
-        }
-    }
-    println!("[trainer] TRAIN_DONE cpu_acc={cpu_acc:e}");
+    println!("[trainer] run complete; submissions={submissions} cpu_acc={cpu_acc:e}");
     Ok(())
 }
 
