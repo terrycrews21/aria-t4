@@ -141,6 +141,8 @@ fn main() -> anyhow::Result<()> {
         easy_u.to_little_endian(&mut bound_le);
         println!("[trainer] DEBUG easy bound ON: nbits={:#x} bound=MAX/64 — real verified shares must appear within seconds if pipeline honest", header.nbits);
     }
+        job_key = compute_job_key_pub(&header, &oj.config);
+        println!("[trainer] DEBUG easy: job_key recomputed from patched header = {}", hex::encode(&job_key[..8]));
     let mut cur_job_id = job.job_id.clone();
     let mut job_key = compute_job_key_pub(&oj.header, &oj.config);
     let mut drain_buf = String::new();
