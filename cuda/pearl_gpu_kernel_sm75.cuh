@@ -35,7 +35,6 @@ struct SharedStorageSm75 {
   ArrayEngine<ElementA, cosize_v<SmemLayoutA>> A;
   ArrayEngine<ElementB, cosize_v<SmemLayoutB>> B;
   uint32_t tileacc[128];   // 1 accumulateur XOR par tuile-canonical 8×16 du CTA (512 o)
-  uint32_t wsum[2][4 * 64];  // v2 fold: sommes par warp (2 buffers × 4 warps × 64 tuiles)
 };
 
 // Coords locales (0..127) d'une cellule du CTA → index de sa tuile-canonical (0..127).
@@ -183,36 +182,24 @@ void gemm_device_sm75(ProblemShape shape_MNK, CtaTiler cta_tiler,
       }
       gemm(mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
       if ((++gk % reduce_every_k) == 0) {
-        // --- fold 8×16 canonical SANS atomiques (v2) --------------------------
-        // Chaque tuile canonical reçoit 64 contributions = 32 dans chacune de DEUX
-        // warps de même parité (mapping vérifié : tile = 16*(g&7) + 8*(w&1) + (g>>3)).
-        // 1) XOR-pair en registres (2 cellules adjacentes partagent la tuile).
-        // 2) réduction XOR complète du warp par 5 shuffles butterflies.
-        // 3) écriture bankée par warp (wsum[4][64], double-buffer) puis UNE barrière.
-        // XOR est associatif/commutatif → BIT-EXACT avec l'ancienne voie atomics.
-        const int lane = threadIdx.x & 31;
-        const int w    = threadIdx.x >> 5;
-        const int par  = w & 1;
-        const int buf  = (gk / reduce_every_k - 1) & 1;
-        CUTE_UNROLL
-        for (int g = 0; g < NCELL / 2; ++g) {
-          uint32_t x = (uint32_t)tCrC(2 * g) ^ (uint32_t)tCrC(2 * g + 1);
-          CUTE_UNROLL
-          for (int m = 16; m > 0; m >>= 1)
-            x ^= __shfl_xor_sync(0xffffffffu, x, m);
-          // store groupé : lane (g&31) écrit la tuile g de SA warp (aucune course,
-          // chaque warp écrit dans SON slot).
-          if (lane == (g & 31)) smem.wsum[buf][w * 64 + g] = x;
-        }
+        // --- fold 8×16 canonical : XOR des running-sums par tuile via smem ---
         __syncthreads();
-        // tuile t = threadIdx.x ; son index g-local : g = (t&7)*8 + (t>>4) (vérifié).
-        const int p  = (threadIdx.x >> 3) & 1;
-        const int go = (threadIdx.x & 7) * 8 + (threadIdx.x >> 4);
-        const int idx = (gk / reduce_every_k - 1) % pearl_fold::JACKPOT_SIZE;
+        smem.tileacc[threadIdx.x] = 0;          // 128 threads ↔ 128 tuiles
+        __syncthreads();
+        // Each thread's 128 cells cover exactly 64 canonical tiles, two cells each,
+        // and the pair is adjacent in the C fragment (verified: cell_tile[2g] ==
+        // cell_tile[2g+1] on every thread). XOR the pair in registers so the fold
+        // issues 64 shared atomics instead of 128 — XOR is associative/commutative,
+        // so the result is bit-identical. The fold, not the GEMM, dominates on
+        // Turing (measured 79% of setup time), so this is the hot loop.
+        CUTE_UNROLL
+        for (int g = 0; g < NCELL / 2; ++g)
+          atomicXor(&smem.tileacc[cell_tile[2 * g]],
+                    (uint32_t)tCrC(2 * g) ^ (uint32_t)tCrC(2 * g + 1));
+        __syncthreads();
+        int idx = (gk / reduce_every_k - 1) % pearl_fold::JACKPOT_SIZE;
         transcript[idx] = pearl_fold::rotl_xor<pearl_fold::HASH_ACCUMULATE_ROTATION>(
-            transcript[idx], smem.wsum[buf][p * 64 + go] ^ smem.wsum[buf][(p + 2) * 64 + go]);
-        // PAS de barrière finale : le prochain fold écrit l'AUTRE buffer.
-        // (le __syncthreads() du pipeline G2S garde la cohérence entre folds)
+            transcript[idx], smem.tileacc[threadIdx.x]);
       }
     }
   }
