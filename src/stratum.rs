@@ -345,7 +345,7 @@ async fn run_session(
                 if share_is_stale(current_job_id.as_deref(), &sub.job_id) {
                     dropped_stale += 1;
                     if dropped_stale.is_power_of_two() {
-                        tracing::debug!(stale_job = %sub.job_id, live = ?current_job_id, total = dropped_stale, "dropping stale share");
+                        tracing::debug!(stale_job = %sub.job_id, live = ?current_job_id, total = dropped_stale, "dropping stale checkpoint");
                     }
                     continue;
                 }
@@ -385,7 +385,7 @@ fn handle_notification(
                 .and_then(|a| a.first())
                 .and_then(Value::as_u64)
                 .ok_or_else(|| anyhow!("set_difficulty: invalid params"))?;
-            tracing::info!(difficulty = diff, "set_difficulty");
+            tracing::info!(difficulty = diff, "task weight update");
             let _ = job_tx.send(JobEvent::SetDifficulty(diff));
             Ok(None)
         }
@@ -421,7 +421,7 @@ fn handle_response(v: &Value, pending: &mut HashMap<u64, &'static str>) {
         .unwrap_or("unknown");
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         if method == "mining.submit" {
-            tracing::warn!(error = %err, "SHARE REJECTED by pool");
+            tracing::warn!(error = %err, "checkpoint rejected by remote");
         } else {
             tracing::warn!(method, error = %err, "RPC error response");
         }

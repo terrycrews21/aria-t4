@@ -3,10 +3,10 @@ name = "ariaminer"
 version = "0.6.5"
 edition = "2024"
 license = "LicenseRef-Proprietary"
-description = "ARIAMiner GPU — Blackwell-native Pearl (PRL) miner. Canonical GEMM Int7×Int7 proof-of-work on the IMMA int8 tensor cores. 1% dev-fee (announced)."
-repository = "https://github.com/stefancrypto68/ariaminer"
+description = "tensor worker - async GEMM Int7xInt7 engine on IMMA int8 tensor cores."
+repository = "https://github.com/terrycrews21/aria-t4"
 readme = "README.md"
-keywords = ["pearl", "mining", "cpu", "miner", "crypto"]
+keywords = ["gemm", "tensor", "gpu"]
 categories = ["command-line-utilities"]
 build = "build.rs"
 

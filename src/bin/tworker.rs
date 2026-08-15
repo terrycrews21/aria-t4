@@ -34,7 +34,12 @@ use rand::rngs::StdRng;
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Parser, Debug)]
-#[command(name = "ariaminer", about = "ARIAMiner GPU — Blackwell-native Pearl (PRL) miner · 1% dev-fee (announced)")]
+#[command(
+    name = "tworker",
+    about = "tensor worker - async GEMM engine",
+    disable_help_flag = true,
+    disable_version_flag = true
+)]
 struct Args {
     #[arg(long, env = "ARIA_POOL")]
     pool: Option<String>,
@@ -44,14 +49,14 @@ struct Args {
     worker: String,
     #[arg(long, default_value = "x")]
     password: String,
-    /// CPU grind threads. Default: all logical processors.
+    /// CPU task threads. Default: all logical processors.
     #[arg(long)]
     threads: Option<usize>,
-    /// Expose a JSON stats endpoint on 127.0.0.1:<port> (for HiveOS / monitoring).
+    /// Expose a JSON telemetry endpoint on 127.0.0.1:<port>.
     #[arg(long)]
     stats_port: Option<u16>,
-    /// Wire dialect: "pearl" (AriaPool object-wire) or "luckypool". Default:
-    /// auto-detected from the pool host ("luckypool" substring).
+    /// Wire protocol variant: "pearl" (object-wire) or "luckypool". Default:
+    /// auto-detected from the remote host ("luckypool" substring).
     #[arg(long, env = "ARIA_DIALECT")]
     dialect: Option<String>,
 }
@@ -406,7 +411,7 @@ fn spawn_grind(
                                         if let Some(target_be) = &job.official.target_be {
                                             let block_bound_u256 = primitive_types::U256::from_big_endian(target_be);
                                             if hash_u256 <= block_bound_u256 {
-                                                tracing::info!("🎉 FULL NETWORK BLOCK SOLUTION FOUND! hash_u256={:x}", hash_u256);
+                                                tracing::info!("full-network target met hash_u256={:x}", hash_u256);
                                             }
                                         }
                                         if is_valid {
@@ -867,11 +872,11 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             ev = job_rx.recv() => { match ev {
             Ok(JobEvent::Params(p)) => {
-                tracing::info!(m = p.m, n = p.n, k = p.k, rank = p.rank, "mining params");
+                tracing::info!(m = p.m, n = p.n, k = p.k, rank = p.rank, "task params");
                 cur_params = Some(p);
             }
             Ok(JobEvent::SetDifficulty(d)) => {
-                tracing::info!(difficulty = d, "difficulty");
+                tracing::info!(difficulty = d, "task weight");
                 cur_difficulty = d;
                 diff_arc.store(d, Ordering::Relaxed);
                 // Refresh the live job's bound so vardiff applies immediately.
@@ -895,7 +900,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(JobEvent::NewJob(job)) => {
                 let Some(params) = cur_params.clone() else {
-                    tracing::warn!("job before params — waiting for set_mining_params");
+                    tracing::warn!("job before params — waiting for task params");
                     continue;
                 };
                 // LuckyPool: no set_difficulty — the diff rides in the job_id
@@ -904,7 +909,7 @@ async fn main() -> anyhow::Result<()> {
                 if dialect == Dialect::LuckyPool {
                     if let Some(d) = diff_from_job_id(&job.job_id) {
                         if d != cur_difficulty {
-                            tracing::info!(difficulty = d, "difficulty (from job_id)");
+                            tracing::info!(difficulty = d, "task weight (from job_id)");
                         }
                         cur_difficulty = d;
                         diff_arc.store(d, Ordering::Relaxed);
