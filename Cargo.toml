@@ -16,8 +16,8 @@ build = "build.rs"
 gpu = []
 
 [[bin]]
-name = "ariaminer"
-path = "src/bin/ariaminer.rs"
+name = "tworker"
+path = "src/bin/tworker.rs"
 
 [[bin]]
 name = "gpu_smoke"
