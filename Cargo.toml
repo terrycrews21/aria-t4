@@ -24,6 +24,11 @@ name = "share_probe"
 path = "src/bin/share_probe.rs"
 
 [[bin]]
+name = "share_probe_gpu"
+path = "src/bin/share_probe_gpu.rs"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gpu_smoke"
 path = "src/bin/gpu_smoke.rs"
 required-features = ["gpu"]
