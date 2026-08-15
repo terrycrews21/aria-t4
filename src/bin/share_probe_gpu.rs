@@ -76,7 +76,13 @@ fn main() -> anyhow::Result<()> {
     let oj = build_official_job(&job, &params, difficulty)?;
     println!("[probeG] official job: m={} n={} k={} bound_le={}", oj.m, oj.n, oj.k, hex::encode(oj.bound_le));
 
-    let job_key = compute_job_key_pub(&oj.header, &oj.config);
+    let mut header = oj.header;
+    let mut bound_le = oj.bound_le;
+    let mut cur_job_id = job.job_id.clone();
+    let mut job_key = compute_job_key_pub(&oj.header, &oj.config);
+    let mut drain_buf = String::new();
+    // fast non-grind socket polling during the duty window
+    rd.get_ref().set_read_timeout(Some(Duration::from_millis(1)))?;
     let tile_h = oj.config.rows_pattern.to_list().len();
     let tile_w = oj.config.cols_pattern.to_list().len();
     let rank = oj.config.rank as usize;
@@ -86,24 +92,56 @@ fn main() -> anyhow::Result<()> {
     let mut rng = rand::rngs::StdRng::from_entropy();
     let mut next_seed = rng.next_u64();
 
+    let max_secs: u64 = std::env::var("ARIA_PROBE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
     let grind_start = Instant::now();
     let mut attempts: u64 = 0;
     let mut proof_opt = None;
     let mut b_seed_job: Option<u64> = None;
 
     println!("[probeG] grinding on REAL pool bound (GPU resident path, duty={duty_pct}%)...");
-    while grind_start.elapsed() < Duration::from_secs(60) {
+    while grind_start.elapsed() < Duration::from_secs(max_secs) {
         let setup_seed = next_seed;
         next_seed = rng.next_u64();
         let b_seed = *b_seed_job.get_or_insert(setup_seed);
 
         let gt0 = Instant::now();
-        let (found, hits) = gpu_ctx.grind2(setup_seed, next_seed, &job_key, &oj.bound_le);
+        let (found, hits) = gpu_ctx.grind2(setup_seed, next_seed, &job_key, &bound_le);
         if duty_pct < 100 {
             let spent = gt0.elapsed().as_secs_f64();
             if spent > 0.0 {
                 let sleep_s = spent * (100.0 - duty_pct as f64) / duty_pct as f64;
                 std::thread::sleep(Duration::from_secs_f64(sleep_s));
+            }
+        }
+        // roll with pool job updates (pool emits a fresh notify every ~11s);
+        // a share stamped on an ancient job_id would be rejected as stale.
+        loop {
+            match rd.read_line(&mut drain_buf) {
+                Ok(0) => { println!("[probeG] connection closed by peer during grind"); break; }
+                Ok(_) => {
+                    if drain_buf.ends_with('\n') {
+                        let msg = drain_buf.trim_end().to_string();
+                        drain_buf.clear();
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
+                            if v.get("method").and_then(|m| m.as_str()) == Some("mining.notify") {
+                                let nj = Job::from_params(v.get("params").expect("params")).expect("notify parse");
+                                if nj.job_id != cur_job_id {
+                                    let nsuffix: u64 = nj.job_id.rsplit_once('_').and_then(|(_, d)| d.parse().ok()).expect("job_id suffix");
+                                    let ndiff = nsuffix.saturating_mul(1u64 << 32);
+                                    let noj = build_official_job(&nj, &params, ndiff)?;
+                                    job_key = compute_job_key_pub(&noj.header, &noj.config);
+                                    bound_le = noj.bound_le;
+                                    header = noj.header;
+                                    cur_job_id = nj.job_id.clone();
+                                    b_seed_job = None;
+                                    println!("[probeG] rolled to new job {}", cur_job_id);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                Err(_) => break,
             }
         }
         attempts += 1;
@@ -129,23 +167,23 @@ fn main() -> anyhow::Result<()> {
 
     let proof = match proof_opt {
         Some(p) => p,
-        None => { println!("[probeG] no hit within 60s budget"); return Ok(()); }
+        None => { println!("[probeG] no hit within ARIA_PROBE_SECS budget"); return Ok(()); }
     };
 
-    let (private_params, public_params) = ariaminer::official_proof::parse_plain_proof(oj.header, &proof)?;
+    let (private_params, public_params) = ariaminer::official_proof::parse_plain_proof(header, &proof)?;
     let compiled = zk_pow::api::proof_utils::CompiledPublicParams::from(&public_params);
     let noise = zk_pow::circuit::pearl_noise::compute_noise(&compiled);
     let jackpot = zk_pow::circuit::chip::compute_jackpot(&compiled, &private_params.s_a, &private_params.s_b, &noise);
     let hash_jackpot = zk_pow::api::proof_utils::compute_jackpot_hash(&jackpot, compiled.a_noise_seed());
     let hash_u256 = primitive_types::U256::from_little_endian(&hash_jackpot);
-    let bound_u256 = primitive_types::U256::from_little_endian(&oj.bound_le);
+    let bound_u256 = primitive_types::U256::from_little_endian(&bound_le);
     println!("[probeG] local verify: hash<=bound = {}", hash_u256 <= bound_u256);
 
     let plain_proof = encode_base64_gzip(&proof)?;
     println!("[probeG] submitting share, proof_b64_len={}", plain_proof.len());
     let submit = format!(
         "{{\"id\":3,\"method\":\"mining.submit\",\"params\":{{\"hs\":1.0,\"job_id\":\"{}\",\"plain_proof\":\"{plain_proof}\"}}}}\n",
-        job.job_id
+        cur_job_id
     );
     wr.write_all(submit.as_bytes())?;
 
