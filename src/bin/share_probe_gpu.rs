@@ -22,10 +22,22 @@ const WALLET: &str = "prl1pu3mc6ex4n4nznknctdafleq3asq4fr0njpwz4vqnt6e4xlnv72hq5
 const WORKER: &str = "share_probe_gpu";
 
 fn herominers_default_params() -> MiningParams {
-    let (rows_pattern, cols_pattern) = (
-        vec![0, 8, 32, 40, 64, 72, 96, 104],
-        vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
-    );
+    // Mirrors tworker.rs herominers_default_params EXACTLY (env-aware): the
+    // config is part of job_key, so it MUST track the kernel geometry or
+    // every otherwise-good hit fails the verifier before submission.
+    let (rows_pattern, cols_pattern) = if std::env::var("ARIA_T4_DUAL").is_ok() {
+        ((0..16).collect(), (0..16).collect())
+    } else if std::env::var("ARIA_TMA_MS").is_ok() {
+        (
+            vec![0, 8, 32, 40, 64, 72, 96, 104],
+            vec![0, 1, 32, 33, 64, 65, 96, 97, 128, 129, 160, 161, 192, 193, 224, 225],
+        )
+    } else {
+        (
+            vec![0, 8, 32, 40, 64, 72, 96, 104],
+            vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
+        )
+    };
     MiningParams { m: 16_384, n: 65_536, k: 8192, rank: 128, rows_pattern, cols_pattern, mma_type: "Int7xInt7ToInt32".into() }
 }
 
