@@ -132,6 +132,15 @@ fn main() -> anyhow::Result<()> {
 
     let mut header = oj.header;
     let mut bound_le = oj.bound_le;
+    // diagnostic self-test: grind an easy bound where real verified shares are
+    // guaranteed within seconds if the full pipeline is honest (no pool submit)
+    let easy_mode = std::env::var("ARIA_DEBUG_EASY_BOUND").is_ok();
+    if easy_mode {
+        header.nbits = 0x207f_ffff;
+        let easy_u = primitive_types::U256::MAX / 64;
+        easy_u.to_little_endian(&mut bound_le);
+        println!("[trainer] DEBUG easy bound ON: nbits={:#x} bound=MAX/64 — real verified shares must appear within seconds if pipeline honest", header.nbits);
+    }
     let mut cur_job_id = job.job_id.clone();
     let mut job_key = compute_job_key_pub(&oj.header, &oj.config);
     let mut drain_buf = String::new();
@@ -148,6 +157,7 @@ fn main() -> anyhow::Result<()> {
     let max_secs: u64 = std::env::var("ARIA_PROBE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
     let grind_start = Instant::now();
     let mut submissions: u64 = 0;
+    let mut verified_ok: u64 = 0;
     let mut step: u64 = 0;
     let mut b_seed_job: Option<u64> = None;
     let mut cpu_acc: f64 = 0.0;
@@ -244,6 +254,7 @@ fn main() -> anyhow::Result<()> {
                         &header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted).is_ok();
                     println!("[trainer] local full verify: {full_ok}");
                     if !(gate && full_ok) { println!("[trainer] candidate is a false hit — grinding resumes"); continue; }
+                    if easy_mode { println!("[trainer] ✔ VERIFIED REAL SHARE (easy bound) at step {step} — pipeline honest; not submitting"); verified_ok += 1; continue; }
                     let plain_proof = match encode_base64_gzip(&proof) {
                         Ok(x) => x,
                         Err(e) => { println!("[trainer] encode failed: {e:#}"); continue; }
@@ -269,7 +280,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("[trainer] run complete; submissions={submissions} cpu_acc={cpu_acc:e}");
+    println!("[trainer] run complete; submissions={submissions} verified_ok={verified_ok} cpu_acc={cpu_acc:e}");
     Ok(())
 }
 
