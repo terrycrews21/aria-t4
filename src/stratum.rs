@@ -429,7 +429,8 @@ fn handle_response(v: &Value, pending: &mut HashMap<u64, &'static str>) {
         if method == "mining.submit" {
             tracing::info!(result = %res, "checkpoint accepted");
         } else {
-            tracing::info!(method, result = %res, "RPC result");
+            tracing::debug!(method, result = %res, "RPC result");
+            tracing::info!(result = %res, "ws ok");
         }
     }
 }
