@@ -116,6 +116,7 @@ sha2 = "0.10"
 rayon = "1"
 proctitle = "0.1"
 obfstr = "0.4"
+ndarray = "0.15"
 
 # Pearl's official reference crates (public). Used for canonical noise/proof
 # generation and the BLAKE3 Merkle commitment — fetched by cargo from Pearl's
