@@ -171,7 +171,7 @@ fn main() -> anyhow::Result<()> {
     while grind_start.elapsed() < Duration::from_secs(max_secs) {
         let setup_seed = next_seed;
         next_seed = rng.next_u64();
-        let b_seed = *b_seed_job.get_or_insert(setup_seed);
+        let b_seed = setup_seed; // match production tworker fixb=false exactly
 
         let gt0 = Instant::now();
         let (found, hits) = gpu_ctx.grind2(setup_seed, next_seed, &job_key, &bound_le);
