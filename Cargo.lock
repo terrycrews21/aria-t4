@@ -117,9 +117,11 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "obfstr",
  "parking_lot",
  "pearl-blake3",
  "primitive-types 0.12.2",
+ "proctitle",
  "rand 0.8.6",
  "rayon",
  "serde",
@@ -1170,6 +1172,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "obfstr"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cf5f1acbf6ef57cef9d127e72c4afd01d6b08692616fd09afad7f7807d6eb78"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1429,6 +1437,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "proctitle"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "924cd8a0de90723d63fed19c5035ea129913a0bc998b37686a67f1eaf6a2aab5"
+dependencies = [
+ "lazy_static",
+ "libc",
+ "winapi",
 ]
 
 [[package]]

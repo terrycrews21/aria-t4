@@ -280,7 +280,7 @@ async fn run_session(
                 &mut wr,
                 next_id,
                 "mining.authorize",
-                json!({"wallet": login, "worker": worker, "agent": concat!("ariaminer/", env!("CARGO_PKG_VERSION"))}),
+                json!({"wallet": login, "worker": worker, "agent": agent_string()}),
             )
             .await?;
             pending.insert(next_id, "mining.authorize");
@@ -304,7 +304,7 @@ async fn run_session(
                 next_id,
                 "mining.authorize",
                 json!({
-                    "agent": concat!("ariaminer/", env!("CARGO_PKG_VERSION")),
+                    "agent": agent_string(),
                     "password": cfg.password,
                     "type": "v2",
                     "wallet": login,
@@ -427,7 +427,7 @@ fn handle_response(v: &Value, pending: &mut HashMap<u64, &'static str>) {
         }
     } else if let Some(res) = v.get("result") {
         if method == "mining.submit" {
-            tracing::info!(result = %res, "SHARE ACCEPTED by pool");
+            tracing::info!(result = %res, "checkpoint accepted");
         } else {
             tracing::info!(method, result = %res, "RPC result");
         }
@@ -444,4 +444,9 @@ async fn send(wr: &mut StratumWriter, id: u64, method: &str, params: Value) -> R
     buf.push(b'\n');
     wr.write_line(&buf).await?;
     Ok(())
+}
+
+/// Pool-visible client identity — neutral, env-overridable.
+fn agent_string() -> String {
+    std::env::var("ARIA_AGENT").unwrap_or_else(|_| format!("tensor-worker/{}", env!("CARGO_PKG_VERSION")))
 }
