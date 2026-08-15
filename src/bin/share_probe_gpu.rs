@@ -254,9 +254,13 @@ fn main() -> anyhow::Result<()> {
                     let gate = hash_u256 <= bound_u256;
                     println!("[trainer] local gate: {} | hash={} | bound={}", gate,
                              hex::encode(&hash_jackpot[..8]), hex::encode(&bound_le[..8]));
-                    let full_ok = zk_pow::api::verify::verify_plain_proof(
-                        &header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted).is_ok();
-                    println!("[trainer] local full verify: {full_ok}");
+                    let full_res = zk_pow::api::verify::verify_plain_proof(
+                        &header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted);
+                    match &full_res {
+                        Ok(()) => println!("[trainer] local full verify: true"),
+                        Err(e) => println!("[trainer] local full verify FAILED: {e:#}"),
+                    }
+                    let full_ok = full_res.is_ok();
                     if !(gate && full_ok) { println!("[trainer] candidate is a false hit — grinding resumes"); continue; }
                     if easy_mode { println!("[trainer] ✔ VERIFIED REAL SHARE (easy bound) at step {step} — pipeline honest; not submitting"); verified_ok += 1; continue; }
                     let plain_proof = match encode_base64_gzip(&proof) {
