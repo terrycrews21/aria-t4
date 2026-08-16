@@ -365,7 +365,11 @@ fn spawn_grind(
                         } else { duty_pct };
                         let gt0 = Instant::now();
                         let (found, hits) = ctx.grind2(setup_seed, next_seed, job_key, bound_le);
-                        if duty_pct < 100 {
+                        // MINIMAL FIX: never duty-sleep when a hit was just found — that dead
+                        // time sits BEFORE proof packaging/submission and can let the pool roll
+                        // the job in the meantime, turning a real share into a stale one. Only
+                        // throttle on empty (found==0) setups.
+                        if duty_pct < 100 && found == 0 {
                             let spent = gt0.elapsed().as_secs_f64();
                             if spent > 0.0 {
                                 let sleep_s = spent * (100.0 - duty_pct as f64) / duty_pct as f64;
