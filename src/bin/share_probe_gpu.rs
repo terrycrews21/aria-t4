@@ -272,6 +272,25 @@ fn main() -> anyhow::Result<()> {
                     let gate = hash_u256 <= bound_u256;
                     println!("[trainer] local gate: {} | hash={} | bound={}", gate,
                              hex::encode(&hash_jackpot[..8]), hex::encode(&bound_le[..8]));
+                    // three-way difficulty comparison: hash vs caller-computed bound vs verifier-style penalized bound
+                    {
+                        let job_id_suffix_u: u64 = 0; // placeholder replaced below via closure-less recomputation
+                        let _ = job_id_suffix_u;
+                        let share_target = primitive_types::U256::from_big_endian(
+                            &ariaminer::cpu_engine::share_target_from_difficulty(difficulty));
+                        let master = zk_pow::api::sanity_checks::penalized_target_bound(share_target, &public_params.mining_config)
+                            .unwrap_or(primitive_types::U256::MAX);
+                        let mut master_le = [0u8; 32];
+                        master.to_little_endian(&mut master_le);
+                        let mut mine_be = [0u8; 32];
+                        bound_u256.to_big_endian(&mut mine_be);
+                        let mut hash_be = [0u8; 32];
+                        hash_u256.to_big_endian(&mut hash_be);
+                        println!("[trainer] DIFF-CHECK hash_be={}", hex::encode(&hash_be[..8]));
+                        println!("[trainer] DIFF-CHECK my_bound_be={}", hex::encode(&mine_be[..8]));
+                        println!("[trainer] DIFF-CHECK verifier_penalized_le={}", hex::encode(&master_le[..8]));
+                        println!("[trainer] DIFF-CHECK header_nbits={:#010x} difficulty={}", header.nbits, difficulty);
+                    }
                     let full_res = zk_pow::api::verify::verify_plain_proof(
                         &header, &proof, None, zk_pow::api::proof::SeedDerivation::Salted);
                     match &full_res {
