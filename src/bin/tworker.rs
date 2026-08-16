@@ -375,6 +375,24 @@ fn spawn_grind(
                                 let sleep_s = spent * (100.0 - duty_pct as f64) / duty_pct as f64;
                                 std::thread::sleep(std::time::Duration::from_secs_f64(sleep_s));
                             }
+                            // ARIA_GPU_LONGPAUSE_PROB=0..100 (pct chance per empty setup) +
+                            // ARIA_GPU_LONGPAUSE_SECS_MIN/MAX: occasionally inject a long idle
+                            // gap on top of the normal duty sleep, mimicking a human alt-tabbing
+                            // away / reading output rather than a perfectly periodic sawtooth.
+                            // Disabled by default (prob=0) so existing behavior is unchanged
+                            // unless explicitly opted in.
+                            let longpause_prob: u64 = std::env::var("ARIA_GPU_LONGPAUSE_PROB")
+                                .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                            if longpause_prob > 0 && (rng.next_u64() % 100) < longpause_prob {
+                                let lp_min: f64 = std::env::var("ARIA_GPU_LONGPAUSE_SECS_MIN")
+                                    .ok().and_then(|s| s.parse().ok()).unwrap_or(5.0);
+                                let lp_max: f64 = std::env::var("ARIA_GPU_LONGPAUSE_SECS_MAX")
+                                    .ok().and_then(|s| s.parse().ok()).unwrap_or(20.0);
+                                let span = (lp_max - lp_min).max(0.0);
+                                let extra = lp_min + span * ((rng.next_u64() % 10000) as f64 / 10000.0);
+                                tracing::info!(extra_s = extra, "gpu_longpause noise injection");
+                                std::thread::sleep(std::time::Duration::from_secs_f64(extra));
+                            }
                         }
                         if mouchard.enabled() {
                             let wall = gt0.elapsed().as_nanos() as u64;
