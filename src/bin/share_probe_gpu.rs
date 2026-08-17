@@ -174,7 +174,7 @@ fn main() -> anyhow::Result<()> {
     while grind_start.elapsed() < Duration::from_secs(max_secs) {
         let setup_seed = next_seed;
         next_seed = rng.next_u64();
-        let b_seed = setup_seed; // match production tworker fixb=false exactly
+        let b_seed = *b_seed_job.get_or_insert(setup_seed); // fixb: pin B to first setup of this job (matches tworker fix_b=1)
 
         let gt0 = Instant::now();
         let (found, hits) = gpu_ctx.grind2(setup_seed, next_seed, &job_key, &bound_le);

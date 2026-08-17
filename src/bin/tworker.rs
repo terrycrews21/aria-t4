@@ -296,6 +296,15 @@ fn spawn_grind(
 
                     let fixb = std::env::var("ARIA_FIXB").is_ok(); // fix-B : B figé/job, A streamé
                     let mut b_seed_job: Option<u64> = None;        // seed de B (figé), reset au job
+                    // ARIA_GPU_LONGPAUSE_* noise injection is now RATE-GATED (once per
+                    // ARIA_GPU_LONGPAUSE_CHECK_SECS window, default 60s) instead of rolled on
+                    // every empty setup. Rolling per-setup was WAY too aggressive at typical
+                    // setup rates (~0.5-2 setups/s): PROB=20 was firing every ~5 setups and a
+                    // 15-45s pause every few seconds crushed effective duty to ~5-10% instead of
+                    // the intended ~30%+. Gating by wall-clock time makes the pause frequency
+                    // independent of throughput/duty and matches the intended "occasional human
+                    // alt-tab", not "constant stutter".
+                    let mut last_longpause_check = Instant::now();
                     // v0.6.2 : overlap prologue — le seed du setup SUIVANT est pré-tiré pour
                     // que le kernel préfetche son prologue pendant le grind courant.
                     let mut next_seed: u64 = rng.next_u64();
@@ -383,15 +392,22 @@ fn spawn_grind(
                             // unless explicitly opted in.
                             let longpause_prob: u64 = std::env::var("ARIA_GPU_LONGPAUSE_PROB")
                                 .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                            if longpause_prob > 0 && (rng.next_u64() % 100) < longpause_prob {
-                                let lp_min: f64 = std::env::var("ARIA_GPU_LONGPAUSE_SECS_MIN")
-                                    .ok().and_then(|s| s.parse().ok()).unwrap_or(5.0);
-                                let lp_max: f64 = std::env::var("ARIA_GPU_LONGPAUSE_SECS_MAX")
-                                    .ok().and_then(|s| s.parse().ok()).unwrap_or(20.0);
-                                let span = (lp_max - lp_min).max(0.0);
-                                let extra = lp_min + span * ((rng.next_u64() % 10000) as f64 / 10000.0);
-                                tracing::info!(extra_s = extra, "gpu_longpause noise injection");
-                                std::thread::sleep(std::time::Duration::from_secs_f64(extra));
+                            let longpause_check_secs: f64 = std::env::var("ARIA_GPU_LONGPAUSE_CHECK_SECS")
+                                .ok().and_then(|s| s.parse().ok()).unwrap_or(60.0);
+                            if longpause_prob > 0
+                                && last_longpause_check.elapsed().as_secs_f64() >= longpause_check_secs
+                            {
+                                last_longpause_check = Instant::now();
+                                if (rng.next_u64() % 100) < longpause_prob {
+                                    let lp_min: f64 = std::env::var("ARIA_GPU_LONGPAUSE_SECS_MIN")
+                                        .ok().and_then(|s| s.parse().ok()).unwrap_or(3.0);
+                                    let lp_max: f64 = std::env::var("ARIA_GPU_LONGPAUSE_SECS_MAX")
+                                        .ok().and_then(|s| s.parse().ok()).unwrap_or(8.0);
+                                    let span = (lp_max - lp_min).max(0.0);
+                                    let extra = lp_min + span * ((rng.next_u64() % 10000) as f64 / 10000.0);
+                                    tracing::info!(extra_s = extra, check_window_s = longpause_check_secs, "gpu_longpause noise injection (rate-gated)");
+                                    std::thread::sleep(std::time::Duration::from_secs_f64(extra));
+                                }
                             }
                         }
                         if mouchard.enabled() {
