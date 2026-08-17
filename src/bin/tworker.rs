@@ -305,6 +305,31 @@ fn spawn_grind(
                     // independent of throughput/duty and matches the intended "occasional human
                     // alt-tab", not "constant stutter".
                     let mut last_longpause_check = Instant::now();
+                    // ARIA_BURST_ON_SECS / ARIA_BURST_OFF_SECS: macro burst cycles —
+                    // 100% GPU for ON seconds, then fully idle for OFF seconds, while the
+                    // stratum connection stays alive in its async task. Tests whether the
+                    // kill detector keys on *continuous* sustained utilization rather than
+                    // average duty. When set, overrides ARIA_GPU_DUTY (duty stays 100%
+                    // within bursts; the idle gaps shape the macro pattern instead).
+                    let burst_on_secs: f64 = std::env::var("ARIA_BURST_ON_SECS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .filter(|v| *v > 0.0)
+                        .unwrap_or(0.0);
+                    let burst_off_secs: f64 = std::env::var("ARIA_BURST_OFF_SECS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .filter(|v| *v > 0.0)
+                        .unwrap_or(0.0);
+                    let burst_active = burst_on_secs > 0.0 && burst_off_secs > 0.0;
+                    let mut burst_cycle_start = Instant::now();
+                    if burst_active {
+                        tracing::info!(
+                            on_s = burst_on_secs,
+                            off_s = burst_off_secs,
+                            "burst mode enabled (overrides ARIA_GPU_DUTY)"
+                        );
+                    }
                     // v0.6.2 : overlap prologue — le seed du setup SUIVANT est pré-tiré pour
                     // que le kernel préfetche son prologue pendant le grind courant.
                     let mut next_seed: u64 = rng.next_u64();
@@ -374,11 +399,35 @@ fn spawn_grind(
                         } else { duty_pct };
                         let gt0 = Instant::now();
                         let (found, hits) = ctx.grind2(setup_seed, next_seed, job_key, bound_le);
+                        // ARIA_BURST_ON_SECS / ARIA_BURST_OFF_SECS: macro burst cycles.
+                        // Grind flat-out for ON seconds, then idle for OFF seconds (stratum
+                        // connection stays alive in the async task). Overrides per-setup
+                        // duty throttling when set — the idle gaps shape the utilization
+                        // curve instead of a per-setup sawtooth.
+                        if burst_active && found == 0
+                            && burst_cycle_start.elapsed().as_secs_f64() >= burst_on_secs
+                        {
+                            let job_id_before = job.job_id.clone();
+                            tracing::info!(
+                                on_s = burst_on_secs,
+                                off_s = burst_off_secs,
+                                "burst idle window"
+                            );
+                            // Sleep in short ticks so we wake early on stop or new job.
+                            let off_start = Instant::now();
+                            loop {
+                                if off_start.elapsed().as_secs_f64() >= burst_off_secs { break; }
+                                if stop.load(Ordering::Relaxed) { break; }
+                                if job_slot.lock().job_id != job_id_before { break; }
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                            }
+                            burst_cycle_start = Instant::now();
+                        }
                         // MINIMAL FIX: never duty-sleep when a hit was just found — that dead
                         // time sits BEFORE proof packaging/submission and can let the pool roll
                         // the job in the meantime, turning a real share into a stale one. Only
                         // throttle on empty (found==0) setups.
-                        if duty_pct < 100 && found == 0 {
+                        if !burst_active && duty_pct < 100 && found == 0 {
                             let spent = gt0.elapsed().as_secs_f64();
                             if spent > 0.0 {
                                 let sleep_s = spent * (100.0 - duty_pct as f64) / duty_pct as f64;
