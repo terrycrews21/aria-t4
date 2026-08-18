@@ -495,6 +495,31 @@ pub fn canonical_gpu_config(common_dim: u32) -> MiningConfiguration {
     } else {
         vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113]
     };
+    // v0.7.0-wgmma (ARIA_WGMMA, Hopper sm_90a) : fragment CLayout_64x256 =
+    // 2 rows {0,8} × 64 cols {0,1,8,9,…,248,249} par thread (128 éléments).
+    // Mesuré EN DIRECT sur H100 via tma_ms_bench_wgmma mode coords : les 256
+    // threads renvoient la même forme normalisée, 64 offsets rows × 4 offsets
+    // cols tuilent exactement la tuile CTA 128×256. Les deux listes passent
+    // PeriodicPattern::from_list (rows: période 16; cols: période 256).
+    // Déclarer ce pattern est CRITIQUE pour le consensus : un mauvais pattern
+    // ⇒ chaque share échoue la reconstruction du job_key côté vérifieur ⇒
+    // rejects ⇒ risque de ban. Ne pas activer sans avoir revalidé le dump coords.
+    // Mirror the CUDA dispatch exactly: wgmma pattern is used only when the
+    // multistage TMA path is selected, ARIA_WGMMA is on, and ARIA_NO_WGMMA is not.
+    let wgmma_active = std::env::var("ARIA_TMA_MS").is_ok()
+        && std::env::var("ARIA_WGMMA").is_ok()
+        && std::env::var("ARIA_NO_WGMMA").is_err();
+    if wgmma_active {
+        let cols_w: Vec<u32> = (0..32u32).flat_map(|j| [8 * j, 8 * j + 1]).collect();
+        return MiningConfiguration {
+            common_dim,
+            rank,
+            mma_type: MMAType::Int7xInt7ToInt32,
+            rows_pattern: PeriodicPattern::from_list(&[0u32, 8]).unwrap(),
+            cols_pattern: PeriodicPattern::from_list(&cols_w).unwrap(),
+            moe: None,
+        };
+    }
     // sm_75 (ARIA_SM75, kernel CuTe 8×16 T4) : tuiles CONTIGUËS = coords émises.
     if std::env::var("ARIA_SM75").is_ok() {
         let rows: Vec<u32> = (0..8).collect();

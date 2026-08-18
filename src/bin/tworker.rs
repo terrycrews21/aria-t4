@@ -67,13 +67,28 @@ struct Args {
 /// patterns are the canonical GPU MMA fragment (same lists as
 /// `canonical_gpu_config`, which the GPU path re-derives anyway).
 fn luckypool_default_params() -> MiningParams {
+    // v0.7.0-wgmma: if wgmma is active, use its fragment pattern (same as
+    // herominers). LuckyPool uses rank=256 and larger m/n, but the per-thread
+    // fragment shape is determined by the MMA atom, not the matrix dimensions.
+    let (rows_pattern, cols_pattern) =
+        if std::env::var("ARIA_WGMMA").is_ok() && std::env::var("ARIA_NO_WGMMA").is_err() {
+            (
+                vec![0, 8],
+                (0..32u32).flat_map(|j| vec![8 * j, 8 * j + 1]).collect(),
+            )
+        } else {
+            (
+                vec![0, 8, 32, 40, 64, 72, 96, 104],
+                vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
+            )
+        };
     MiningParams {
         m: 131_072,
         n: 131_072,
         k: 4096,
         rank: 256,
-        rows_pattern: vec![0, 8, 32, 40, 64, 72, 96, 104],
-        cols_pattern: vec![0, 1, 16, 17, 32, 33, 48, 49, 64, 65, 80, 81, 96, 97, 112, 113],
+        rows_pattern,
+        cols_pattern,
         mma_type: "Int7xInt7ToInt32".into(),
     }
 }
@@ -93,6 +108,16 @@ fn herominers_default_params() -> MiningParams {
         // Warp-owned Turing path: two complete contiguous 16×16 proof tiles
         // per warp, so there is no shared-atomic fold reconstruction.
         ((0..16).collect(), (0..16).collect())
+    } else if std::env::var("ARIA_WGMMA").is_ok() && std::env::var("ARIA_NO_WGMMA").is_err() {
+        // v0.7.0-wgmma: Hopper wgmma 128×256 kernel fragment pattern.
+        // Measured live via tma_ms_bench_wgmma coords mode (all 256 threads
+        // consistent). 2 rows × 64 cols per thread; period-16 rows, period-256 cols.
+        // Must be checked BEFORE the ARIA_TMA_MS branch because wgmma also
+        // implies ARIA_TMA_MS=1.
+        (
+            vec![0, 8],
+            (0..32u32).flat_map(|j| vec![8 * j, 8 * j + 1]).collect(),
+        )
     } else if std::env::var("ARIA_TMA_MS").is_ok() {
         (
             vec![0, 8, 32, 40, 64, 72, 96, 104],
@@ -475,8 +500,14 @@ fn spawn_grind(
                             {
                                 let (gm, gn, k) = (*gm, *gn, *k);
                                 if pctx.as_ref().map(|c| (c.0, c.1, c.2)) != Some((gm, gn, k)) {
-                                    let a = ProofGpuCtx::new(gm, k, 256);
-                                    let b = ProofGpuCtx::new(gn, k, 256);
+                                    // max_leafdata must cover the widest proof tile: each
+                                    // selected row spans ceil(k/1024) Merkle leaves. The wgmma
+                                    // 2×64 tile at k=8192 needs 64×8 = 512 leaves for B (the
+                                    // old hard-coded 256 was sized for the 8×16 mma.sync tile
+                                    // and asserted in gather() on the first wgmma hit).
+                                    let leaves_per_row = k.div_ceil(1024);
+                                    let a = ProofGpuCtx::new(gm, k, *tile_h * leaves_per_row);
+                                    let b = ProofGpuCtx::new(gn, k, *tile_w * leaves_per_row);
                                     pctx = Some((gm, gn, k, a, b));
                                 }
                                 let (_, _, _, ca, cb) = pctx.as_ref().unwrap();
@@ -828,12 +859,29 @@ async fn main() -> anyhow::Result<()> {
             } else if std::env::var("ARIA_TMA_MS").is_err() {
                 std::env::set_var("ARIA_TMA_MS", "1");
             }
+            // v0.7.0: on Hopper (sm_90a) enable the native wgmma 128×256
+            // kernel. ARIA_WGMMA selects the SM90 MMA atom in the CUDA lib AND
+            // its canonical fragment pattern in canonical_gpu_config() — the
+            // two MUST stay in sync (pattern is part of job_key; mismatch =
+            // share rejection = ban risk). Pattern measured live on H100:
+            // rows [0,8] × cols [0,1,8,9,…,248,249]. ARIA_SWZ_G=16 matched the
+            // best measured H100 sweep (572 TH/s vs 535 at the L2-based 64).
+            if device_major == 9 {
+                if std::env::var("ARIA_WGMMA").is_err() && std::env::var("ARIA_NO_WGMMA").is_err() {
+                    std::env::set_var("ARIA_WGMMA", "1");
+                }
+                if std::env::var("ARIA_WGMMA").is_ok() && std::env::var("ARIA_SWZ_G").is_err() {
+                    std::env::set_var("ARIA_SWZ_G", "16");
+                }
+            }
         }
         tracing::info!(
             batch_m = %std::env::var("ARIA_BATCH_M").unwrap_or_default(),
             batch_n = %std::env::var("ARIA_BATCH_N").unwrap_or_default(),
             fix_b = %std::env::var("ARIA_FIXB").unwrap_or_default(),
             multistage = %std::env::var("ARIA_TMA_MS").unwrap_or_default(),
+            wgmma = %std::env::var("ARIA_WGMMA").unwrap_or_default(),
+            swz_g = %std::env::var("ARIA_SWZ_G").unwrap_or_default(),
             t4_dual = %std::env::var("ARIA_T4_DUAL").unwrap_or_default(),
             "amortization defaults"
         );

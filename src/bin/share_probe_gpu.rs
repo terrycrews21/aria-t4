@@ -252,8 +252,11 @@ fn main() -> anyhow::Result<()> {
         if found > 0 {
             if let Some(hit) = hits.into_iter().find(|h| h.rows.len() == tile_h && h.cols.len() == tile_w) {
                 println!("[trainer] checkpoint candidate at step {step} after {:?}", grind_start.elapsed());
-                let ca = ProofGpuCtx::new(oj.m, oj.k, 256);
-                let cb = ProofGpuCtx::new(oj.n, oj.k, 256);
+                // Size the GPU leaf buffers for the active tile shape (see tworker.rs:
+                // each selected row spans ceil(k/1024) Merkle leaves).
+                let leaves_per_row = oj.k.div_ceil(1024);
+                let ca = ProofGpuCtx::new(oj.m, oj.k, tile_h * leaves_per_row);
+                let cb = ProofGpuCtx::new(oj.n, oj.k, tile_w * leaves_per_row);
                 let proofs = build_proofs_from_setup_gpu_fixb(
                     &ca, &cb, setup_seed, b_seed, std::slice::from_ref(&hit),
                     &job_key, oj.m, oj.n, oj.k, rank, tile_h, tile_w,

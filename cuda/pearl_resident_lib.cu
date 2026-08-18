@@ -15,6 +15,7 @@
 #include "pearl_gpu_kernel.cuh"        // gemm_device (grind 8×16, v1.0)
 #include "pearl_gpu_kernel_2x64.cuh"   // gemm_device_2x64 (grind 2×64, v1.1 AlphaPool)
 #include "pearl_gpu_kernel_tma.cuh"    // gemm_device_tma_ms (grind multistage TMA 128×256, v0.6.0-ws)
+#include "pearl_gpu_kernel_wgmma.cuh"  // gemm_device_wgmma_ms (grind SM90 wgmma 128×256, v0.7.0 — H100/H200)
 #include "pearl_gpu_kernel_cpasync_ms.cuh" // gemm_device_cpasync_ms (jumeau PORTABLE Ampere/Ada, v0.6.3-beta)
 #include "pearl_gpu_kernel_sm75.cuh"   // gemm_device_sm75 (grind 8×16 contigu TURING T4, sm_75)
 #include "pearl_gpu_kernel_sm75_dual.cuh" // warp-owned dual 16×16 T4 path (no fold atomics)
@@ -29,6 +30,22 @@ using namespace cute;
 static bool aria_use_cpasync(int major) {
   if (getenv("ARIA_FORCE_CPASYNC")) return true;
   return major >= 8 && major < 9;   // cp.async dispo seulement SM80+ (Ampere/Ada major 8). SM75 (T4) -> simple commit.
+}
+
+// v0.7.0-wgmma : faut-il le path SM90 WGMMA (au lieu du mma.sync multistage) ?
+// Seulement sur Hopper (major == 9, sm_90a) : wgmma.mma_async lit A/B
+// DIRECTEMENT depuis la smem via descripteurs (pas de ldmatrix/staging
+// registres) → ~1.6× le débit tensor-core du mma.sync mesuré sur H100
+// (bench tma_ms_bench_wgmma : 562 vs 345 TH/s interne, PIPE=4 SWZ_G=16).
+// Blackwell (major 10) n'a PAS wgmma (tcgen05 only) → reste mma.sync là-bas.
+// Opt-out : ARIA_NO_WGMMA=1 (retour au path TMA_MS mma.sync, p.ex. debug
+// transcript/pattern). Opt-in forcé sur autre arch : ARIA_WGMMA=1 (DANGER :
+// le pattern rows/cols déclaré au pool DOIT matcher le layout CLayout_64x256,
+// cf official_grind.rs — sinon shares rejetées).
+static bool aria_use_wgmma(int major) {
+  if (getenv("ARIA_NO_WGMMA")) return false;
+  if (getenv("ARIA_WGMMA")) return true;
+  return major == 9;   // Hopper only.
 }
 
 // Major du device courant, caché (pour les helpers sans accès au Ctx, ex commit_nokey).
@@ -571,6 +588,76 @@ if (dev_major == 7 || getenv("ARIA_FORCE_SM75")) {
     // DumpC=false. ⚠️ PERF ONLY : coords 2×4 PAS encore consensus-validées (bound=0 → 0 hit).
     auto bM2=Int<128>{}; auto bN2=Int<256>{}; auto bK2=Int<128>{};
     auto cta2 = make_shape(bM2,bN2,bK2);
+    // ---- v0.7.0-wgmma : path SM90 WGMMA (Hopper uniquement) ----
+    // Kernel validé sur H100 : (1) C bit-exact vs réf CPU (bench mode verify,
+    // M=128 N=256 K=512, 4 stages), (2) coords de hits identiques sur les 256
+    // threads et compatibles PeriodicPattern (bench mode coords → rows [0,8],
+    // cols 64 entrées [0,1,8,9,…,248,249] — déclaré dans official_grind.rs
+    // gate ARIA_WGMMA), (3) perf 562 TH/s @ PIPE=4 SWZ_G=16 (> PeakMiner 552).
+    // Pattern DIFFÉRENT du mma.sync (8×16) : la config pool DOIT suivre
+    // (canonical_gpu_config lit ARIA_WGMMA) sinon job_key mismatch = rejects.
+    if (aria_use_wgmma(dev_major)) {
+      // K_PIPE=2 (MEASURED BEST on H100, sweep 2026-08-18):
+      //   PIPE=2 SWZ=16: 572 TH/s   <- chosen (2 CTAs/SM, 99KB x 2 = 198KB)
+      //   PIPE=4 SWZ=16: 564 TH/s      (1 CTA/SM, 192KB)
+      //   PIPE=2 SWZ=64: 509 TH/s      (old auto swz default — wrong for H100)
+      // 2 CTAs/SM = 512 threads per SM hide the wgmma drain at each fold
+      // boundary (warpgroup_wait<0> every rank/32 k-blocks) better than one
+      // deep-pipeline CTA. SWZ_G=16 (not the 64 auto-picked for L2>=48MB):
+      // band = 16 x 128 rows x 8KB = 16MB of A per band, comfortably inside
+      // H100's 50MB L2 alongside streamed B tiles. Set ARIA_SWZ_G=16 (the
+      // tworker does this automatically when it enables ARIA_WGMMA).
+      // Layouts K-major swizzle 128B (GMMA::Layout_K_SW128_Atom) = exactly what
+      // both the TMA descriptor builder and the wgmma smem descriptors require.
+      using SmemAtomW = GMMA::Layout_K_SW128_Atom<int8_t>;
+      auto sAw = tile_to_shape(SmemAtomW{}, Shape<Int<128>, Int<128>, _2>{});
+      auto sBw = tile_to_shape(SmemAtomW{}, Shape<Int<256>, Int<128>, _2>{});
+      auto sCw = make_layout(make_shape(bM2,bN2));
+      // TiledMMA : atome wgmma 64×256×32 (SS = A et B depuis smem), 2 warpgroups
+      // empilés en M → couvre la tuile CTA 128×256 avec 256 threads.
+      TiledMMA mmaw = make_tiled_mma(SM90_64x256x32_S32S8S8_SS_TN{}, Layout<Shape<_2,_1,_1>>{});
+      // Descripteurs TMA pour A ET B (pas de cp.async sur ce path : tous les
+      // threads sont libérés pour le MMA ; TMA = DMA matériel, 1 thread issue).
+      Tensor gA_t = make_tensor(make_gmem_ptr<int8_t>(c->d_A), make_layout(make_shape(m,k), make_stride(k,Int<1>{})));
+      Tensor gB_t2 = make_tensor(make_gmem_ptr<int8_t>(c->d_B), make_layout(make_shape(n,k), make_stride(k,Int<1>{})));
+      auto tma_a = make_tma_copy<int8_t>(SM90_TMA_LOAD{}, gA_t, sAw(_,_,_0{}), make_shape(bM2,bK2), Int<1>{});
+      auto tma_b2 = make_tma_copy<int8_t>(SM90_TMA_LOAD{}, gB_t2, sBw(_,_,_0{}), make_shape(bN2,bK2), Int<1>{});
+      int smemw = int(sizeof(SharedStorageWGMMA<decltype(sAw),decltype(sBw),2>));
+      dim3 grdw(size(ceil_div(m,bM2)), size(ceil_div(n,bN2))), blkw(size(mmaw));
+      auto setattrw = [&](auto kfn){ cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smemw); };
+      ARIA_NEXT("gemm launch wgmma seed=%016llx m=%d n=%d k=%d grid=(%d,%d) blk=%u smem=%d rank=%d swz_g=%d",
+                (unsigned long long)setup_seed, m, n, k, grdw.x, grdw.y, blkw.x, smemw, c->rank, aria_swz_g());
+      if (c->big_endian) {
+        auto kfn = gemm_device_wgmma_ms<decltype(prob),decltype(cta2),
+            decltype(sAw),decltype(tma_a),
+            decltype(sBw),decltype(tma_b2),
+            int32_t,decltype(dC),decltype(sCw),decltype(mmaw), /*DumpC=*/false, /*BE=*/true>;
+        setattrw(kfn);
+        kfn<<<grdw,blkw,smemw,c->sA>>>(prob,cta2, sAw,tma_a, sBw,tma_b2,
+            c->d_C,dC,sCw,mmaw, reduce_every_k, aria_swz_g(), c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+      } else {
+        auto kfn = gemm_device_wgmma_ms<decltype(prob),decltype(cta2),
+            decltype(sAw),decltype(tma_a),
+            decltype(sBw),decltype(tma_b2),
+            int32_t,decltype(dC),decltype(sCw),decltype(mmaw), /*DumpC=*/false, /*BE=*/false>;
+        setattrw(kfn);
+        kfn<<<grdw,blkw,smemw,c->sA>>>(prob,cta2, sAw,tma_a, sBw,tma_b2,
+            c->d_C,dC,sCw,mmaw, reduce_every_k, aria_swz_g(), c->d_as, c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+      }
+      if (c->do_timing) cudaEventRecord(c->tEnd, c->sA);
+      CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
+      if (c->do_timing) {
+        cudaEventElapsedTime(&c->last_pro_ms,   c->tStart, c->tPro);
+        cudaEventElapsedTime(&c->last_grind_ms, c->tPro,   c->tEnd);
+        cudaEventElapsedTime(&c->last_genc_ms,  c->tStart, c->tMid);
+        cudaEventElapsedTime(&c->last_noise_ms, c->tMid,   c->tPro);
+      }
+      int found=0; CKR(cudaMemcpy(&found,c->d_found,4,cudaMemcpyDeviceToHost));
+      int nret = found<max_hits?found:max_hits;
+      if(nret>0 && hit_rows) CKR(cudaMemcpy(hit_rows,c->d_hr,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+      if(nret>0 && hit_cols) CKR(cudaMemcpy(hit_cols,c->d_hc,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+      return found;
+    }
     // K_PIPE = dernière dim du Shape (étages du ring TMA). =2 : smem ~96KB déjà au
     // plafond du 5080 (~100KB/SM) → impossible d'ajouter un stage (tâtonnement : _3 =
     // cudaErrorInvalidValue). Le vrai goulot = occupation 1 CTA/SM (smem trop gros).
@@ -729,6 +816,7 @@ static void prologue_A_slot(Ctx* c, uint64_t seed, int8_t* dA, uint32_t* dha, ui
 static int resident_run2(Ctx* c, uint64_t seed, uint64_t next_seed, int has_next,
                          const uint8_t job_key[32], int* hit_rows, int* hit_cols) {
   bool fixb = (getenv("ARIA_FIXB") != nullptr);
+  int dev_major = ((cudaDeviceProp*)c->prop)->major;
   // L'overlap n'a pas de jumeau cp.async (TMA only) → fallback classique sur Ampere/Ada.
   if (!(fixb && getenv("ARIA_TMA_MS") && c->d_A2 && aria_overlap())
       || aria_use_cpasync(((cudaDeviceProp*)c->prop)->major))
@@ -789,6 +877,76 @@ static int resident_run2(Ctx* c, uint64_t seed, uint64_t next_seed, int has_next
     auto dA = make_stride(k, Int<1>{}); auto dB = make_stride(k, Int<1>{}); auto dC = make_stride(n, Int<1>{});
     auto bM2=Int<128>{}; auto bN2=Int<256>{}; auto bK2=Int<128>{};
     auto cta2 = make_shape(bM2,bN2,bK2);
+    // ---- v0.7.0-wgmma : path SM90 WGMMA (Hopper uniquement) ----
+    // Kernel validé sur H100 : (1) C bit-exact vs réf CPU (bench mode verify,
+    // M=128 N=256 K=512, 4 stages), (2) coords de hits identiques sur les 256
+    // threads et compatibles PeriodicPattern (bench mode coords → rows [0,8],
+    // cols 64 entrées [0,1,8,9,…,248,249] — déclaré dans official_grind.rs
+    // gate ARIA_WGMMA), (3) perf 562 TH/s @ PIPE=4 SWZ_G=16 (> PeakMiner 552).
+    // Pattern DIFFÉRENT du mma.sync (8×16) : la config pool DOIT suivre
+    // (canonical_gpu_config lit ARIA_WGMMA) sinon job_key mismatch = rejects.
+    if (aria_use_wgmma(dev_major)) {
+      // K_PIPE=2 (MEASURED BEST on H100, sweep 2026-08-18):
+      //   PIPE=2 SWZ=16: 572 TH/s   <- chosen (2 CTAs/SM, 99KB x 2 = 198KB)
+      //   PIPE=4 SWZ=16: 564 TH/s      (1 CTA/SM, 192KB)
+      //   PIPE=2 SWZ=64: 509 TH/s      (old auto swz default — wrong for H100)
+      // 2 CTAs/SM = 512 threads per SM hide the wgmma drain at each fold
+      // boundary (warpgroup_wait<0> every rank/32 k-blocks) better than one
+      // deep-pipeline CTA. SWZ_G=16 (not the 64 auto-picked for L2>=48MB):
+      // band = 16 x 128 rows x 8KB = 16MB of A per band, comfortably inside
+      // H100's 50MB L2 alongside streamed B tiles. Set ARIA_SWZ_G=16 (the
+      // tworker does this automatically when it enables ARIA_WGMMA).
+      // Layouts K-major swizzle 128B (GMMA::Layout_K_SW128_Atom) = exactly what
+      // both the TMA descriptor builder and the wgmma smem descriptors require.
+      using SmemAtomW = GMMA::Layout_K_SW128_Atom<int8_t>;
+      auto sAw = tile_to_shape(SmemAtomW{}, Shape<Int<128>, Int<128>, _2>{});
+      auto sBw = tile_to_shape(SmemAtomW{}, Shape<Int<256>, Int<128>, _2>{});
+      auto sCw = make_layout(make_shape(bM2,bN2));
+      // TiledMMA : atome wgmma 64×256×32 (SS = A et B depuis smem), 2 warpgroups
+      // empilés en M → couvre la tuile CTA 128×256 avec 256 threads.
+      TiledMMA mmaw = make_tiled_mma(SM90_64x256x32_S32S8S8_SS_TN{}, Layout<Shape<_2,_1,_1>>{});
+      // Descripteurs TMA pour A ET B (pas de cp.async sur ce path : tous les
+      // threads sont libérés pour le MMA ; TMA = DMA matériel, 1 thread issue).
+      Tensor gA_t = make_tensor(make_gmem_ptr<int8_t>(dA_[slot]), make_layout(make_shape(m,k), make_stride(k,Int<1>{})));
+      Tensor gB_t2 = make_tensor(make_gmem_ptr<int8_t>(c->d_B), make_layout(make_shape(n,k), make_stride(k,Int<1>{})));
+      auto tma_a = make_tma_copy<int8_t>(SM90_TMA_LOAD{}, gA_t, sAw(_,_,_0{}), make_shape(bM2,bK2), Int<1>{});
+      auto tma_b2 = make_tma_copy<int8_t>(SM90_TMA_LOAD{}, gB_t2, sBw(_,_,_0{}), make_shape(bN2,bK2), Int<1>{});
+      int smemw = int(sizeof(SharedStorageWGMMA<decltype(sAw),decltype(sBw),2>));
+      dim3 grdw(size(ceil_div(m,bM2)), size(ceil_div(n,bN2))), blkw(size(mmaw));
+      auto setattrw = [&](auto kfn){ cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, smemw); };
+      ARIA_NEXT("gemm launch wgmma seed=%016llx m=%d n=%d k=%d grid=(%d,%d) blk=%u smem=%d rank=%d swz_g=%d",
+                (unsigned long long)seed, m, n, k, grdw.x, grdw.y, blkw.x, smemw, c->rank, aria_swz_g());
+      if (c->big_endian) {
+        auto kfn = gemm_device_wgmma_ms<decltype(prob),decltype(cta2),
+            decltype(sAw),decltype(tma_a),
+            decltype(sBw),decltype(tma_b2),
+            int32_t,decltype(dC),decltype(sCw),decltype(mmaw), /*DumpC=*/false, /*BE=*/true>;
+        setattrw(kfn);
+        kfn<<<grdw,blkw,smemw,c->sA>>>(prob,cta2, sAw,tma_a, sBw,tma_b2,
+            c->d_C,dC,sCw,mmaw, reduce_every_k, aria_swz_g(), das_[slot], c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+      } else {
+        auto kfn = gemm_device_wgmma_ms<decltype(prob),decltype(cta2),
+            decltype(sAw),decltype(tma_a),
+            decltype(sBw),decltype(tma_b2),
+            int32_t,decltype(dC),decltype(sCw),decltype(mmaw), /*DumpC=*/false, /*BE=*/false>;
+        setattrw(kfn);
+        kfn<<<grdw,blkw,smemw,c->sA>>>(prob,cta2, sAw,tma_a, sBw,tma_b2,
+            c->d_C,dC,sCw,mmaw, reduce_every_k, aria_swz_g(), das_[slot], c->d_bnd, c->d_found, c->d_hr,c->d_hc,max_hits);
+      }
+      if (c->do_timing) cudaEventRecord(c->tEnd, c->sA);
+      CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
+      if (c->do_timing) {
+        cudaEventElapsedTime(&c->last_pro_ms,   c->tStart, c->tPro);
+        cudaEventElapsedTime(&c->last_grind_ms, c->tPro,   c->tEnd);
+        cudaEventElapsedTime(&c->last_genc_ms,  c->tStart, c->tMid);
+        cudaEventElapsedTime(&c->last_noise_ms, c->tMid,   c->tPro);
+      }
+      int found=0; CKR(cudaMemcpy(&found,c->d_found,4,cudaMemcpyDeviceToHost));
+      int nret = found<max_hits?found:max_hits;
+      if(nret>0 && hit_rows) CKR(cudaMemcpy(hit_rows,c->d_hr,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+      if(nret>0 && hit_cols) CKR(cudaMemcpy(hit_cols,c->d_hc,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+      return found;
+    }
     auto sAm = composition(Swizzle<3,4,3>{},
         Layout<Shape<Shape<_16,_8 >,Shape<_128,_1>,_2>, Stride<Stride<_128,Int<2048>>,Stride<_1,_0>,Int<16384>>>{});
     auto sBm = composition(Swizzle<3,4,3>{},
