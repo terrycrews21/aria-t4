@@ -10,6 +10,7 @@
 #include "pearl_gpu_kernel_sm75_wideL.cuh"
 #include "pearl_gpu_kernel_sm75_wideM.cuh"
 #include "pearl_gpu_kernel_sm75_wideP.cuh"
+#include "pearl_gpu_kernel_sm75_wideQ.cuh"
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
   printf("CUDA ERROR %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); std::exit(1); } } while (0)
@@ -107,6 +108,10 @@ int main(int argc, char** argv) {
           dA,dB,M,N,K,rank,dkey,dbnd,dfound,dhr,dhc,64);
     }, false);
   }
+  bench("wideQ  (frag dblbuf)", [&](){
+    aria_sm75_wideQ::grind<false><<<grd, dim3(aria_sm75_wideQ::kThreads)>>>(
+        dA,dB,M,N,K,rank,dkey,dbnd,dfound,dhr,dhc,64);
+  }, false);
   // second pass: wide3 again to detect clock drift
   bench("wide3  (LDS.32 rerun)", [&](){
     aria_sm75_wide3::grind<false><<<grd, dim3(aria_sm75_wide3::kThreads)>>>(
