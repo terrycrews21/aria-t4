@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 #include "pearl_gpu_kernel_sm75_wide3.cuh"
 #include "pearl_gpu_kernel_sm75_wideK.cuh"
+#include "pearl_gpu_kernel_sm75_wideL.cuh"
+#include "pearl_gpu_kernel_sm75_wideM.cuh"
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
   printf("CUDA ERROR %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); std::exit(1); } } while (0)
@@ -26,6 +28,9 @@ int main(int argc, char** argv) {
   CK(cudaMalloc(&dkey, 32)); CK(cudaMalloc(&dbnd, 32));
   CK(cudaMalloc(&dfound, 4));
   CK(cudaMalloc(&dhr, 64*128*4)); CK(cudaMalloc(&dhc, 64*128*4));
+  // transcript scratch for wideL: 256-slot pool * 16 warps * 8 tiles * 16 words
+  uint32_t* dtrL = nullptr;
+  CK(cudaMalloc(&dtrL, 256ull * 16 * 8 * 16 * 4));
 
   std::vector<int8_t> hA((size_t)M*K), hB((size_t)N*K);
   for (size_t i = 0; i < hA.size(); ++i) hA[i] = (int8_t)(((i*1103515245u+12345u)>>16)&0x7F)-64;
@@ -82,6 +87,14 @@ int main(int argc, char** argv) {
   }, true);
   bench("wideK  (ldmatrix)", [&](){
     aria_sm75_wideK::grind<false><<<grd, dim3(aria_sm75_wideK::kThreads)>>>(
+        dA,dB,M,N,K,rank,dkey,dbnd,dfound,dhr,dhc,64);
+  }, false);
+  bench("wideL  (ldmatrix 2CTA/SM)", [&](){
+    aria_sm75_wideL::grind<false><<<grd, dim3(aria_sm75_wideL::kThreads)>>>(
+        dA,dB,M,N,K,rank,dkey,dbnd,dfound,dhr,dhc,64,dtrL);
+  }, false);
+  bench("wideM  (1024thr 4tile/warp)", [&](){
+    aria_sm75_wideM::grind<false><<<grd, dim3(aria_sm75_wideM::kThreads)>>>(
         dA,dB,M,N,K,rank,dkey,dbnd,dfound,dhr,dhc,64);
   }, false);
   // second pass: wide3 again to detect clock drift
