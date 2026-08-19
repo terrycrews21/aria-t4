@@ -107,6 +107,7 @@ fn herominers_default_params() -> MiningParams {
     let (rows_pattern, cols_pattern) = if std::env::var("ARIA_T4_DUAL").is_ok()
         || std::env::var("ARIA_T4_WIDE").is_ok()
         || std::env::var("ARIA_T4_WIDE3").is_ok()
+        || std::env::var("ARIA_T4_WIDEK").is_ok()
     {
         // Warp-owned Turing paths (dual 16×16 pair, wide four-tile and wide3
         // 512-thread eight-tile 128×256 CTAs): each emitted hit is one complete
@@ -862,6 +863,7 @@ async fn main() -> anyhow::Result<()> {
                 if std::env::var("ARIA_T4_DUAL").is_err()
                     && std::env::var("ARIA_T4_WIDE").is_err()
                     && std::env::var("ARIA_T4_WIDE3").is_err()
+                    && std::env::var("ARIA_T4_WIDEK").is_err()
                     && std::env::var("ARIA_SM75").is_err()
                 { std::env::set_var("ARIA_T4_DUAL", "1"); }
                 // TMA does not exist on Turing and its period-256 config is not
@@ -896,6 +898,7 @@ async fn main() -> anyhow::Result<()> {
             t4_dual = %std::env::var("ARIA_T4_DUAL").unwrap_or_default(),
             t4_wide = %std::env::var("ARIA_T4_WIDE").unwrap_or_default(),
             t4_wide3 = %std::env::var("ARIA_T4_WIDE3").unwrap_or_default(),
+            t4_widek = %std::env::var("ARIA_T4_WIDEK").unwrap_or_default(),
             "amortization defaults"
         );
     }
