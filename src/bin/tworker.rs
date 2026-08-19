@@ -106,10 +106,12 @@ fn herominers_default_params() -> MiningParams {
     // verifier's Merkle/job-key reconstruction before submission.
     let (rows_pattern, cols_pattern) = if std::env::var("ARIA_T4_DUAL").is_ok()
         || std::env::var("ARIA_T4_WIDE").is_ok()
+        || std::env::var("ARIA_T4_WIDE3").is_ok()
     {
-        // Warp-owned Turing paths (dual 16×16 pair and wide four-tile 128×256
-        // CTA): each emitted hit is one complete contiguous 16×16 proof tile,
-        // so there is no shared-atomic fold reconstruction. Both kernels dump
+        // Warp-owned Turing paths (dual 16×16 pair, wide four-tile and wide3
+        // 512-thread eight-tile 128×256 CTAs): each emitted hit is one complete
+        // contiguous 16×16 proof tile, so there is no shared-atomic fold
+        // reconstruction. All these kernels dump
         // the same normalized shape (verified via sm75_wide_bench coords mode:
         // rows 0..15 × cols 0..15, consistent across all slots).
         ((0..16).collect(), (0..16).collect())
@@ -859,6 +861,7 @@ async fn main() -> anyhow::Result<()> {
                 // ARIA_SM75=1 → CuTe canonical 8×16 path (v2 butterfly fold) au lieu du dual 16×16.
                 if std::env::var("ARIA_T4_DUAL").is_err()
                     && std::env::var("ARIA_T4_WIDE").is_err()
+                    && std::env::var("ARIA_T4_WIDE3").is_err()
                     && std::env::var("ARIA_SM75").is_err()
                 { std::env::set_var("ARIA_T4_DUAL", "1"); }
                 // TMA does not exist on Turing and its period-256 config is not
@@ -892,6 +895,7 @@ async fn main() -> anyhow::Result<()> {
             swz_g = %std::env::var("ARIA_SWZ_G").unwrap_or_default(),
             t4_dual = %std::env::var("ARIA_T4_DUAL").unwrap_or_default(),
             t4_wide = %std::env::var("ARIA_T4_WIDE").unwrap_or_default(),
+            t4_wide3 = %std::env::var("ARIA_T4_WIDE3").unwrap_or_default(),
             "amortization defaults"
         );
     }

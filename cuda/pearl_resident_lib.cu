@@ -20,6 +20,7 @@
 #include "pearl_gpu_kernel_sm75.cuh"   // gemm_device_sm75 (grind 8×16 contigu TURING T4, sm_75)
 #include "pearl_gpu_kernel_sm75_dual.cuh" // warp-owned dual 16×16 T4 path (no fold atomics)
 #include "pearl_gpu_kernel_sm75_wide.cuh" // warp-owned four-tile wide-M T4 path (128x256)
+#include "pearl_gpu_kernel_sm75_wide3.cuh" // variant C: 512-thread wide-M T4 path (128x256, ~615ms vs 705)
 #include "merkle_roots_cpasync.cuh"
 #include "merkle_simple.cuh"          // commit PORTABLE (roots identiques sur tout GPU)        // MerkleTreeRootsKernelCpAsync (commit PORTABLE — l'officiel est TMA/SM90-only)
 using namespace cute;
@@ -464,6 +465,44 @@ static int resident_run(Ctx* c, uint64_t setup_seed,
   int reduce_every_k = c->rank / 32;
   dim3 grd(size(ceil_div(m,bM)), size(ceil_div(n,bN))), blk(size(mma));
   int dev_major = ((cudaDeviceProp*)c->prop)->major;
+  if ((dev_major == 7 || getenv("ARIA_FORCE_SM75")) && getenv("ARIA_T4_WIDE3")) {
+    // Variant C wide3: 128x256 CTA, 512 threads, warp owns contiguous 32x64
+    // (8 proof tiles) -> ~40% fewer smem fragment loads than the 1024-thread
+    // wide kernel. Measured 615ms vs 705ms per setup on T4 (14.3 vs 12.5 TH/s).
+    // Proof geometry identical to wide: each emitted hit is one full 16x16 tile.
+    if ((m % aria_sm75_wide3::kBlockM) != 0 || (n % aria_sm75_wide3::kBlockN) != 0) {
+      fprintf(stderr, "sm75 wide3 kernel requires m%%128==0 and n%%256==0 (m=%d n=%d)\n", m, n);
+      return -1;
+    }
+    dim3 gridW3((unsigned)(m / aria_sm75_wide3::kBlockM),
+                (unsigned)(n / aria_sm75_wide3::kBlockN));
+    dim3 blockW3(aria_sm75_wide3::kThreads);
+    ARIA_NEXT("gemm launch sm75-wide3 seed=%016llx m=%d n=%d k=%d grid=(%u,%u) blk=%u rank=%d",
+              (unsigned long long)setup_seed, m, n, k, gridW3.x, gridW3.y,
+              blockW3.x, c->rank);
+    if (c->big_endian) {
+      aria_sm75_wide3::grind<true><<<gridW3, blockW3, 0, c->sA>>>(
+          c->d_A, c->d_B, m, n, k, c->rank, c->d_as, c->d_bnd,
+          c->d_found, c->d_hr, c->d_hc, max_hits);
+    } else {
+      aria_sm75_wide3::grind<false><<<gridW3, blockW3, 0, c->sA>>>(
+          c->d_A, c->d_B, m, n, k, c->rank, c->d_as, c->d_bnd,
+          c->d_found, c->d_hr, c->d_hc, max_hits);
+    }
+    if (c->do_timing) cudaEventRecord(c->tEnd, c->sA);
+    CKR(cudaStreamSynchronize(c->sA)); CKR(cudaGetLastError());
+    if (c->do_timing) {
+      cudaEventElapsedTime(&c->last_pro_ms,   c->tStart, c->tPro);
+      cudaEventElapsedTime(&c->last_grind_ms, c->tPro,   c->tEnd);
+      cudaEventElapsedTime(&c->last_genc_ms,  c->tStart, c->tMid);
+      cudaEventElapsedTime(&c->last_noise_ms, c->tMid,   c->tPro);
+    }
+    int found=0; CKR(cudaMemcpy(&found,c->d_found,4,cudaMemcpyDeviceToHost));
+    int nret = found<max_hits?found:max_hits;
+    if(nret>0 && hit_rows) CKR(cudaMemcpy(hit_rows,c->d_hr,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+    if(nret>0 && hit_cols) CKR(cudaMemcpy(hit_cols,c->d_hc,(size_t)nret*128*4,cudaMemcpyDeviceToHost));
+    return found;
+  }
   if ((dev_major == 7 || getenv("ARIA_FORCE_SM75")) && getenv("ARIA_T4_WIDE")) {
     // Wide-M variant: 128x256 CTA for higher arithmetic intensity (85 vs 57 MACs/byte).
     if ((m % aria_sm75_wide::kBlockM) != 0 || (n % aria_sm75_wide::kBlockN) != 0) {
