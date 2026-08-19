@@ -104,9 +104,14 @@ fn herominers_default_params() -> MiningParams {
     // 128×128 kernel maps to period 128. The config is part of job_key, so this
     // MUST track the selected kernel or every otherwise-good hit fails the
     // verifier's Merkle/job-key reconstruction before submission.
-    let (rows_pattern, cols_pattern) = if std::env::var("ARIA_T4_DUAL").is_ok() {
-        // Warp-owned Turing path: two complete contiguous 16×16 proof tiles
-        // per warp, so there is no shared-atomic fold reconstruction.
+    let (rows_pattern, cols_pattern) = if std::env::var("ARIA_T4_DUAL").is_ok()
+        || std::env::var("ARIA_T4_WIDE").is_ok()
+    {
+        // Warp-owned Turing paths (dual 16×16 pair and wide four-tile 128×256
+        // CTA): each emitted hit is one complete contiguous 16×16 proof tile,
+        // so there is no shared-atomic fold reconstruction. Both kernels dump
+        // the same normalized shape (verified via sm75_wide_bench coords mode:
+        // rows 0..15 × cols 0..15, consistent across all slots).
         ((0..16).collect(), (0..16).collect())
     } else if std::env::var("ARIA_WGMMA").is_ok() && std::env::var("ARIA_NO_WGMMA").is_err() {
         // v0.7.0-wgmma: Hopper wgmma 128×256 kernel fragment pattern.
@@ -852,7 +857,10 @@ async fn main() -> anyhow::Result<()> {
             let device_major = ariaminer::gpu_ffi::device_major();
             if device_major == 7 {
                 // ARIA_SM75=1 → CuTe canonical 8×16 path (v2 butterfly fold) au lieu du dual 16×16.
-                if std::env::var("ARIA_T4_DUAL").is_err() && std::env::var("ARIA_SM75").is_err() { std::env::set_var("ARIA_T4_DUAL", "1"); }
+                if std::env::var("ARIA_T4_DUAL").is_err()
+                    && std::env::var("ARIA_T4_WIDE").is_err()
+                    && std::env::var("ARIA_SM75").is_err()
+                { std::env::set_var("ARIA_T4_DUAL", "1"); }
                 // TMA does not exist on Turing and its period-256 config is not
                 // the warp-owned 16×16 proof geometry.
                 std::env::remove_var("ARIA_TMA_MS");
@@ -883,6 +891,7 @@ async fn main() -> anyhow::Result<()> {
             wgmma = %std::env::var("ARIA_WGMMA").unwrap_or_default(),
             swz_g = %std::env::var("ARIA_SWZ_G").unwrap_or_default(),
             t4_dual = %std::env::var("ARIA_T4_DUAL").unwrap_or_default(),
+            t4_wide = %std::env::var("ARIA_T4_WIDE").unwrap_or_default(),
             "amortization defaults"
         );
     }

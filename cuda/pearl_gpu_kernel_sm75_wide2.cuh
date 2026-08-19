@@ -1,9 +1,12 @@
-// ariaminer — Turing sm_75 warp-owned four-tile Pearl grind (wide-M variant).
+// ariaminer — Turing sm_75 warp-owned Pearl grind, variant B (128x128 CTA).
 //
-// Each warp owns four complete contiguous 16x16 proof tiles within a 128x256
-// CTA. Compared to the 64x512 original, this halves global memory traffic per
-// block (higher arithmetic intensity: 85 vs 57 MACs/byte) while keeping the
-// same thread count, register pressure, and shared-memory budget.
+// Derived from the wide kernel: same warp-owned contiguous 16x16 proof tiles,
+// same padded smem layout, same swizzled rasterization. Differences:
+//   - CTA tile 128x128 instead of 128x256, 512 threads (16 warps) instead of 1024
+//   - warp grid 4x4, each warp owns 2x2 = four 16x16 tiles (32x32 region)
+//   - launch_bounds allows 2 CTAs/SM -> full 32-warp occupancy, smaller barriers
+//   - B replication drops 8x -> 4x: smem read traffic per SM-chunk -20% at
+//     equal occupancy (ncu showed L1/TEX at 83% = bottleneck on the wide kernel)
 #pragma once
 
 #include <cuda_runtime.h>
@@ -11,26 +14,24 @@
 #include <cute/tensor.hpp>
 #include "blake3/blake3.cuh"
 
-namespace aria_sm75_wide {
+namespace aria_sm75_wide2 {
 using namespace cute;
 
 static constexpr int kBlockM = 128;
-static constexpr int kBlockN = 256;
+static constexpr int kBlockN = 128;
 static constexpr int kChunkK = 32;
 static constexpr int kMmaK = 16;
-static constexpr int kWarpRows = 8;
+static constexpr int kWarpRows = 4;
 static constexpr int kWarpCols = 4;
-static constexpr int kTilesPerWarp = 4;
-static constexpr int kTileColStride = kBlockN / kTilesPerWarp;  // = 64
-static constexpr int kWarps = kWarpRows * kWarpCols;
-static constexpr int kThreads = kWarps * 32;
+static constexpr int kTileRowsPerWarp = 2;
+static constexpr int kTileColsPerWarp = 2;
+static constexpr int kTilesPerWarp = kTileRowsPerWarp * kTileColsPerWarp;  // 4
+static constexpr int kWarps = kWarpRows * kWarpCols;                       // 16
+static constexpr int kThreads = kWarps * 32;                               // 512
 static constexpr int kTranscript = 16;
 static constexpr int kRotate = 13;
-// Padded smem row stride (words). Unpadded, each 32-byte row = 8 words and the
-// mma fragment reads 8 rows 8 words apart -> rows 4..7 alias rows 0..3 mod 32
-// banks -> 2-way LDS conflicts on EVERY operand load. Stride 12 words spaces
-// the 8 rows at {0,12,24,4,16,28,8,20} mod 32 -> all 32 banks distinct, zero
-// conflicts. 12 words = 48B keeps uint4 (16B) stores aligned (row*48 % 16 == 0).
+// Padded smem row stride (words): rows land on banks {0,12,24,4,16,28,8,20}
+// mod 32 -> zero LDS bank conflicts for the mma fragment reads.
 static constexpr int kRowStride = 12;
 static constexpr int kWordsA = kBlockM * kRowStride;
 static constexpr int kWordsB = kBlockN * kRowStride;
@@ -51,7 +52,7 @@ __device__ __forceinline__ uint32_t rotl13_xor(uint32_t previous, uint32_t value
 #endif
 
 template <bool BigEndian = false>
-__global__ __launch_bounds__(kThreads, 1)
+__global__ __launch_bounds__(kThreads, 2)
 void grind(const int8_t* __restrict__ a,
            const int8_t* __restrict__ bt,
            int m, int n, int k, int rank,
@@ -70,27 +71,21 @@ void grind(const int8_t* __restrict__ a,
   const int lane_quad = lane & 3;
   const int warp_m = warp / kWarpCols;
   const int warp_n = warp % kWarpCols;
-  // L2-friendly rasterization. Default blockIdx order (x fastest) streams a
-  // FRESH 1MB A slice for every CTA — on 16384×65536 that is 32768 × 1MB =
-  // 32GB of redundant A DRAM traffic per setup (each A slice is re-read by
-  // every one of its 256 column partners, long after L2 evicted it).
-  // Pair CTAs so two consecutive launches share the same A slice (same tile_x,
-  // adjacent tile_y): the second consumer hits L2, and total DRAM traffic drops
-  // to roughly the theoretical minimum |A| + |B|. Bijection for even gridDim.y:
-  //   linear = (tile_y/2 * gridDim.x + tile_x) * 2 + (tile_y & 1)
+  // L2-friendly rasterization: pair consecutive launches on the same A slice
+  // (bijection for even gridDim.y).
   int tile_x, tile_y;
   if ((gridDim.y & 1) == 0) {
     const int linear = blockIdx.y * gridDim.x + blockIdx.x;
     tile_x = (linear >> 1) % gridDim.x;
     tile_y = (linear / (gridDim.x << 1)) * 2 + (linear & 1);
   } else {
-    tile_x = blockIdx.x;  // odd tile count: keep default mapping (still correct)
+    tile_x = blockIdx.x;
     tile_y = blockIdx.y;
   }
   const int row_base = tile_x * kBlockM;
   const int col_base = tile_y * kBlockN;
-  const int warp_row = row_base + warp_m * 16;
-  const int warp_col = col_base + warp_n * 16;
+  const int warp_row = row_base + warp_m * (kTileRowsPerWarp * 16);
+  const int warp_col = col_base + warp_n * (kTileColsPerWarp * 16);
 
   __shared__ __align__(16) uint32_t stages[2][kWordsStage];
   __shared__ __align__(16) uint32_t transcripts[kWarps][kTilesPerWarp][kTranscript];
@@ -109,37 +104,41 @@ void grind(const int8_t* __restrict__ a,
 
   uint4 prefetched_a;
   uint4 prefetched_b;
-  // A: 128 rows x 2 uint4 per row = 256 loads; B: 256 rows x 2 uint4 = 512 loads.
-  // These counts are independent of the padded smem stride.
-  const bool has_a = tid < (kBlockM * 2);   // 256 threads load A
-  const bool has_b = tid < (kBlockN * 2);   // 512 threads load B
+  // A: 128 rows x 1 uint4 (32B row chunk = 2 uint4? no: kChunkK=32 -> 32 bytes
+  // per row = 2 uint4) -> 256 loads across threads 0..255.
+  // B: 128 rows x 2 uint4 = 256 loads across threads 256..511.
+  const bool has_a = tid < (kBlockM * 2);            // threads 0..255
+  const bool has_b = tid >= (kBlockM * 2);           // threads 256..511
 
   auto prefetch = [&](int k_offset) {
     if (has_a) {
-      int row = tid / 2;       // 0..127
-      int col_vec = tid % 2;   // 0 or 1
+      int idx = tid;                    // 0..255
+      int row = idx / 2;                // 0..127
+      int col_vec = idx % 2;            // 0 or 1
       const uint4* ptr_a = reinterpret_cast<const uint4*>(
           a + static_cast<size_t>(row_base + row) * k + k_offset + col_vec * 16);
       prefetched_a = __ldcg(ptr_a);
     }
     if (has_b) {
-      int cidx = tid / 2;      // 0..255
-      int col_vec = tid % 2;   // 0 or 1
+      int idx = tid - kBlockM * 2;      // 0..255
+      int row = idx / 2;                // 0..127
+      int col_vec = idx % 2;
       const uint4* ptr_bt = reinterpret_cast<const uint4*>(
-          bt + static_cast<size_t>(col_base + cidx) * k + k_offset + col_vec * 16);
+          bt + static_cast<size_t>(col_base + row) * k + k_offset + col_vec * 16);
       prefetched_b = __ldcg(ptr_bt);
     }
   };
 
   auto publish = [&](int stage) {
-    // Padded layout: row r's two uint4 vectors live at word offset r*kRowStride
-    // and r*kRowStride+4 -> uint4 slot index r*3 + v (v = 0|1). Slots 2,5,8,...
-    // are the unused padding. Max index: A (128 rows) -> 382 < kWordsA/4 = 384.
+    // Padded layout: row r's two uint4 vectors at word offsets r*kRowStride and
+    // r*kRowStride+4 -> uint4 slot r*3 + v (padding slots 2,5,8,... unused).
     if (has_a) {
-      reinterpret_cast<uint4*>(stages[stage])[(tid / 2) * 3 + (tid % 2)] = prefetched_a;
+      int idx = tid;
+      reinterpret_cast<uint4*>(stages[stage])[(idx / 2) * 3 + (idx % 2)] = prefetched_a;
     }
     if (has_b) {
-      reinterpret_cast<uint4*>(stages[stage] + kWordsA)[(tid / 2) * 3 + (tid % 2)] = prefetched_b;
+      int idx = tid - kBlockM * 2;
+      reinterpret_cast<uint4*>(stages[stage] + kWordsA)[(idx / 2) * 3 + (idx % 2)] = prefetched_b;
     }
   };
 
@@ -156,24 +155,34 @@ void grind(const int8_t* __restrict__ a,
 
     const uint32_t* sa = stages[current];
     const uint32_t* sb = stages[current] + kWordsA;
-    const int a_row0 = warp_m * 16 + lane_group;
+    // This warp's two row-bands within its 32-row span.
+    const int a_row0 = warp_m * 32 + lane_group;
     const int a_row1 = a_row0 + 8;
+    const int a_row2 = a_row0 + 16;
+    const int a_row3 = a_row2 + 8;
 
     #pragma unroll
     for (int sub = 0; sub < kChunkK / kMmaK; ++sub) {
       const int word_offset = sub * (kMmaK / 4) + lane_quad;
       const uint32_t a0 = sa[a_row0 * kRowStride + word_offset];
       const uint32_t a1 = sa[a_row1 * kRowStride + word_offset];
+      const uint32_t a2 = sa[a_row2 * kRowStride + word_offset];
+      const uint32_t a3 = sa[a_row3 * kRowStride + word_offset];
       #pragma unroll
-      for (int tile = 0; tile < kTilesPerWarp; ++tile) {
-        const int b0 = warp_n * 16 + tile * kTileColStride + lane_group;
+      for (int tc = 0; tc < kTileColsPerWarp; ++tc) {
+        const int b0 = warp_n * 32 + tc * 16 + lane_group;
         const int b1 = b0 + 8;
         const uint32_t bv0 = sb[b0 * kRowStride + word_offset];
         const uint32_t bv1 = sb[b1 * kRowStride + word_offset];
-        mma_8x8x16(acc[tile][0], acc[tile][1], a0, bv0);
-        mma_8x8x16(acc[tile][2], acc[tile][3], a1, bv0);
-        mma_8x8x16(acc[tile][4], acc[tile][5], a0, bv1);
-        mma_8x8x16(acc[tile][6], acc[tile][7], a1, bv1);
+        // tile t = tr*2 + tc ; tr=0 uses (a0,a1), tr=1 uses (a2,a3)
+        mma_8x8x16(acc[tc][0],     acc[tc][1],     a0, bv0);
+        mma_8x8x16(acc[tc][2],     acc[tc][3],     a1, bv0);
+        mma_8x8x16(acc[tc][4],     acc[tc][5],     a0, bv1);
+        mma_8x8x16(acc[tc][6],     acc[tc][7],     a1, bv1);
+        mma_8x8x16(acc[2 + tc][0], acc[2 + tc][1], a2, bv0);
+        mma_8x8x16(acc[2 + tc][2], acc[2 + tc][3], a3, bv0);
+        mma_8x8x16(acc[2 + tc][4], acc[2 + tc][5], a2, bv1);
+        mma_8x8x16(acc[2 + tc][6], acc[2 + tc][7], a3, bv1);
       }
     }
 
@@ -229,10 +238,13 @@ void grind(const int8_t* __restrict__ a,
       if (found) {
         int slot = atomicAdd(found_count, 1);
         if (slot < max_hits) {
-          const int tile_col = warp_col + tile * kTileColStride;
+          const int tr = tile / kTileColsPerWarp;
+          const int tc = tile % kTileColsPerWarp;
+          const int tile_row = warp_row + tr * 16;
+          const int tile_col = warp_col + tc * 16;
           #pragma unroll
           for (int i = 0; i < 128; ++i) {
-            hit_rows[slot * 128 + i] = warp_row + (i & 15);
+            hit_rows[slot * 128 + i] = tile_row + (i & 15);
             hit_cols[slot * 128 + i] = tile_col + (i & 15);
           }
         }
@@ -246,4 +258,4 @@ void grind(const int8_t* __restrict__ a,
 #endif
 }
 
-}  // namespace aria_sm75_wide
+}  // namespace aria_sm75_wide2
