@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
+#include <time.h>
 #include <cuda_runtime.h>
 #include "pearl_gpu_kernel_sm75_wide3.cuh"
 #include "pearl_gpu_kernel_sm75_wideK.cuh"
@@ -49,6 +50,11 @@ int main(int argc, char** argv) {
 
   double work = (double)M * (double)N * (double)K;
   auto bench = [&](const char* name, auto launch, bool capture) {
+    // 25s idle cooldown so every kernel starts from the same thermal state;
+    // the 15-iter average then reflects sustained (hot) performance, which is
+    // what continuous mining actually gets.
+    CK(cudaDeviceSynchronize());
+    { struct timespec ts; ts.tv_sec = 25; ts.tv_nsec = 0; nanosleep(&ts, nullptr); }
     CK(cudaMemset(dfound,0,4));
     launch();  // warmup
     CK(cudaDeviceSynchronize());
