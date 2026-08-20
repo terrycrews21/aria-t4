@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemP));
     bench("wideP  (chunkK=64 ldmatrix)", [&](){
       aria_sm75_wideP::grind<false><<<grd, dim3(aria_sm75_wideP::kThreads), smemP>>>(
-          dA,dB,M,N,K,rank,dkey,dbnd,dfound,dhr,dhc,64);
+          dA,dB,M,N,K,rank,dkey,dbnd,dfound,dhr,dhc,64,dtrL);
     }, false);
   }
   bench("wideQ  (frag dblbuf)", [&](){

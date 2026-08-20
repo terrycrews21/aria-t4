@@ -71,7 +71,8 @@ void grind(const int8_t* __restrict__ a,
            int* __restrict__ found_count,
            int* __restrict__ hit_rows,
            int* __restrict__ hit_cols,
-           int max_hits) {
+           int max_hits,
+           uint32_t* __restrict__ transcript_buf) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
   (void)m;
   const int tid = threadIdx.x;
@@ -95,13 +96,18 @@ void grind(const int8_t* __restrict__ a,
 
   extern __shared__ __align__(16) uint32_t smem[];
   uint32_t (*stages)[kWordsStage] = reinterpret_cast<uint32_t (*)[kWordsStage]>(smem);
-  __shared__ __align__(16) uint32_t transcripts[kWarps][kTilesPerWarp][kTranscript];
-
-  if (lane < kTranscript) {
-    #pragma unroll
-    for (int tile = 0; tile < kTilesPerWarp; ++tile)
-      transcripts[warp][tile][lane] = 0;
+  // Transcripts in GLOBAL memory (2 CTA smem budget: 60KB dynamic + 8KB
+  // static > 64KB sm_75 limit). Slot pool of 256 CTAs >= any resident count
+  // on T4 (40 SM); each CTA zeroes its slot then uses it.
+  constexpr int kTrWords = kWarps * kTilesPerWarp * kTranscript;  // 2048
+  constexpr int kTranscriptSlots = 256;
+  const int cta_linear = blockIdx.y * gridDim.x + blockIdx.x;
+  uint32_t* my_tr = transcript_buf + (size_t)(cta_linear & (kTranscriptSlots - 1)) * kTrWords;
+  if (tid < kTrWords / 4) {
+    my_tr[tid * 4 + 0] = 0; my_tr[tid * 4 + 1] = 0;
+    my_tr[tid * 4 + 2] = 0; my_tr[tid * 4 + 3] = 0;
   }
+  __syncthreads();
 
   int32_t acc[kTilesPerWarp][8];
   #pragma unroll
@@ -208,8 +214,9 @@ void grind(const int8_t* __restrict__ a,
           folded ^= __shfl_xor_sync(0xffffffffu, folded, mask);
         if (lane == 0) {
           int transcript_index = ((chunk + 1) / chunks_per_rank - 1) % kTranscript;
-          transcripts[warp][tile][transcript_index] =
-              rotl13_xor(transcripts[warp][tile][transcript_index], folded);
+          uint32_t* slot = my_tr + (warp * kTilesPerWarp + tile) * kTranscript + transcript_index;
+          uint32_t prev = *slot;
+          *slot = rotl13_xor(prev, folded);
         }
       }
     }
@@ -228,8 +235,9 @@ void grind(const int8_t* __restrict__ a,
         const int tile = tm * kTileColsPerWarp + tn;
         auto message = make_tensor<uint32_t>(Int<16>{});
         auto cv = make_tensor<uint32_t>(Int<8>{});
+        __threadfence_block();
         #pragma unroll
-        for (int i = 0; i < 16; ++i) message(i) = transcripts[warp][tile][i];
+        for (int i = 0; i < 16; ++i) message(i) = my_tr[(warp * kTilesPerWarp + tile) * kTranscript + i];
         #pragma unroll
         for (int i = 0; i < 8; ++i) cv(i) = pow_key[i];
         blake3::compress_msg_block_u32(message, cv, blake3::COMPRESS_PARAMS_SINGLE_BLOCK_KEYED);
@@ -267,7 +275,7 @@ void grind(const int8_t* __restrict__ a,
 #else
   (void)a; (void)bt; (void)m; (void)n; (void)k; (void)rank;
   (void)pow_key; (void)pow_bound; (void)found_count;
-  (void)hit_rows; (void)hit_cols; (void)max_hits;
+  (void)hit_rows; (void)hit_cols; (void)max_hits; (void)transcript_buf;
 #endif
 }
 
