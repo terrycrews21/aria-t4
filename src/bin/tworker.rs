@@ -31,6 +31,7 @@ use rand::SeedableRng;
 #[cfg(feature = "gpu")]
 use rand::RngCore;
 use rand::rngs::StdRng;
+use rand_distr::{Distribution, LogNormal, Pareto};
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Parser, Debug)]
@@ -97,6 +98,32 @@ fn luckypool_default_params() -> MiningParams {
 /// so these are self-declared. Only the patterns/rank are consensus-relevant
 /// (committed via job_key + reconstructed verifier-side from the submitted
 /// indices); m/n are the miner's own batch (advisory). Canonical GPU MMA
+/// Sample a duration from a log-normal with the given MEDIAN and sigma.
+/// Heavy-tailed (most samples near median, occasional very long) — matches the
+/// bursty human inter-arrival timing documented by Barabási (PhysRevE 73, 036127)
+/// and the TUD "Are human interactivity times lognormal?" finding. A flat/periodic
+/// duty sawtooth is the single strongest ML-detection signature; log-normal
+/// randomized on/off cycles remove the periodicity.
+#[cfg(feature = "gpu")]
+fn sample_lognormal(rng: &mut StdRng, median: f64, sigma: f64) -> f64 {
+    let mu = median.max(0.001).ln(); // exp(mu) == median
+    match LogNormal::new(mu, sigma) {
+        Ok(d) => d.sample(rng),
+        Err(_) => median,
+    }
+}
+
+/// Sample a heavy-tailed long break from a Pareto distribution (scale = floor,
+/// shape controls tail weight). Used sparingly to inject occasional "human walked
+/// away" gaps that a pure log-normal of short cycles would under-represent.
+#[cfg(feature = "gpu")]
+fn sample_pareto(rng: &mut StdRng, floor: f64, shape: f64) -> f64 {
+    match Pareto::new(floor.max(0.001), shape.max(0.01)) {
+        Ok(d) => d.sample(rng),
+        Err(_) => floor,
+    }
+}
+
 /// fragment 8×16, rank 128, k=8192 (post-fork mainnet shape).
 fn herominers_default_params() -> MiningParams {
     // The multistage 128×256 kernel maps each winning thread fragment to the
@@ -356,10 +383,32 @@ fn spawn_grind(
                         .unwrap_or(0.0);
                     let burst_active = burst_on_secs > 0.0 && burst_off_secs > 0.0;
                     let mut burst_cycle_start = Instant::now();
+                    // ARIA_BURST_HUMANIZE=1: randomize each on/off cycle via log-normal
+                    // (median = configured secs, sigma = ARIA_BURST_SIGMA default 0.7)
+                    // plus occasional Pareto long-breaks. Removes the fixed-period
+                    // sawtooth that ML detectors key on. Default ON for burst mode.
+                    let burst_humanize: bool = std::env::var("ARIA_BURST_HUMANIZE")
+                        .map(|v| v != "0" && !v.is_empty())
+                        .unwrap_or(true);
+                    let burst_sigma: f64 = std::env::var("ARIA_BURST_SIGMA")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.7);
+                    // Pareto long-break: prob per idle window (pct), floor secs, tail shape.
+                    let longbreak_prob: u64 = std::env::var("ARIA_LONGBREAK_PROB")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+                    let longbreak_floor: f64 = std::env::var("ARIA_LONGBREAK_FLOOR")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(60.0);
+                    let longbreak_shape: f64 = std::env::var("ARIA_LONGBREAK_SHAPE")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
+                    // Current (possibly randomized) durations for THIS cycle.
+                    let mut cur_on_secs = burst_on_secs;
+                    let mut cur_off_secs = burst_off_secs;
                     if burst_active {
                         tracing::info!(
                             on_s = burst_on_secs,
                             off_s = burst_off_secs,
+                            humanize = burst_humanize,
+                            sigma = burst_sigma,
+                            longbreak_prob = longbreak_prob,
                             "burst mode enabled (overrides ARIA_GPU_DUTY)"
                         );
                     }
@@ -438,23 +487,39 @@ fn spawn_grind(
                         // duty throttling when set — the idle gaps shape the utilization
                         // curve instead of a per-setup sawtooth.
                         if burst_active && found == 0
-                            && burst_cycle_start.elapsed().as_secs_f64() >= burst_on_secs
+                            && burst_cycle_start.elapsed().as_secs_f64() >= cur_on_secs
                         {
                             let job_id_before = job.job_id.clone();
                             tracing::info!(
-                                on_s = burst_on_secs,
-                                off_s = burst_off_secs,
+                                on_s = cur_on_secs,
+                                off_s = cur_off_secs,
+                                humanize = burst_humanize,
                                 "burst idle window"
                             );
                             // Sleep in short ticks so we wake early on stop or new job.
                             let off_start = Instant::now();
                             loop {
-                                if off_start.elapsed().as_secs_f64() >= burst_off_secs { break; }
+                                if off_start.elapsed().as_secs_f64() >= cur_off_secs { break; }
                                 if stop.load(Ordering::Relaxed) { break; }
                                 if job_slot.lock().job_id != job_id_before { break; }
                                 std::thread::sleep(std::time::Duration::from_millis(500));
                             }
                             burst_cycle_start = Instant::now();
+                            // Re-sample this cycle's on/off durations (log-normal around the
+                            // configured medians) so consecutive cycles are NOT identical —
+                            // kills the fixed-period sawtooth signature. Occasionally draw a
+                            // heavy-tailed "human walked away" long break on top of the idle.
+                            if burst_humanize {
+                                cur_on_secs = sample_lognormal(&mut rng, burst_on_secs, burst_sigma)
+                                    .clamp(2.0, burst_on_secs * 4.0);
+                                let mut off = sample_lognormal(&mut rng, burst_off_secs, burst_sigma);
+                                if (rng.next_u64() % 100) < longbreak_prob {
+                                    let lb = sample_pareto(&mut rng, longbreak_floor, longbreak_shape);
+                                    tracing::info!(longbreak_s = lb, "heavy-tail long break injected");
+                                    off += lb;
+                                }
+                                cur_off_secs = off.clamp(3.0, 600.0);
+                            }
                         }
                         // MINIMAL FIX: never duty-sleep when a hit was just found — that dead
                         // time sits BEFORE proof packaging/submission and can let the pool roll
