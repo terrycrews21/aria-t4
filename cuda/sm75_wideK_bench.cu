@@ -15,6 +15,7 @@
 #include "pearl_gpu_kernel_sm75_wideS.cuh"
 #include "pearl_gpu_kernel_sm75_wideT.cuh"
 #include "pearl_gpu_kernel_sm75_wideV.cuh"
+#include "pearl_gpu_kernel_sm75_wideW.cuh"
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
   printf("CUDA ERROR %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); std::exit(1); } } while (0)
@@ -142,6 +143,13 @@ int main(int argc, char** argv) {
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemV));
     bench("wideV  (3-stage ldmatrix)", [&](){
       aria_sm75_wideV::grind<false><<<grd, dim3(aria_sm75_wideV::kThreads), smemV>>>(
+          dA,dB,M,N,K,rank,dkey,dbnd,dfound,dhr,dhc,64);
+    }, false);
+  }
+  {
+    dim3 grdW(M/aria_sm75_wideW::kBlockM, N/aria_sm75_wideW::kBlockN);
+    bench("wideW  (128x128 2CTA/SM)", [&](){
+      aria_sm75_wideW::grind<false><<<grdW, dim3(aria_sm75_wideW::kThreads)>>>(
           dA,dB,M,N,K,rank,dkey,dbnd,dfound,dhr,dhc,64);
     }, false);
   }
