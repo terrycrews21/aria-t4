@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
         dA,dB,M,N,K,rank,dkey,dbnd,dfound,dhr,dhc,64);
   }, false);
   {
+    // wideS: 64x128 CTA -> grid (M/64, N/128)
     dim3 grdS(M/aria_sm75_wideS::kBlockM, N/aria_sm75_wideS::kBlockN);
     bench("wideS  (64x128 2CTA/SM)", [&](){
       aria_sm75_wideS::grind<false><<<grdS, dim3(aria_sm75_wideS::kThreads)>>>(
